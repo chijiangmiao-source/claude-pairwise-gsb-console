@@ -500,6 +500,9 @@ class PairwiseService:
         return row
 
     def refresh_recording_stage(self, pair_id: str) -> None:
+        pair = self._pair(pair_id)
+        if pair["stage"] != "recording":
+            return
         rows = self.db.all("SELECT status FROM recordings WHERE pair_id=?", (pair_id,))
         if len(rows) == 2 and all(row["status"] == "passed" for row in rows):
             self.db.execute("UPDATE pairs SET stage='gsb_ready',updated_at=? WHERE id=?", (now_iso(), pair_id))

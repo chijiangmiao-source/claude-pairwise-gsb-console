@@ -66,8 +66,16 @@ class CoreTests(unittest.TestCase):
             "INSERT INTO gsb_reviews(id,pair_id,verdict,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             ("gsb-1", pair["id"], "Same", "两边都完成了相同功能，但各有一些可以复核的实现差异。", "draft", stamp, stamp),
         )
+        self.db.execute("UPDATE pairs SET stage='recording' WHERE id=?", (pair["id"],))
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO recordings(id,pair_id,arm,path,width,height,duration_seconds,status,created_at,updated_at)
+                   VALUES(?,?,?,?,1280,720,30,'passed',?,?)""",
+                ("rec-" + arm, pair["id"], arm, str(self.root / (arm + ".mov")), stamp, stamp),
+            )
         result = self.service.confirm_gsb(pair["id"], "A better", "A 的真实验收覆盖更完整，B 的异常路径仍有失败，因此 A 的交付更可靠。", "刘昱")
         self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["stage"], "completed")
         self.assertEqual(result["gsb"]["confirmed_by"], "刘昱")
 
     def test_historical_import_excludes_bug_and_medium(self):
