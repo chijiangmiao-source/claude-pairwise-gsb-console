@@ -1,6 +1,8 @@
 import hashlib
+import json
 import os
 import plistlib
+import re
 import signal
 import subprocess
 import threading
@@ -75,6 +77,7 @@ class RecordingManager:
         _, stderr = process.communicate()
         with self._lock:
             self._processes.pop(recording_id, None)
+        _normalize_to_720p(path)
         result = inspect_recording(path)
         status = "passed" if process.returncode in (0, 130, -2) and result.get("ok") else "failed"
         error = "" if status == "passed" else (result.get("error") or redact((stderr or b"").decode("utf-8", "ignore")))
@@ -95,13 +98,51 @@ def inspect_recording(path: Path) -> Dict[str, Any]:
         "-name", "kMDItemPixelHeight", str(path),
     ], check=False, timeout=60)
     if result.returncode != 0:
-        return {"ok": False, "sha256": digest, "error": redact(result.stderr or result.stdout)}
+        return _inspect_with_ffprobe(path, digest, redact(result.stderr or result.stdout))
     try:
         metadata = plistlib.loads(result.stdout.encode("utf-8"))
         width = int(metadata.get("kMDItemPixelWidth") or 0)
         height = int(metadata.get("kMDItemPixelHeight") or 0)
         duration = float(metadata.get("kMDItemDurationSeconds") or 0)
     except (ValueError, TypeError, plistlib.InvalidFileException) as exc:
+        return _inspect_with_ffprobe(path, digest, "无法读取 Spotlight 录像规格：%s" % exc)
+    if not width or not height or not duration:
+        return _inspect_with_ffprobe(path, digest, "Spotlight 录像元数据尚未生成")
+    ok = width == 1280 and height == 720 and 0 < duration < 90
+    return {
+        "ok": ok, "sha256": digest, "width": width, "height": height,
+        "duration_seconds": round(duration, 3),
+        "error": "" if ok else "录像必须为 1280×720 且少于 90 秒",
+    }
+
+
+def _inspect_with_ffprobe(path: Path, digest: str, prior_error: str) -> Dict[str, Any]:
+    media_info = run_command(["/usr/bin/avmediainfo", str(path)], check=False, timeout=60)
+    if media_info.returncode == 0:
+        dimensions = re.search(r"Dimensions:\s*(\d+)\s*x\s*(\d+)", media_info.stdout)
+        duration_match = re.search(r"^Duration:\s*([\d.]+)\s+seconds", media_info.stdout, re.MULTILINE)
+        if dimensions and duration_match:
+            width, height = int(dimensions.group(1)), int(dimensions.group(2))
+            duration = float(duration_match.group(1))
+            ok = width == 1280 and height == 720 and 0 < duration < 90
+            return {
+                "ok": ok, "sha256": digest, "width": width, "height": height,
+                "duration_seconds": round(duration, 3),
+                "error": "" if ok else "录像必须为 1280×720 且少于 90 秒",
+            }
+    probe = run_command([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration", "-of", "json", str(path),
+    ], check=False, timeout=60)
+    if probe.returncode != 0:
+        return {"ok": False, "sha256": digest, "error": redact(probe.stderr or prior_error)}
+    try:
+        data = json.loads(probe.stdout)
+        stream = (data.get("streams") or [{}])[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        duration = float((data.get("format") or {}).get("duration") or 0)
+    except (ValueError, TypeError, KeyError) as exc:
         return {"ok": False, "sha256": digest, "error": "无法读取录像规格：%s" % exc}
     ok = width == 1280 and height == 720 and 0 < duration < 90
     return {
@@ -110,3 +151,21 @@ def inspect_recording(path: Path) -> Dict[str, Any]:
         "error": "" if ok else "录像必须为 1280×720 且少于 90 秒",
     }
 
+
+def _normalize_to_720p(path: Path) -> None:
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    info = run_command(["/usr/bin/avmediainfo", str(path)], check=False, timeout=60)
+    dimensions = re.search(r"Dimensions:\s*(\d+)\s*x\s*(\d+)", info.stdout) if info.returncode == 0 else None
+    if dimensions and (int(dimensions.group(1)), int(dimensions.group(2))) == (1280, 720):
+        return
+    converted = path.with_name(path.stem + ".720p" + path.suffix)
+    converted.unlink(missing_ok=True)
+    result = run_command([
+        "/usr/bin/avconvert", "--source", str(path), "--output", str(converted),
+        "--preset", "Preset1280x720", "--replace",
+    ], check=False, timeout=600)
+    if result.returncode == 0 and converted.exists() and converted.stat().st_size:
+        os.replace(converted, path)
+    else:
+        converted.unlink(missing_ok=True)
