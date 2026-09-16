@@ -44,6 +44,19 @@ class ArtifactChecker:
             ps = run_command(["docker", "compose", "-p", project, "-f", str(compose), "ps", "--format", "json"], cwd=workspace, check=False, timeout=60)
             running = ps.returncode == 0 and ("running" in ps.stdout.casefold() or "healthy" in ps.stdout.casefold())
             self._record(checks, "containers_running", running, redact(ps.stdout or ps.stderr))
+            services = run_command(
+                ["docker", "compose", "-p", project, "-f", str(compose), "config", "--services"],
+                cwd=workspace, check=False, timeout=60,
+            )
+            service_names = {line.strip() for line in services.stdout.splitlines() if line.strip()}
+            has_verify = "verify" in service_names
+            self._record(checks, "verify_service_present", has_verify, ", ".join(sorted(service_names)))
+            if has_verify:
+                verify = run_command(
+                    ["docker", "compose", "-p", project, "-f", str(compose), "run", "--rm", "verify"],
+                    cwd=workspace, check=False, timeout=1200,
+                )
+                self._record(checks, "verify_service", verify.returncode == 0, redact(verify.stdout + "\n" + verify.stderr))
             down = run_command(["docker", "compose", "-p", project, "-f", str(compose), "down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180)
             self._record(checks, "cleanup", down.returncode == 0, redact(down.stderr or down.stdout))
             status = "passed" if all(item["passed"] for item in checks) else "failed"
@@ -91,4 +104,3 @@ def validate_recording(path: Path) -> Dict[str, Any]:
         "sha256": digest, "width": width, "height": height, "duration_seconds": duration,
         "error": "" if width == 1280 and height == 720 and 0 < duration < 90 else "录像必须为 1280×720 且少于 90 秒",
     }
-
