@@ -17,7 +17,7 @@ from .config import Config
 from .db import Database, now_iso
 from .gitops import GitOps
 from .importer import fingerprint, import_historical_tasks
-from .prompts import bug_discovery_prompt, gsb_prompt, task_generation_prompt, task_validation_prompt
+from .prompts import bug_discovery_prompt, feature_generation_prompt, gsb_prompt, task_generation_prompt, task_validation_prompt
 from .recording import RecordingManager
 from .commands import redact, run_command
 
@@ -229,6 +229,70 @@ class PairwiseService:
         except Exception as exc:
             self.db.execute("UPDATE generation_batches SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?", (str(exc)[-3000:], now_iso(), now_iso(), batch_id))
             raise
+
+    def generate_followup_feature_async(self, pair_id: str) -> str:
+        operation = "feature-" + pair_id
+        self._submit(operation, self.generate_followup_feature, pair_id)
+        return operation
+
+    def generate_followup_feature(self, pair_id: str) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        if pair["status"] != "completed":
+            raise ValueError("只有已完成 GSB 的 Pair 才能生成 Feature 迭代")
+        existing_followup = self.db.one(
+            "SELECT * FROM tasks WHERE parent_pair_id=? AND task_type='feature' AND status IN ('candidate','ready','used') ORDER BY created_at DESC LIMIT 1",
+            (pair_id,),
+        )
+        if existing_followup:
+            return existing_followup
+        selected = "B" if pair["winner"] == "B better" else "A"
+        arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=? AND status='completed'", (pair_id, selected))
+        check = self.db.one("SELECT * FROM artifact_checks WHERE pair_id=? AND arm=? AND status='passed' ORDER BY created_at DESC LIMIT 1", (pair_id, selected))
+        if not arm or not check or not arm.get("commit_sha"):
+            raise ValueError("获胜产物缺少固定提交或 Docker 验收证据")
+        workspace = Path(arm["workspace_path"])
+        task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        files = [str(path.relative_to(workspace)) for path in sorted(workspace.rglob("*"))
+                 if path.is_file() and ".git" not in path.parts and not any(part in (".venv", "node_modules", "__pycache__") for part in path.parts)][:160]
+        readme = next((p for p in (workspace / "README.md", workspace / "README") if p.exists()), None)
+        readme_text = readme.read_text(encoding="utf-8", errors="ignore")[:10000] if readme else ""
+        summary = json.dumps({
+            "selectedArm": selected, "commitSha": arm["commit_sha"], "files": files,
+            "readme": readme_text, "dockerCheck": json.loads(check.get("checks_json") or "[]"),
+        }, ensure_ascii=False)
+        known = self.db.all("SELECT title,substr(prompt,1,220) summary FROM tasks ORDER BY created_at DESC LIMIT 100")
+        last_error = ""
+        for _ in range(3):
+            result = self.codex.run(
+                "task_generation",
+                feature_generation_prompt(task.get("prompt", ""), summary, json.dumps(known, ensure_ascii=False)),
+                TASK_SCHEMA, cwd=workspace, pair_id=pair_id, task_id=pair["task_id"], timeout=1800,
+            )
+            if result.get("taskType") != "feature" or result.get("difficulty") not in ("困难", "地狱"):
+                last_error = "生成结果不是困难或地狱 Feature"
+                continue
+            task_id = "task-" + uuid.uuid4().hex[:16]
+            key = fingerprint("feature", result["prompt"], arm["commit_sha"])
+            if self.db.one("SELECT id FROM tasks WHERE fingerprint=?", (key,)):
+                last_error = "生成结果与已有 Feature 重复"
+                continue
+            stamp = now_iso()
+            self.db.execute(
+                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,acceptance_json,difficulty,
+                   difficulty_evidence_json,baseline_path,baseline_repo_url,baseline_sha,parent_pair_id,fingerprint,
+                   status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (task_id, "generated_followup", pair_id, "feature", result["title"], result["prompt"], result["stack"],
+                 json.dumps(result["acceptance"], ensure_ascii=False), result["difficulty"],
+                 json.dumps(result["difficultyEvidence"], ensure_ascii=False), str(workspace),
+                 (self.db.one("SELECT remote_url FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}).get("remote_url", ""),
+                 arm["commit_sha"], pair_id, key, "candidate", stamp, stamp),
+            )
+            validation = self.validate_task(task_id)
+            if validation["status"] == "ready":
+                self.db.audit("feature.followup_ready", "task", task_id, {"source_pair_id": pair_id, "source_arm": selected, "baseline_sha": arm["commit_sha"]})
+                return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
+            last_error = str(validation["result"].get("reason") or "Feature 准入未通过")
+        raise RuntimeError("未能生成可进入 A/B 的困难 Feature：%s" % last_error)
 
     def create_pair(self, task_id: str) -> Dict[str, Any]:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))

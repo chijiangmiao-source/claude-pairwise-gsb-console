@@ -36,6 +36,26 @@ def task_generation_prompt(existing: str, task_type: str = "zero_to_one") -> str
 只按 Schema 输出。"""
 
 
+def feature_generation_prompt(original_task: str, artifact_summary: str, existing: str) -> str:
+    return f"""为一个已经完成并通过 Docker 验收的项目生成下一轮 Feature 迭代任务。
+
+{DIFFICULTY_RULES}
+{BANNED_TASKS}
+
+必须在现有产品和代码结构上增加真实的新能力，保留现有功能、接口与 Docker Compose 验收链路。直接生成困难或地狱任务，复杂度必须来自跨模块状态、性能、并发、异常恢复或兼容性等真实约束，不能靠堆字段或扩大文字。题面要明确新行为、边界条件与可执行验收，但给开发者保留实现取舍。taskType 必须为 feature。
+
+原始任务：
+{original_task}
+
+当前获胜产物摘要：
+{artifact_summary}
+
+已有题目标题与摘要，必须避免雷同：
+{existing or '无'}
+
+只按 Schema 输出。"""
+
+
 def gsb_prompt(task: str, a_evidence: str, b_evidence: str) -> str:
     return f"""比较同一道开发任务的 A、B 两份最终产物，给出 GSB 结论。只依据可见题面、代码提交、Docker 验收、真实操作录像和开发轨迹，不索取内部思维。
 
