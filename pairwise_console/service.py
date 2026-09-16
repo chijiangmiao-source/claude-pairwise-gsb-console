@@ -575,6 +575,7 @@ class PairwiseService:
 
     def _monitor_arm(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
         started = time.monotonic()
+        pair_baseline = (self.db.one("SELECT baseline_sha FROM pairs WHERE id=?", (pair_id,)) or {}).get("baseline_sha", "")
         initial = self.db.one("SELECT prompt_sent_at FROM arm_runs WHERE id=?", (arm_id,)) or {}
         try:
             sent_at = datetime.fromisoformat(str(initial.get("prompt_sent_at") or ""))
@@ -629,7 +630,7 @@ class PairwiseService:
                 return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
             elapsed = time.monotonic() - started
             workspace = Path(arm["workspace_path"])
-            has_code = self.claude.has_business_code(workspace)
+            has_code = self.claude.has_business_code(workspace, pair_baseline)
             if elapsed >= int(self.db.setting("first_prompt_warning_minutes", 15)) * 60 and not has_code and not warned:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))

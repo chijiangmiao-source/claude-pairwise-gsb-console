@@ -134,6 +134,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual((destination / "README.md").read_text(encoding="utf-8"), "baseline\n")
         self.assertEqual(run_command(["git", "branch", "--show-current"], cwd=destination).stdout.strip(), "A")
         self.assertEqual(run_command(["git", "status", "--porcelain"], cwd=destination).stdout.strip(), "")
+        (destination / "app.py").write_text("print('ready')\n", encoding="utf-8")
+        run_command(["git", "add", "app.py"], cwd=destination)
+        run_command(["git", "commit", "-m", "implementation"], cwd=destination)
+        self.assertTrue(self.service.claude.has_business_code(destination, expected_sha))
 
 
 if __name__ == "__main__":

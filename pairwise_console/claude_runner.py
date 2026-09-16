@@ -314,13 +314,20 @@ exit "$code"
         run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "stuff", "\r"])
 
     @staticmethod
-    def has_business_code(workspace: Path) -> bool:
+    def has_business_code(workspace: Path, baseline_sha: str = "") -> bool:
         status = run_command(["git", "status", "--porcelain"], cwd=workspace, check=False, timeout=30)
         if status.returncode != 0:
             return False
         extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".cpp", ".c", ".h", ".vue", ".svelte", ".html", ".css", ".sql", ".sh"}
-        for line in status.stdout.splitlines():
-            path = line[3:].split(" -> ")[-1].strip()
+        paths = [line[3:].split(" -> ")[-1].strip() for line in status.stdout.splitlines()]
+        if baseline_sha:
+            committed = run_command(
+                ["git", "diff", "--name-only", "%s..HEAD" % baseline_sha],
+                cwd=workspace, check=False, timeout=30,
+            )
+            if committed.returncode == 0:
+                paths.extend(line.strip() for line in committed.stdout.splitlines() if line.strip())
+        for path in paths:
             item = workspace / path
             if item.name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml") or item.suffix.casefold() in extensions:
                 return True
