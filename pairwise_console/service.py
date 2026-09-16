@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -89,7 +90,28 @@ class PairwiseService:
         if self._scheduler_started:
             return
         self._scheduler_started = True
+        self._resume_active_monitors()
         threading.Thread(target=self._scheduler_loop, name="task-pool-refill", daemon=True).start()
+
+    def _resume_active_monitors(self) -> None:
+        """Reattach monitoring after the web service restarts.
+
+        Claude runs in independent Docker/screen sessions, so a service update
+        must not strand work that already received its prompt.
+        """
+        rows = self.db.all(
+            """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
+               JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
+               WHERE a.prompt_sent_at IS NOT NULL
+                 AND a.status IN ('running','developing','waiting_retry')
+                 AND p.stage='development'"""
+        )
+        pair_ids = set()
+        for row in rows:
+            pair_ids.add(row["pair_id"])
+            self._submit("monitor-" + row["arm_id"], self._monitor_arm, row["pair_id"], row["arm_id"], row["prompt"])
+        for pair_id in pair_ids:
+            self.db.execute("UPDATE pairs SET status='running',error='',updated_at=? WHERE id=?", (now_iso(), pair_id))
 
     def _scheduler_loop(self) -> None:
         # Let HTTP start first, then maintain the pool independently of A/B
@@ -553,12 +575,20 @@ class PairwiseService:
 
     def _monitor_arm(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
         started = time.monotonic()
+        initial = self.db.one("SELECT prompt_sent_at FROM arm_runs WHERE id=?", (arm_id,)) or {}
+        try:
+            sent_at = datetime.fromisoformat(str(initial.get("prompt_sent_at") or ""))
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
+            started -= max(0.0, (datetime.now(timezone.utc) - sent_at).total_seconds())
+        except ValueError:
+            pass
         warned = False
         last_api_error = ""
         last_resume_at = 0.0
         while True:
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,))
-            if not arm or arm["status"] not in ("developing", "running"):
+            if not arm or arm["status"] not in ("developing", "running", "waiting_retry"):
                 return arm or {}
             state = self.claude.trace_state(arm, prompt)
             if state.get("session_id") or state.get("prompt_id"):
