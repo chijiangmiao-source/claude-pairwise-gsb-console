@@ -304,7 +304,10 @@ class PairwiseService:
             for run in runs:
                 refreshed = self.db.one("SELECT * FROM arm_runs WHERE id=?", (run["id"],)) or run
                 self.claude.send_prompt(refreshed, prompt)
-            self.db.execute("UPDATE pairs SET status='running',stage='development',started_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), pair_id))
+            self.db.execute(
+                "UPDATE pairs SET status='running',stage='development',error='',started_at=?,updated_at=? WHERE id=?",
+                (now_iso(), now_iso(), pair_id),
+            )
             for run in runs:
                 self._submit("monitor-" + run["id"], self._monitor_arm, pair_id, run["id"], prompt)
             return self.pair_detail(pair_id)
