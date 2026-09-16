@@ -63,7 +63,64 @@ class ClaudeRunner:
                 """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
                    model,image,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", values,
             )
+        elif not current.get("prompt_sent_at"):
+            # Repository preparation can be retried before the prompt is sent.
+            # Keep the canonical A/B clones separate and point Claude at a
+            # disposable workspace that is empty when the container starts.
+            self.db.execute(
+                """UPDATE arm_runs SET workspace_path=?,container_name=?,screen_name=?,model=?,image=?,
+                   status='queued',error='',updated_at=? WHERE id=?""",
+                (str(workspace), container, screen, model, image, stamp, current["id"]),
+            )
         return self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (pair["id"], arm)) or {}
+
+    def reset_unsent_arm(self, arm_run: Dict[str, Any]) -> None:
+        """Reset launch debris only when no task prompt has entered the session."""
+        if arm_run.get("prompt_sent_at"):
+            raise RuntimeError("该 Arm 已发送题面，不能按未启动任务重置")
+        container = arm_run["container_name"]
+        if run_command(["docker", "inspect", container], check=False, timeout=20).returncode == 0:
+            run_command(["docker", "rm", "-f", container], check=False, timeout=60)
+        if self._screen_running(arm_run["screen_name"]):
+            run_command(["screen", "-S", arm_run["screen_name"], "-X", "quit"], check=False, timeout=20)
+        root = self.runtime_dir / arm_run["id"]
+        self._close_terminal_window(root / "terminal-window.json", arm_run["screen_name"])
+        workspace = Path(arm_run["workspace_path"]).resolve()
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        for stale in (root / "terminal.log", root / "exit-status", root / "permission-status"):
+            stale.unlink(missing_ok=True)
+        self.db.execute(
+            """UPDATE arm_runs SET status='queued',image_id='',session_id='',prompt_id='',trace_path='',
+               commit_sha='',result='',warning_at=NULL,error='',updated_at=? WHERE id=?""",
+            (now_iso(), arm_run["id"]),
+        )
+
+    def materialize_repository(self, arm_run: Dict[str, Any], source: Path, expected_sha: str) -> None:
+        """Import an exact branch snapshot after Claude accepts the empty mount."""
+        destination = Path(arm_run["workspace_path"]).resolve()
+        source = source.resolve()
+        if not self._container_running(arm_run["container_name"]):
+            raise RuntimeError("Claude 容器尚未运行，不能导入仓库")
+        if not source.is_dir() or not (source / ".git").is_dir():
+            raise RuntimeError("A/B 源仓库不存在：%s" % source)
+        if any(destination.iterdir()):
+            raise RuntimeError("Claude 运行工作区在仓库导入前不是空目录")
+        source_sha = run_command(["git", "rev-parse", "HEAD"], cwd=source, timeout=30).stdout.strip()
+        source_branch = run_command(["git", "branch", "--show-current"], cwd=source, timeout=30).stdout.strip()
+        source_status = run_command(["git", "status", "--porcelain"], cwd=source, timeout=30).stdout.strip()
+        if source_sha != expected_sha or source_branch != arm_run["arm"] or source_status:
+            raise RuntimeError("A/B 源仓库未保持指定分支的清洁基线")
+        shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+        imported_sha = run_command(["git", "rev-parse", "HEAD"], cwd=destination, timeout=30).stdout.strip()
+        imported_branch = run_command(["git", "branch", "--show-current"], cwd=destination, timeout=30).stdout.strip()
+        imported_status = run_command(["git", "status", "--porcelain"], cwd=destination, timeout=30).stdout.strip()
+        if imported_sha != expected_sha or imported_branch != arm_run["arm"] or imported_status:
+            raise RuntimeError("导入后的 A/B 工作区未通过分支与基线校验")
+        self.db.audit("claude.repository_materialized", "arm_run", arm_run["id"], {
+            "arm": arm_run["arm"], "baseline_sha": imported_sha,
+        })
 
     def launch(self, arm_run: Dict[str, Any]) -> None:
         arm_id = arm_run["id"]
@@ -75,6 +132,9 @@ class ClaudeRunner:
         exit_status = root / "exit-status"
         terminal_meta = root / "terminal-window.json"
         workspace = Path(arm_run["workspace_path"]).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        if any(workspace.iterdir()):
+            raise RuntimeError("Claude 首次启动工作区必须为空")
         settings = Path.home() / ".claude" / "settings.json"
         image_id = run_command(["docker", "image", "inspect", arm_run["image"], "--format", "{{.Id}}"], timeout=30).stdout.strip()
         if run_command(["docker", "inspect", arm_run["container_name"]], check=False, timeout=20).returncode == 0:

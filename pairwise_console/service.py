@@ -261,7 +261,7 @@ class PairwiseService:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         repo = self.git.create_pair_repository(pair, task)
         for arm in ("A", "B"):
-            self.claude.prepare_arm(pair, arm, Path(repo["local_root"]) / arm)
+            self.claude.prepare_arm(pair, arm, Path(repo["local_root"]) / "workspaces" / arm)
         self.db.execute("UPDATE pairs SET stage='ready_to_start',updated_at=? WHERE id=?", (now_iso(), pair_id))
         return self.pair_detail(pair_id)
 
@@ -275,16 +275,30 @@ class PairwiseService:
         if pair["stage"] != "ready_to_start":
             raise ValueError("Pair 尚未完成仓库与 A/B 工作区准备")
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,))
+        if not repo or repo["status"] != "ready":
+            raise RuntimeError("Pair 仓库尚未准备完成")
+        # Also migrates pre-fix queued rows whose workspace pointed directly at
+        # the non-empty canonical clone.
+        for arm in ("A", "B"):
+            self.claude.prepare_arm(pair, arm, Path(repo["local_root"]) / "workspaces" / arm)
         runs = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
         if len(runs) != 2:
             raise RuntimeError("A/B Arm 不完整")
         started: List[Dict[str, Any]] = []
         try:
             for run in runs:
+                self.claude.reset_unsent_arm(run)
+            runs = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
+            for run in runs:
                 self.claude.launch(run)
                 started.append(run)
             for run in runs:
                 self.claude.wait_until_ready(run)
+            for run in runs:
+                self.claude.materialize_repository(
+                    run, Path(repo["local_root"]) / run["arm"], pair["baseline_sha"]
+                )
             # Both containers are started before either receives the identical prompt.
             prompt = task["prompt"]
             for run in runs:

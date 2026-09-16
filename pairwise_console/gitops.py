@@ -168,7 +168,10 @@ class GitOps:
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,))
         if not repo:
             raise RuntimeError("Pair 尚未创建仓库")
-        path = Path(repo["local_root"]) / arm
+        arm_run = self.db.one("SELECT workspace_path FROM arm_runs WHERE pair_id=? AND arm=?", (pair_id, arm))
+        if not arm_run:
+            raise RuntimeError("找不到 %s Arm 工作区" % arm)
+        path = Path(arm_run["workspace_path"])
         status = run_command(["git", "status", "--porcelain"], cwd=path).stdout.strip()
         if status:
             run_command(["git", "add", "-A"], cwd=path)

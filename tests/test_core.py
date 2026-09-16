@@ -3,7 +3,9 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from pairwise_console.commands import run_command
 from pairwise_console.config import load_config
 from pairwise_console.db import Database, now_iso
 from pairwise_console.importer import import_historical_tasks
@@ -109,6 +111,29 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(task["task_type"], "bugfix")
         self.assertEqual(task["parent_pair_id"], pair["id"])
         self.assertEqual(task["status"], "ready")
+
+    def test_arm_repository_is_imported_only_after_empty_container_start(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        source = self.root / "source-A"
+        destination = self.root / "runtime-A"
+        source.mkdir()
+        destination.mkdir()
+        run_command(["git", "init", "-b", "A"], cwd=source)
+        run_command(["git", "config", "user.name", "Test"], cwd=source)
+        run_command(["git", "config", "user.email", "test@example.com"], cwd=source)
+        (source / "README.md").write_text("baseline\n", encoding="utf-8")
+        run_command(["git", "add", "README.md"], cwd=source)
+        run_command(["git", "commit", "-m", "baseline"], cwd=source)
+        expected_sha = run_command(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+        arm = self.service.claude.prepare_arm(pair, "A", destination)
+
+        with patch.object(self.service.claude, "_container_running", return_value=True):
+            self.service.claude.materialize_repository(arm, source, expected_sha)
+
+        self.assertEqual((destination / "README.md").read_text(encoding="utf-8"), "baseline\n")
+        self.assertEqual(run_command(["git", "branch", "--show-current"], cwd=destination).stdout.strip(), "A")
+        self.assertEqual(run_command(["git", "status", "--porcelain"], cwd=destination).stdout.strip(), "")
 
 
 if __name__ == "__main__":
