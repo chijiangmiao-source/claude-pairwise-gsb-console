@@ -331,6 +331,13 @@ exit "$code"
             item = workspace / path
             if item.name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml") or item.suffix.casefold() in extensions:
                 return True
+            if item.is_dir():
+                for child in item.rglob("*"):
+                    if child.is_file() and (
+                        child.name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml")
+                        or child.suffix.casefold() in extensions
+                    ):
+                        return True
         return False
 
     @staticmethod

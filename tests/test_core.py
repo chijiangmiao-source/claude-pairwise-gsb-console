@@ -138,6 +138,11 @@ class CoreTests(unittest.TestCase):
         run_command(["git", "add", "app.py"], cwd=destination)
         run_command(["git", "commit", "-m", "implementation"], cwd=destination)
         self.assertTrue(self.service.claude.has_business_code(destination, expected_sha))
+        run_command(["git", "reset", "--hard", expected_sha], cwd=destination)
+        nested = destination / "untracked-package"
+        nested.mkdir()
+        (nested / "worker.py").write_text("print('work')\n", encoding="utf-8")
+        self.assertTrue(self.service.claude.has_business_code(destination, expected_sha))
 
 
 if __name__ == "__main__":
