@@ -1,0 +1,92 @@
+import json
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from pairwise_console.config import load_config
+from pairwise_console.db import Database, now_iso
+from pairwise_console.importer import import_historical_tasks
+from pairwise_console.service import PairwiseService
+
+
+class CoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.config = load_config(Path(__file__).resolve().parents[1])
+        from dataclasses import replace
+        self.config = replace(
+            self.config,
+            data_dir=self.root / "data",
+            db_path=self.root / "data" / "test.db",
+            projects_dir=self.root / "projects",
+            old_db_path=self.root / "old.db",
+            git_author_email="test@example.com",
+        )
+        self.db = Database(self.config.db_path)
+        self.db.initialize()
+        self.service = PairwiseService(self.config, self.db)
+
+    def tearDown(self):
+        self.service.executor.shutdown(wait=False, cancel_futures=True)
+        self.temp.cleanup()
+
+    def insert_ready_task(self):
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+               fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            ("task-1", "test", "zero_to_one", "hard-project", "Build a hard project with Docker Compose",
+             "困难", '["跨模块状态","异常恢复"]', "fingerprint-1", "ready", stamp, stamp),
+        )
+
+    def test_defaults_use_codex_for_review_and_claude_for_development(self):
+        self.assertEqual(self.db.setting("codex_model"), "gpt-5.6-sol")
+        self.assertEqual(self.db.setting("codex_default_effort"), "medium")
+        self.assertEqual(self.db.setting("codex_bug_effort"), "high")
+        self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
+
+    def test_pair_requires_ready_hard_task_and_creates_chain(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.assertEqual(pair["status"], "queued")
+        self.assertEqual(pair["stage"], "repository")
+        chain = self.db.one("SELECT * FROM project_chains WHERE id=?", (pair["chain_id"],))
+        self.assertEqual(chain["followup_required"], 1)
+        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-1'")["status"], "used")
+
+    def test_gsb_confirmation_strips_backticks_and_completes_pair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "INSERT INTO gsb_reviews(id,pair_id,verdict,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("gsb-1", pair["id"], "Same", "两边都完成了相同功能，但各有一些可以复核的实现差异。", "draft", stamp, stamp),
+        )
+        result = self.service.confirm_gsb(pair["id"], "A better", "A 的真实验收覆盖更完整，B 的异常路径仍有失败，因此 A 的交付更可靠。", "刘昱")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["gsb"]["confirmed_by"], "刘昱")
+
+    def test_historical_import_excludes_bug_and_medium(self):
+        source = sqlite3.connect(str(self.config.old_db_path))
+        source.executescript("""
+        CREATE TABLE runs(id TEXT,repo_name TEXT,task_type TEXT,task_difficulty TEXT,language_framework TEXT,
+          repo_path TEXT,repo_url TEXT,base_sha TEXT,first_prompt TEXT,status_detail TEXT,phase TEXT,
+          created_at TEXT,deleted_at TEXT);
+        """)
+        rows = [
+            ("1","hard-zero","0-1 代码生成","困难","Python","","","abc","hard prompt","","complete","2026-01-01",None),
+            ("2","hard-bug","Bug 修复","困难","Python","","","def","bug prompt","","complete","2026-01-02",None),
+            ("3","medium-zero","0-1 代码生成","中等","Python","","","ghi","medium prompt","","complete","2026-01-03",None),
+        ]
+        source.executemany("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        source.commit(); source.close()
+        result = import_historical_tasks(self.db, self.config.old_db_path)
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(self.db.one("SELECT COUNT(*) count FROM tasks")["count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

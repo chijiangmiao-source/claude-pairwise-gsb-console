@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PAIRWISE_DATA_DIR="${PAIRWISE_DATA_DIR:-$HOME/Library/Application Support/Claude A-B GSB Console/.data}"
+export PAIRWISE_PROJECTS_DIR="${PAIRWISE_PROJECTS_DIR:-$HOME/Library/Application Support/Claude A-B GSB Console/projects}"
+export PAIRWISE_PORT="${PAIRWISE_PORT:-8865}"
+export PAIRWISE_CODEX_MODEL="${PAIRWISE_CODEX_MODEL:-gpt-5.6-sol}"
+export PAIRWISE_CODEX_EFFORT="${PAIRWISE_CODEX_EFFORT:-medium}"
+export PAIRWISE_CODEX_BUG_EFFORT="${PAIRWISE_CODEX_BUG_EFFORT:-high}"
+export PAIRWISE_CLAUDE_MODEL="${PAIRWISE_CLAUDE_MODEL:-auto_model/urm}"
+export PAIRWISE_GITHUB_OWNER="${PAIRWISE_GITHUB_OWNER:-chijiangmiao-source}"
+export PAIRWISE_GIT_AUTHOR_NAME="${PAIRWISE_GIT_AUTHOR_NAME:-刘昱}"
+export PAIRWISE_GIT_AUTHOR_EMAIL="${PAIRWISE_GIT_AUTHOR_EMAIL:-290786387+chijiangmiao-source@users.noreply.github.com}"
+cd "$ROOT"
+exec /usr/bin/python3 -m pairwise_console "$@"
