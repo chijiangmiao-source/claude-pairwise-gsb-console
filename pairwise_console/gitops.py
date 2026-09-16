@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shutil
 import uuid
@@ -51,6 +52,22 @@ class GitOps:
             result["ok"] = False
             result["author"]["error"] = "尚未配置 Git 提交邮箱"
         return result
+
+    @staticmethod
+    def _github_git(args, cwd: Optional[Path] = None, timeout: int = 180, check: bool = True):
+        """Run GitHub network Git without user URL rewrite rules.
+
+        This machine may use a github.com mirror through a global insteadOf
+        rule. Background jobs must still use gh's credential helper against
+        GitHub itself, without changing the user's global Git configuration.
+        """
+        env = os.environ.copy()
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        command = [
+            "git", "-c", "credential.helper=",
+            "-c", "credential.helper=!/opt/homebrew/bin/gh auth git-credential",
+        ] + list(args)
+        return run_command(command, cwd=cwd, timeout=timeout, check=check, env=env)
 
     def create_pair_repository(self, pair: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
         pair_id = pair["id"]
@@ -115,19 +132,20 @@ class GitOps:
             main_sha = run_command(["git", "rev-parse", "HEAD"], cwd=baseline).stdout.strip()
             remote_slug = "%s/%s" % (owner, name)
             exists = run_command(["gh", "repo", "view", remote_slug, "--json", "url", "--jq", ".url"], check=False, timeout=30)
-            if exists.returncode == 0:
-                raise RuntimeError("目标仓库已经存在，不能覆盖：%s" % remote_slug)
             visibility_flag = "--private" if visibility == "private" else "--public"
-            created = run_command(
-                ["gh", "repo", "create", remote_slug, visibility_flag, "--source", str(baseline), "--remote", "origin", "--push"],
-                cwd=baseline, timeout=180,
-            )
-            remote_url = run_command(["git", "remote", "get-url", "origin"], cwd=baseline).stdout.strip()
+            canonical_remote = "https://github.com/%s.git" % remote_slug
+            if exists.returncode != 0:
+                run_command(["gh", "repo", "create", remote_slug, visibility_flag], cwd=baseline, timeout=120)
+            elif not existing:
+                raise RuntimeError("目标仓库已经存在，不能覆盖：%s" % remote_slug)
+            run_command(["git", "remote", "add", "origin", canonical_remote], cwd=baseline)
+            self._github_git(["push", "-u", "origin", "main:main"], cwd=baseline, timeout=180)
+            remote_url = canonical_remote
             for arm in ("A", "B"):
                 run_command(["git", "branch", arm, main_sha], cwd=baseline)
-                run_command(["git", "push", "origin", "%s:%s" % (arm, arm)], cwd=baseline, timeout=120)
+                self._github_git(["push", "origin", "%s:%s" % (arm, arm)], cwd=baseline, timeout=120)
                 arm_dir = local_root / arm
-                run_command(["git", "clone", "--branch", arm, "--single-branch", remote_url, str(arm_dir)], timeout=180)
+                self._github_git(["clone", "--branch", arm, "--single-branch", remote_url, str(arm_dir)], timeout=180)
                 run_command(["git", "config", "user.name", author_name], cwd=arm_dir)
                 run_command(["git", "config", "user.email", author_email], cwd=arm_dir)
             self.db.execute(
@@ -156,8 +174,8 @@ class GitOps:
             run_command(["git", "add", "-A"], cwd=path)
             run_command(["git", "commit", "-m", "Deliver %s implementation" % arm], cwd=path)
         sha = run_command(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
-        run_command(["git", "push", "origin", "HEAD:%s" % arm], cwd=path, timeout=180)
-        remote_sha = run_command(["git", "ls-remote", "origin", "refs/heads/%s" % arm], cwd=path).stdout.split()[0]
+        self._github_git(["push", "origin", "HEAD:%s" % arm], cwd=path, timeout=180)
+        remote_sha = self._github_git(["ls-remote", "origin", "refs/heads/%s" % arm], cwd=path).stdout.split()[0]
         if sha != remote_sha:
             raise RuntimeError("%s 远端 SHA 校验失败" % arm)
         column = "a_sha" if arm == "A" else "b_sha"
