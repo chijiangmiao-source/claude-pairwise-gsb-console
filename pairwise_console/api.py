@@ -106,6 +106,10 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 operation = self.app.service.generate_gsb_async(match.group(1))
                 return self._json(202, {"operationId": operation})
+            match = re.fullmatch(r"/api/pairs/([^/]+)/bugs/discover", path)
+            if match:
+                operation = self.app.service.discover_bugs_async(match.group(1))
+                return self._json(202, {"operationId": operation})
             match = re.fullmatch(r"/api/pairs/([^/]+)/recordings/([AB])/(start|stop)", path)
             if match:
                 pair_id, arm, action = match.groups()

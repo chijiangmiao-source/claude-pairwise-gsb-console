@@ -167,3 +167,29 @@ TASK_SCHEMA = {
         "acceptance": {"type": "array", "items": {"type": "string"}, "minItems": 3},
     },
 }
+
+BUG_DISCOVERY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["searchSummary", "candidates"],
+    "properties": {
+        "searchSummary": {"type": "string", "maxLength": 1200},
+        "candidates": {
+            "type": "array", "maxItems": 5,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["title", "preconditions", "steps", "actual", "expected", "difficulty", "difficultyEvidence", "sourcePaths"],
+                "properties": {
+                    "title": {"type": "string", "maxLength": 160},
+                    "preconditions": {"type": "string", "maxLength": 1000},
+                    "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 12},
+                    "actual": {"type": "string", "maxLength": 1200},
+                    "expected": {"type": "string", "maxLength": 1200},
+                    "difficulty": {"type": "string", "enum": ["简单", "中等", "困难", "地狱"]},
+                    "difficultyEvidence": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                    "sourcePaths": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+                },
+            },
+        },
+    },
+}

@@ -11,12 +11,12 @@ from typing import Any, Dict, List, Optional
 from .analytics import dashboard
 from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
-from .codex_runner import CodexRunner, GSB_SCHEMA, TASK_SCHEMA
+from .codex_runner import BUG_DISCOVERY_SCHEMA, CodexRunner, GSB_SCHEMA, TASK_SCHEMA
 from .config import Config
 from .db import Database, now_iso
 from .gitops import GitOps
 from .importer import fingerprint, import_historical_tasks
-from .prompts import gsb_prompt, task_generation_prompt, task_validation_prompt
+from .prompts import bug_discovery_prompt, gsb_prompt, task_generation_prompt, task_validation_prompt
 from .recording import RecordingManager
 
 
@@ -302,6 +302,47 @@ class PairwiseService:
         operation = "gsb-" + pair_id
         self._submit(operation, self.generate_gsb, pair_id)
         return operation
+
+    def discover_bugs_async(self, pair_id: str) -> str:
+        operation = "bugs-" + pair_id
+        self._submit(operation, self.discover_bugs, pair_id)
+        return operation
+
+    def discover_bugs(self, pair_id: str) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        if pair["status"] != "completed":
+            raise ValueError("只有 GSB 已人工确认的 Pair 才能进入后续 Bug 搜索")
+        task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        selected = "B" if pair["winner"] == "B better" else "A"
+        arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (pair_id, selected))
+        check = self.db.one("SELECT * FROM artifact_checks WHERE pair_id=? AND arm=? AND status='passed'", (pair_id, selected))
+        if not arm or not check:
+            raise ValueError("选定产物缺少已通过的 Docker 验收证据")
+        result = self.codex.run(
+            "bug_discovery",
+            bug_discovery_prompt(task.get("prompt", ""), selected, arm.get("commit_sha", ""), json.dumps(check, ensure_ascii=False)),
+            BUG_DISCOVERY_SCHEMA,
+            cwd=Path(arm["workspace_path"]), pair_id=pair_id, task_id=pair["task_id"], timeout=2400,
+        )
+        created = []
+        for candidate in result["candidates"]:
+            candidate_id = "bug-" + uuid.uuid4().hex[:16]
+            difficulty = candidate["difficulty"]
+            status = "awaiting_reproduction" if difficulty in ("困难", "地狱") else "difficulty_rejected"
+            stamp = now_iso()
+            self.db.execute(
+                """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
+                   reproduction_steps_json,actual_result,expected_result,difficulty,difficulty_evidence_json,status,
+                   created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (candidate_id, pair_id, selected, arm["commit_sha"], candidate["title"], candidate["preconditions"],
+                 json.dumps(candidate["steps"], ensure_ascii=False), candidate["actual"], candidate["expected"],
+                 difficulty, json.dumps(candidate["difficultyEvidence"], ensure_ascii=False), status, stamp, stamp),
+            )
+            created.append(candidate_id)
+        self.db.audit("bug.discovery_completed", "pair", pair_id, {
+            "arm": selected, "searchSummary": result["searchSummary"], "candidateIds": created,
+        })
+        return {"pairId": pair_id, "arm": selected, "searchSummary": result["searchSummary"], "candidateIds": created}
 
     def start_recording(self, pair_id: str, arm: str, x: int = 0, y: int = 0) -> Dict[str, Any]:
         pair = self._pair(pair_id)

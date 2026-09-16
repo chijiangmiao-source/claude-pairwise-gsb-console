@@ -51,3 +51,19 @@ B 证据：
 {b_evidence}
 
 只按 Schema 返回。"""
+
+
+def bug_discovery_prompt(task: str, arm: str, commit_sha: str, docker_evidence: str) -> str:
+    return f"""你负责在已经真实开发并通过 Docker 初步验收的产物中寻找 Bug。当前只做只读代码和证据分析，提出可由系统随后在清洁 Docker 环境中实际复现的候选；不能把静态猜测直接写成已复现事实。
+
+优先寻找复杂状态、并发、持久化、兼容性、权限、性能边界或异常恢复中的真实缺陷。候选必须给出明确前置条件、逐步操作、预期结果、预计实际结果、代码位置和修复复杂度。修复复杂度只有困难或地狱才可能生成 Bug Pair；简单和中等也可以记录，但会被标记为 difficulty_rejected。API 限流、证书、网络临时中断和机器资源不足不是产品 Bug。找不到可信候选时返回空 candidates，禁止编造。
+
+原任务：
+{task}
+
+待检查产物：Arm {arm}，提交 {commit_sha}
+
+现有 Docker 验收证据：
+{docker_evidence}
+
+只按 Schema输出。"""
