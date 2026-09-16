@@ -127,6 +127,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.app.db.set_setting(str(key), value)
                 self.app.db.audit("settings.updated", "settings", "", {"keys": list(body)})
                 return self._json(200, {"ok": True})
+            match = re.fullmatch(r"/api/bug-candidates/([^/]+)/(reproduce|convert)", path)
+            if match:
+                candidate_id, action = match.groups()
+                if action == "reproduce":
+                    operation = self.app.service.reproduce_bug_async(candidate_id)
+                    return self._json(202, {"operationId": operation})
+                return self._json(201, self.app.service.convert_bug_to_task(candidate_id))
             self._json(404, {"error": "接口不存在"})
         except KeyError as exc:
             self._json(404, {"error": str(exc)})

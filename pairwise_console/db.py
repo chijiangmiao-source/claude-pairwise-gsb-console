@@ -51,6 +51,13 @@ class Database:
             ):
                 if name not in columns:
                     c.execute("ALTER TABLE arm_runs ADD COLUMN %s %s" % (name, definition))
+            bug_columns = {row[1] for row in c.execute("PRAGMA table_info(bug_candidates)")}
+            for name, definition in (
+                ("reproduction_commands_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("reproduction_results_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if name not in bug_columns:
+                    c.execute("ALTER TABLE bug_candidates ADD COLUMN %s %s" % (name, definition))
             c.execute(
                 "INSERT OR IGNORE INTO metadata(key,value) VALUES('schema_version',?)",
                 (str(SCHEMA_VERSION),),
@@ -254,6 +261,8 @@ CREATE TABLE IF NOT EXISTS bug_candidates (
   title TEXT NOT NULL,
   preconditions TEXT NOT NULL,
   reproduction_steps_json TEXT NOT NULL,
+  reproduction_commands_json TEXT NOT NULL DEFAULT '[]',
+  reproduction_results_json TEXT NOT NULL DEFAULT '[]',
   actual_result TEXT NOT NULL,
   expected_result TEXT NOT NULL,
   reproduce_count INTEGER NOT NULL DEFAULT 0,

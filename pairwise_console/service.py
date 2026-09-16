@@ -18,6 +18,7 @@ from .gitops import GitOps
 from .importer import fingerprint, import_historical_tasks
 from .prompts import bug_discovery_prompt, gsb_prompt, task_generation_prompt, task_validation_prompt
 from .recording import RecordingManager
+from .commands import redact, run_command
 
 
 VALIDATION_SCHEMA = {
@@ -332,10 +333,11 @@ class PairwiseService:
             stamp = now_iso()
             self.db.execute(
                 """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
-                   reproduction_steps_json,actual_result,expected_result,difficulty,difficulty_evidence_json,status,
-                   created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   reproduction_steps_json,reproduction_commands_json,actual_result,expected_result,difficulty,
+                   difficulty_evidence_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (candidate_id, pair_id, selected, arm["commit_sha"], candidate["title"], candidate["preconditions"],
-                 json.dumps(candidate["steps"], ensure_ascii=False), candidate["actual"], candidate["expected"],
+                 json.dumps(candidate["steps"], ensure_ascii=False), json.dumps(candidate["reproductionCommands"], ensure_ascii=False),
+                 candidate["actual"], candidate["expected"],
                  difficulty, json.dumps(candidate["difficultyEvidence"], ensure_ascii=False), status, stamp, stamp),
             )
             created.append(candidate_id)
@@ -343,6 +345,108 @@ class PairwiseService:
             "arm": selected, "searchSummary": result["searchSummary"], "candidateIds": created,
         })
         return {"pairId": pair_id, "arm": selected, "searchSummary": result["searchSummary"], "candidateIds": created}
+
+    def reproduce_bug_async(self, candidate_id: str) -> str:
+        operation = "reproduce-" + candidate_id
+        self._submit(operation, self.reproduce_bug, candidate_id)
+        return operation
+
+    def reproduce_bug(self, candidate_id: str) -> Dict[str, Any]:
+        candidate = self.db.one("SELECT * FROM bug_candidates WHERE id=?", (candidate_id,))
+        if not candidate:
+            raise KeyError("Bug 候选不存在")
+        if candidate["status"] == "difficulty_rejected":
+            raise ValueError("简单或中等 Bug 只保留记录，不能进入复现与 Pair")
+        arm = self.db.one(
+            "SELECT * FROM arm_runs WHERE pair_id=? AND arm=? AND commit_sha=?",
+            (candidate["source_pair_id"], candidate["source_arm"], candidate["source_sha"]),
+        )
+        if not arm:
+            raise ValueError("找不到候选对应的固定提交工作区")
+        workspace = Path(arm["workspace_path"])
+        compose = self.artifacts._compose_path(workspace)
+        if not compose:
+            raise ValueError("来源产物缺少 Compose 文件")
+        commands = json.loads(candidate["reproduction_commands_json"] or "[]")
+        if not commands:
+            raise ValueError("候选缺少可执行复现命令")
+        self.db.execute("UPDATE bug_candidates SET status='reproducing',error='',updated_at=? WHERE id=?", (now_iso(), candidate_id))
+        attempts = []
+        try:
+            for attempt in (1, 2):
+                project = "bugrep-%s-%d" % (candidate_id[-8:].lower(), attempt)
+                attempt_result = {"attempt": attempt, "commands": [], "passed": True}
+                run_command(["docker", "compose", "-p", project, "-f", str(compose), "down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180)
+                up = run_command(["docker", "compose", "-p", project, "-f", str(compose), "up", "-d", "--build"], cwd=workspace, check=False, timeout=1200)
+                attempt_result["startExitCode"] = up.returncode
+                if up.returncode != 0:
+                    attempt_result["passed"] = False
+                    attempt_result["startOutput"] = redact(up.stderr or up.stdout)
+                else:
+                    time.sleep(3)
+                    for spec in commands:
+                        args = spec.get("composeArgs") if isinstance(spec, dict) else None
+                        if not isinstance(args, list) or not args or not all(isinstance(x, str) and x for x in args):
+                            raise ValueError("复现命令格式无效")
+                        if args[0] not in ("exec", "run") or any(x in ("down", "rm", "kill", "stop") for x in args):
+                            raise ValueError("复现命令只允许 docker compose exec 或 run")
+                        result = run_command(
+                            ["docker", "compose", "-p", project, "-f", str(compose)] + args,
+                            cwd=workspace, check=False, timeout=600,
+                        )
+                        combined = (result.stdout + "\n" + result.stderr).strip()
+                        expected_code = int(spec.get("expectedExitCode", 0))
+                        marker = str(spec.get("expectedOutputContains") or "")
+                        matched = result.returncode == expected_code and (not marker or marker in combined)
+                        attempt_result["commands"].append({
+                            "composeArgs": args, "exitCode": result.returncode, "expectedExitCode": expected_code,
+                            "expectedOutputContains": marker, "matched": matched, "output": redact(combined),
+                        })
+                        attempt_result["passed"] = attempt_result["passed"] and matched
+                run_command(["docker", "compose", "-p", project, "-f", str(compose), "down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180)
+                attempts.append(attempt_result)
+            reproduced = len(attempts) == 2 and all(item["passed"] for item in attempts)
+            status = "reproduced" if reproduced else "not_reproduced"
+            error = "" if reproduced else "两次清洁环境复现未得到一致的预期结果"
+            self.db.execute(
+                """UPDATE bug_candidates SET reproduce_count=?,reproduction_results_json=?,status=?,error=?,updated_at=? WHERE id=?""",
+                (sum(1 for item in attempts if item["passed"]), json.dumps(attempts, ensure_ascii=False), status, error, now_iso(), candidate_id),
+            )
+            self.db.audit("bug.reproduction_finished", "bug_candidate", candidate_id, {"status": status, "attempts": attempts})
+            return self.db.one("SELECT * FROM bug_candidates WHERE id=?", (candidate_id,)) or {}
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE bug_candidates SET status='reproduction_failed',reproduction_results_json=?,error=?,updated_at=? WHERE id=?",
+                (json.dumps(attempts, ensure_ascii=False), str(exc)[-3000:], now_iso(), candidate_id),
+            )
+            raise
+
+    def convert_bug_to_task(self, candidate_id: str) -> Dict[str, Any]:
+        candidate = self.db.one("SELECT * FROM bug_candidates WHERE id=?", (candidate_id,))
+        if not candidate:
+            raise KeyError("Bug 候选不存在")
+        if candidate["status"] != "reproduced" or candidate["reproduce_count"] < 2 or candidate["difficulty"] not in ("困难", "地狱"):
+            raise ValueError("只有双次复现且难度为困难或地狱的 Bug 才能创建任务")
+        arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (candidate["source_pair_id"], candidate["source_arm"])) or {}
+        prompt = "%s\n\n前置条件：%s\n\n复现步骤：\n%s\n\n实际结果：%s\n\n预期结果：%s\n\n请修复该问题，保留现有 Docker Compose 启动与验收链路，并补充覆盖复现路径的自动化验收。" % (
+            candidate["title"], candidate["preconditions"],
+            "\n".join("%d. %s" % (i + 1, step) for i, step in enumerate(json.loads(candidate["reproduction_steps_json"]))),
+            candidate["actual_result"], candidate["expected_result"],
+        )
+        task_id = "task-" + uuid.uuid4().hex[:16]
+        key = fingerprint("bugfix", prompt, candidate["source_sha"])
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,difficulty,difficulty_evidence_json,
+               baseline_path,baseline_sha,parent_pair_id,fingerprint,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, "bug_discovery", candidate_id, "bugfix", candidate["title"], prompt, candidate["difficulty"],
+             candidate["difficulty_evidence_json"], arm.get("workspace_path", ""), candidate["source_sha"],
+             candidate["source_pair_id"], key, "ready", stamp, stamp),
+        )
+        self.db.execute("UPDATE bug_candidates SET status='converted',updated_at=? WHERE id=?", (stamp, candidate_id))
+        self.db.audit("bug.converted_to_task", "bug_candidate", candidate_id, {"task_id": task_id})
+        return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
 
     def start_recording(self, pair_id: str, arm: str, x: int = 0, y: int = 0) -> Dict[str, Any]:
         pair = self._pair(pair_id)

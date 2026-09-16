@@ -56,7 +56,9 @@ B 证据：
 def bug_discovery_prompt(task: str, arm: str, commit_sha: str, docker_evidence: str) -> str:
     return f"""你负责在已经真实开发并通过 Docker 初步验收的产物中寻找 Bug。当前只做只读代码和证据分析，提出可由系统随后在清洁 Docker 环境中实际复现的候选；不能把静态猜测直接写成已复现事实。
 
-优先寻找复杂状态、并发、持久化、兼容性、权限、性能边界或异常恢复中的真实缺陷。候选必须给出明确前置条件、逐步操作、预期结果、预计实际结果、代码位置和修复复杂度。修复复杂度只有困难或地狱才可能生成 Bug Pair；简单和中等也可以记录，但会被标记为 difficulty_rejected。API 限流、证书、网络临时中断和机器资源不足不是产品 Bug。找不到可信候选时返回空 candidates，禁止编造。
+优先寻找复杂状态、并发、持久化、兼容性、权限、性能边界或异常恢复中的真实缺陷。候选必须给出明确前置条件、逐步操作、预期结果、预计实际结果、代码位置和修复复杂度。每个候选还必须提供 reproductionCommands：每项只写 docker compose 的子参数，例如 ["exec","-T","api","pytest","tests/test_x.py::test_case"] 或 ["run","--rm","verify",...]；系统会统一补上 docker compose、项目名和 Compose 文件，并在两次全新启动中执行。命令必须只读取或测试当前产物，不能修改源码、宿主设置、Git 或其他项目。expectedExitCode 与 expectedOutputContains 要能客观判断该缺陷是否复现。没有现成的可重复命令就不要输出该候选。
+
+修复复杂度只有困难或地狱才可能生成 Bug Pair；简单和中等也可以记录，但会被标记为 difficulty_rejected。API 限流、证书、网络临时中断和机器资源不足不是产品 Bug。找不到可信候选时返回空 candidates，禁止编造。
 
 原任务：
 {task}

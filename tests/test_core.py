@@ -86,7 +86,30 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["imported"], 1)
         self.assertEqual(self.db.one("SELECT COUNT(*) count FROM tasks")["count"], 1)
 
+    def test_only_twice_reproduced_hard_bug_converts_to_task(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,model,image,
+               status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("arm-a", pair["id"], "A", "A", str(self.root), "container", "screen", "auto_model/urm",
+             "image", "completed", "abc123", stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
+               reproduction_steps_json,actual_result,expected_result,reproduce_count,difficulty,
+               difficulty_evidence_json,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("bug-1", pair["id"], "A", "abc123", "Concurrent commit loses update", "two clients",
+             '["send two requests"]', "one update disappears", "both updates persist", 2, "困难",
+             '["并发事务","异常恢复"]', "reproduced", stamp, stamp),
+        )
+        task = self.service.convert_bug_to_task("bug-1")
+        self.assertEqual(task["task_type"], "bugfix")
+        self.assertEqual(task["parent_pair_id"], pair["id"])
+        self.assertEqual(task["status"], "ready")
+
 
 if __name__ == "__main__":
     unittest.main()
-

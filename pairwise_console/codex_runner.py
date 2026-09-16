@@ -178,11 +178,23 @@ BUG_DISCOVERY_SCHEMA = {
             "type": "array", "maxItems": 5,
             "items": {
                 "type": "object", "additionalProperties": False,
-                "required": ["title", "preconditions", "steps", "actual", "expected", "difficulty", "difficultyEvidence", "sourcePaths"],
+                "required": ["title", "preconditions", "steps", "reproductionCommands", "actual", "expected", "difficulty", "difficultyEvidence", "sourcePaths"],
                 "properties": {
                     "title": {"type": "string", "maxLength": 160},
                     "preconditions": {"type": "string", "maxLength": 1000},
                     "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 12},
+                    "reproductionCommands": {
+                        "type": "array", "minItems": 1, "maxItems": 8,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["composeArgs", "expectedExitCode", "expectedOutputContains"],
+                            "properties": {
+                                "composeArgs": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 30},
+                                "expectedExitCode": {"type": "integer", "minimum": 0, "maximum": 255},
+                                "expectedOutputContains": {"type": "string", "maxLength": 300},
+                            },
+                        },
+                    },
                     "actual": {"type": "string", "maxLength": 1200},
                     "expected": {"type": "string", "maxLength": 1200},
                     "difficulty": {"type": "string", "enum": ["简单", "中等", "困难", "地狱"]},
