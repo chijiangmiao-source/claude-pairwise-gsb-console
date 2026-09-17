@@ -2366,9 +2366,15 @@ class PairwiseService:
             })
             raise
 
+    def _arm_comparison_sha(self, pair_id: str, arm: str) -> str:
+        pair = self.db.one("SELECT baseline_sha FROM pairs WHERE id=?", (pair_id,)) or {}
+        repo = self.db.one("SELECT a_sha,b_sha FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
+        column = "a_sha" if arm == "A" else "b_sha"
+        source_sha = str(repo.get(column) or pair.get("baseline_sha") or "")
+        return source_sha if re.fullmatch(r"[0-9a-f]{40}", source_sha) else ""
+
     def _monitor_arm(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
         started = time.monotonic()
-        pair_baseline = (self.db.one("SELECT baseline_sha FROM pairs WHERE id=?", (pair_id,)) or {}).get("baseline_sha", "")
         initial = self.db.one("SELECT prompt_sent_at FROM arm_runs WHERE id=?", (arm_id,)) or {}
         try:
             sent_at = datetime.fromisoformat(str(initial.get("prompt_sent_at") or ""))
@@ -2433,7 +2439,9 @@ class PairwiseService:
                     continue
             elapsed = time.monotonic() - started
             workspace = Path(arm["workspace_path"])
-            has_code = self.claude.has_business_code(workspace, pair_baseline)
+            has_code = self.claude.has_business_code(
+                workspace, self._arm_comparison_sha(pair_id, str(arm["arm"])),
+            )
             if elapsed >= int(self.db.setting("first_prompt_warning_minutes", 15)) * 60 and not has_code and not warned:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))

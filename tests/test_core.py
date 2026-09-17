@@ -1065,6 +1065,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(materialize.call_args.args[2], delivered)
         self.assertEqual(result, {"status": "completed"})
 
+    def test_artifact_retry_compares_new_work_with_delivered_commit(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        baseline = "b" * 40
+        delivered = "a" * 40
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET baseline_sha=? WHERE id=?", (baseline, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO git_repositories(id,pair_id,owner,name,visibility,local_root,
+               main_sha,a_sha,b_sha,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'ready',?,?)""",
+            ("repo-source", pair["id"], "owner", "repo", "public", str(self.root),
+             baseline, delivered, baseline, stamp, stamp),
+        )
+        self.assertEqual(self.service._arm_comparison_sha(pair["id"], "A"), delivered)
+        self.assertEqual(self.service._arm_comparison_sha(pair["id"], "B"), baseline)
+
     def test_scheduler_recovers_only_stale_unsent_retry(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
