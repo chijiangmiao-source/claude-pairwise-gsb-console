@@ -67,6 +67,8 @@ class PairwiseService:
         self._scheduler_started = False
         self._automation_lock = threading.Lock()
         self._pair_creation_lock = threading.Lock()
+        self._repository_locks_lock = threading.Lock()
+        self._repository_locks: Dict[str, threading.Lock] = {}
         self._pair_completion_lock = threading.RLock()
         self._auto_retry_after: Dict[str, float] = {}
         self._artifact_retry_after: Dict[str, float] = {}
@@ -699,13 +701,20 @@ class PairwiseService:
         return operation
 
     def prepare_pair_repository(self, pair_id: str) -> Dict[str, Any]:
-        pair = self._pair(pair_id)
-        task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
-        repo = self.git.create_pair_repository(pair, task)
-        for arm in ("A", "B"):
-            self.claude.prepare_arm(pair, arm, Path(repo["local_root"]) / "workspaces" / arm)
-        self.db.execute("UPDATE pairs SET stage='ready_to_start',updated_at=? WHERE id=?", (now_iso(), pair_id))
-        return self.pair_detail(pair_id)
+        # Replacement and scheduler paths may discover the same repository
+        # stage at once. Serialize work for this Pair so a second caller sees
+        # the first caller's ready repository instead of running `git remote
+        # add origin` against the same baseline concurrently.
+        with self._repository_locks_lock:
+            repository_lock = self._repository_locks.setdefault(pair_id, threading.Lock())
+        with repository_lock:
+            pair = self._pair(pair_id)
+            task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+            repo = self.git.create_pair_repository(pair, task)
+            for arm in ("A", "B"):
+                self.claude.prepare_arm(pair, arm, Path(repo["local_root"]) / "workspaces" / arm)
+            self.db.execute("UPDATE pairs SET stage='ready_to_start',updated_at=? WHERE id=?", (now_iso(), pair_id))
+            return self.pair_detail(pair_id)
 
     def start_pair_async(self, pair_id: str) -> str:
         operation = "start-" + pair_id

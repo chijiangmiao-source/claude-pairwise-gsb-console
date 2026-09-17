@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from io import BytesIO
@@ -214,6 +215,37 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(outcomes.count("created"), 3)
         self.assertEqual(self.db.one("SELECT COUNT(*) count FROM pairs")["count"], 3)
         self.assertTrue(any("最多 3 个 Pair" in outcome for outcome in outcomes))
+
+    def test_concurrent_repository_preparation_is_serialized_per_pair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        local_root = self.root / "repository-lock"
+        local_root.mkdir()
+        active = 0
+        maximum_active = 0
+        calls_lock = threading.Lock()
+
+        def prepare_repo(*_args):
+            nonlocal active, maximum_active
+            with calls_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.08)
+            with calls_lock:
+                active -= 1
+            return {"local_root": str(local_root), "status": "ready"}
+
+        with patch.object(self.service.git, "create_pair_repository", side_effect=prepare_repo), \
+             patch.object(self.service.claude, "prepare_arm"):
+            threads = [threading.Thread(
+                target=self.service.prepare_pair_repository, args=(pair["id"],),
+            ) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(maximum_active, 1)
 
     def test_one_click_automation_is_persistent_and_forces_three_pair_target(self):
         self.db.set_setting("max_pairs_parallel", 1)
