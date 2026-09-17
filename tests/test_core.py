@@ -698,8 +698,10 @@ class CoreTests(unittest.TestCase):
              patch("pairwise_console.claude_runner.run_command") as command:
             updated = self.service.claude.archive_failed_attempt(
                 self.db.one("SELECT * FROM arm_runs WHERE id='arm-copy-fail'"), "API Error: 429", True,
+                count_development_failure=False,
             )
-        self.assertEqual(updated["attempt_no"], 2)
+        self.assertEqual(updated["attempt_no"], 1)
+        self.assertEqual(updated["error_retry_count"], 1)
         self.assertEqual(updated["status"], "queued")
         self.assertNotEqual(updated["container_name"], "old-container")
         self.assertNotEqual(updated["workspace_path"], str(workspace))
@@ -756,6 +758,28 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         archive.assert_called_once()
         replace.assert_called_once_with(pair["id"], arm["id"], "container exited")
+
+    def test_429_and_504_restart_without_consuming_development_attempts(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
+        arm = {"id": "arm-transient-api", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
+        errors = (
+            "API Error: Request rejected (429) · litellm.RateLimitError: max_parallel_requests",
+            "API Error: 504 Gateway Timeout",
+        )
+        for error in errors:
+            with self.subTest(error=error), \
+                 patch.object(self.service, "_restart_arm_from_baseline",
+                              return_value={**arm, "status": "developing"}) as restart, \
+                 patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
+                result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", error)
+            self.assertEqual(result["status"], "developing")
+            restart.assert_called_once_with(
+                pair["id"], arm, "same prompt", error,
+                count_development_failure=False,
+            )
+            replace.assert_not_called()
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()

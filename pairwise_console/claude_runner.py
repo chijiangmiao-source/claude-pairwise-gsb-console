@@ -98,7 +98,8 @@ class ClaudeRunner:
         )
 
     def archive_failed_attempt(self, arm_run: Dict[str, Any], error: str,
-                               prepare_retry: bool = True) -> Dict[str, Any]:
+                               prepare_retry: bool = True,
+                               count_development_failure: bool = True) -> Dict[str, Any]:
         """Preserve one failed attempt and optionally prepare a fresh session.
 
         The old container is removed only after its trace copy has been checked.
@@ -164,7 +165,7 @@ class ClaudeRunner:
                 workspace_archived = True
             except OSError as exc:
                 (archive / "workspace-export-error.txt").write_text(redact(str(exc)), encoding="utf-8")
-        next_attempt = attempt_no + 1
+        next_attempt = attempt_no + 1 if count_development_failure else attempt_no
         next_workspace = workspace
         next_container = container
         next_screen = arm_run["screen_name"]
@@ -195,12 +196,15 @@ class ClaudeRunner:
             "trace_exported": trace_exported, "trace_error": trace_error, "stop_error": stop_error,
             "container_retained": bool(container_exists and self._container_exists(container)),
             "workspace_archived": workspace_archived, "retry_prepared": prepare_retry,
+            "counts_toward_development_attempts": count_development_failure,
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_run["id"],)) or {}
 
     def restart_after_api_error(self, arm_run: Dict[str, Any], error: str) -> Dict[str, Any]:
         """Backward-compatible entry point for fresh-session error recovery."""
-        return self.archive_failed_attempt(arm_run, error, prepare_retry=True)
+        return self.archive_failed_attempt(
+            arm_run, error, prepare_retry=True, count_development_failure=False,
+        )
 
     def materialize_repository(self, arm_run: Dict[str, Any], source: Path, expected_sha: str) -> None:
         """Import an exact branch snapshot after Claude accepts the empty mount."""

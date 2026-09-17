@@ -1526,10 +1526,25 @@ class PairwiseService:
         pair["delivery"] = self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,))
         return pair
 
+    @staticmethod
+    def _is_transient_claude_api_error(error: str) -> bool:
+        text = str(error or "").casefold()
+        api_context = "api error" in text or "litellm" in text
+        rate_limited = any(token in text for token in (
+            "rate limit", "rate_limit", "ratelimiterror", "too many requests",
+            "max_parallel_requests",
+        ))
+        gateway_timeout = "gateway timeout" in text or "gateway_timeout" in text
+        status_code = bool(re.search(r"(?:^|\D)(?:429|504)(?:\D|$)", text))
+        return api_context and (rate_limited or gateway_timeout or status_code)
+
     def _restart_arm_from_baseline(self, pair_id: str, arm: Dict[str, Any], prompt: str,
-                                   error: str) -> Dict[str, Any]:
+                                   error: str, count_development_failure: bool = True) -> Dict[str, Any]:
         pair = self._pair(pair_id)
-        restarted = self.claude.archive_failed_attempt(arm, error, prepare_retry=True)
+        restarted = self.claude.archive_failed_attempt(
+            arm, error, prepare_retry=True,
+            count_development_failure=count_development_failure,
+        )
         canonical = self.git.reset_arm_to_baseline(pair_id, str(arm["arm"]))
         lowered = error.casefold()
         delay = 20 if any(token in lowered for token in ("429", "504", "rate limit", "rate_limit")) else 8
@@ -1549,6 +1564,7 @@ class PairwiseService:
         self.db.audit("claude.arm_restarted_after_error", "arm_run", arm["id"], {
             "attempt": int(restarted.get("attempt_no") or 1), "baseline_sha": pair["baseline_sha"],
             "reason": redact(error)[-1000:], "prompt_mode": "same_original_prompt_once",
+            "counts_toward_development_attempts": count_development_failure,
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
 
@@ -1562,16 +1578,22 @@ class PairwiseService:
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
         attempt = max(1, int(arm.get("attempt_no") or 1))
         maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
+        transient_api_error = self._is_transient_claude_api_error(error)
         self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
             "attempt": attempt, "maximum": maximum, "error": redact(error)[-1000:],
-            "action": "replace_task" if attempt >= maximum else "fresh_session_from_baseline",
+            "action": "fresh_session_from_baseline_without_failure_count" if transient_api_error
+                      else ("replace_task" if attempt >= maximum else "fresh_session_from_baseline"),
+            "counts_toward_development_attempts": not transient_api_error,
         })
-        if attempt >= maximum:
+        if not transient_api_error and attempt >= maximum:
             archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
             self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error)
             return archived
         try:
-            return self._restart_arm_from_baseline(pair_id, arm, prompt, error)
+            return self._restart_arm_from_baseline(
+                pair_id, arm, prompt, error,
+                count_development_failure=not transient_api_error,
+            )
         except Exception as exc:
             current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
             return self._handle_attempt_failure(
