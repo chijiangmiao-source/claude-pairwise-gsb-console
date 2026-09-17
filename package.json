@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "ffmpeg-static": "^5.2.0",
     "playwright": "^1.63.0"
   }
 }

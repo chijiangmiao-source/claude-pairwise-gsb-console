@@ -53,11 +53,13 @@ class RecordingManager:
         chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         script = self.config.web_dir.parent / "scripts" / "browser_recorder.mjs"
         playwright = self.config.web_dir.parent / "node_modules" / "playwright"
+        converter = self.config.web_dir.parent / "node_modules" / "ffmpeg-static" / "ffmpeg"
         ffmpeg = list((Path.home() / "Library/Caches/ms-playwright").glob("ffmpeg-*/ffmpeg-mac"))
         node = shutil.which("node")
-        ok = bool(node and chrome.is_file() and script.is_file() and playwright.is_dir() and ffmpeg)
+        ok = bool(node and chrome.is_file() and script.is_file() and playwright.is_dir() and converter.is_file() and ffmpeg)
         return {"ok": ok, "node": node or "", "chrome": str(chrome), "script": str(script),
-                "playwright": playwright.is_dir(), "ffmpeg": str(ffmpeg[-1]) if ffmpeg else ""}
+                "playwright": playwright.is_dir(), "ffmpeg": str(ffmpeg[-1]) if ffmpeg else "",
+                "mp4Converter": str(converter) if converter.is_file() else ""}
 
     def start(self, pair_id: str, arm: str, x: int = 0, y: int = 0) -> Dict[str, Any]:
         if arm not in ("A", "B"):
@@ -84,7 +86,7 @@ class RecordingManager:
         attempt_id = "rec-attempt-" + uuid.uuid4().hex[:16]
         folder = self.root / pair_id
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / ("%s-%s.webm" % (arm, attempt_id[-8:]))
+        path = folder / ("%s-%s.mp4" % (arm, attempt_id[-8:]))
         stamp = now_iso()
         project = "pairdemo-%s-%s" % (pair_id[-8:].lower(), arm.lower())
         self.db.execute(

@@ -1,4 +1,6 @@
 import { chromium } from "playwright";
+import ffmpegPath from "ffmpeg-static";
+import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 
@@ -15,6 +17,24 @@ let finishing = false;
 let demonstrationPromise = Promise.resolve({ required: false, ok: true });
 let monitorRequests = false;
 const successfulRequests = [];
+
+async function saveVideo(sourcePath, targetPath) {
+  if (!targetPath.toLowerCase().endsWith(".mp4")) {
+    await copyFile(sourcePath, targetPath);
+    return;
+  }
+  await new Promise((resolve, reject) => {
+    const command = spawn(ffmpegPath, [
+      "-hide_banner", "-loglevel", "error", "-y", "-i", sourcePath,
+      "-map", "0:v:0", "-an", "-c:v", "libx264", "-preset", "medium",
+      "-crf", "21", "-pix_fmt", "yuv420p", "-movflags", "+faststart", targetPath,
+    ]);
+    let error = "";
+    command.stderr.on("data", (chunk) => { error += chunk.toString(); });
+    command.on("error", reject);
+    command.on("close", (code) => code === 0 ? resolve() : reject(new Error(`MP4 转换失败：${error.slice(-2000)}`)));
+  });
+}
 
 function resolveSchema(schema, spec) {
   if (!schema?.$ref) return schema || {};
@@ -147,7 +167,7 @@ async function finish(reason) {
     stopping = true;
     const video = pages[0]?.video();
     await context?.close();
-    if (video) await copyFile(await video.path(), outputPath);
+    if (video) await saveVideo(await video.path(), outputPath);
     if (demonstration.required && !demonstration.ok) {
       throw new Error(demonstration.error || `真实接口请求失败：HTTP ${demonstration.status || "未知"}`);
     }
