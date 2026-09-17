@@ -1023,6 +1023,69 @@ class CoreTests(unittest.TestCase):
         current = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(current["stage"], "development")
 
+    def test_pending_artifact_retry_recovers_from_delivered_commit(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        baseline = "b" * 40
+        delivered = "a" * 40
+        stamp = now_iso()
+        repo_root = self.root / "pair-repo"
+        (repo_root / "A").mkdir(parents=True)
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development',baseline_sha=? WHERE id=?",
+            (baseline, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO git_repositories(id,pair_id,owner,name,visibility,local_root,
+               main_sha,a_sha,b_sha,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'ready',?,?)""",
+            ("repo-retry", pair["id"], "owner", "repo", "public", str(repo_root),
+             baseline, delivered, baseline, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,error,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'running','',?,?,?)""",
+            ("arm-retry-A", pair["id"], "A", "A", str(self.root / "runtime-A"),
+             "container-A", "screen-A", "auto_model/urm", "image",
+             "Docker 产物验收失败：未通过清洁 Compose 验收", stamp, stamp),
+        )
+        prepared = repo_root / "A"
+        with patch.object(self.service.claude, "reset_unsent_arm"), \
+             patch.object(self.service.git, "prepare_arm_commit", return_value=prepared) as prepare, \
+             patch.object(self.service.claude, "launch"), \
+             patch.object(self.service.claude, "wait_until_ready"), \
+             patch.object(self.service.claude, "materialize_repository") as materialize, \
+             patch.object(self.service, "_send_prompt_with_pair_stagger"), \
+             patch.object(self.service, "_monitor_arm", return_value={"status": "completed"}):
+            result = self.service._recover_pending_retry(
+                pair["id"], "arm-retry-A", "Build a hard project with Docker Compose"
+            )
+        prepare.assert_called_once_with(pair["id"], "A", delivered)
+        self.assertEqual(materialize.call_args.args[2], delivered)
+        self.assertEqual(result, {"status": "completed"})
+
+    def test_scheduler_recovers_only_stale_unsent_retry(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'running',?,?)""",
+            ("arm-stale-A", pair["id"], "A", "A", str(self.root / "runtime-A"),
+             "container-A", "screen-A", "auto_model/urm", "image",
+             "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00"),
+        )
+        with patch.object(self.service, "_submit_monitor") as submit:
+            self.service._schedule_pending_arm_retries(pair["id"])
+        submit.assert_called_once_with(
+            "retry-recover-arm-stale-A", self.service._recover_pending_retry,
+            pair["id"], "arm-stale-A", "Build a hard project with Docker Compose",
+        )
+
     def test_compose_port_variables_are_all_isolated(self):
         compose = self.root / "docker-compose.yml"
         compose.write_text(

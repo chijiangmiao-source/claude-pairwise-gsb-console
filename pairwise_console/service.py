@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -246,13 +246,21 @@ class PairwiseService:
         pair = self._pair(pair_id)
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
         canonical = Path(str(repo.get("local_root") or "")) / str(arm["arm"])
+        expected_sha = str(pair.get("baseline_sha") or "")
+        if "docker 产物验收" in str(arm.get("error") or "").casefold():
+            column = "a_sha" if arm["arm"] == "A" else "b_sha"
+            delivered_sha = str(arm.get("commit_sha") or repo.get(column) or "")
+            if re.fullmatch(r"[0-9a-f]{40}", delivered_sha):
+                expected_sha = delivered_sha
         try:
             self.claude.reset_unsent_arm(arm)
+            if expected_sha != str(pair.get("baseline_sha") or ""):
+                canonical = self.git.prepare_arm_commit(pair_id, str(arm["arm"]), expected_sha)
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             self.claude.launch(arm)
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             self.claude.wait_until_ready(arm)
-            self.claude.materialize_repository(arm, canonical, pair["baseline_sha"])
+            self.claude.materialize_repository(arm, canonical, expected_sha)
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             self._send_prompt_with_pair_stagger(pair_id, arm, prompt)
             self.db.audit("claude.pending_retry_recovered", "arm_run", arm_id, {
@@ -404,6 +412,8 @@ class PairwiseService:
                 elif stage == "ready_to_start":
                     self._submit_auto("start-" + pair_id, self.start_pair, pair_id)
                 elif stage in ("development", "artifact_validation"):
+                    if stage == "development":
+                        self._schedule_pending_arm_retries(pair_id)
                     self._schedule_completed_arm_validations(pair_id)
                 elif stage == "difficulty_review":
                     self._submit_auto(
@@ -497,6 +507,35 @@ class PairwiseService:
                         "arm": arm, "error": redact(str(exc))[-2000:],
                     })
                 return
+
+    def _schedule_pending_arm_retries(self, pair_id: str) -> None:
+        """Recover retries stranded after launch but before prompt delivery."""
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        task = self.db.one(
+            """SELECT t.prompt FROM tasks t JOIN pairs p ON p.task_id=t.id
+               WHERE p.id=?""", (pair_id,),
+        ) or {}
+        prompt = str(task.get("prompt") or "")
+        if not prompt:
+            return
+        for arm in self.db.all(
+            """SELECT * FROM arm_runs WHERE pair_id=? AND prompt_sent_at IS NULL
+               AND status IN ('queued','waiting_retry','running')""", (pair_id,),
+        ):
+            try:
+                updated = datetime.fromisoformat(
+                    str(arm.get("updated_at") or "").replace("Z", "+00:00")
+                )
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if updated > cutoff:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            self._submit_monitor(
+                "retry-recover-" + arm["id"], self._recover_pending_retry,
+                pair_id, arm["id"], prompt,
+            )
 
     def _resume_one_reusable_pair(self) -> bool:
         # Reopening a preserved delivery consumes the same Pair slot as
@@ -2157,16 +2196,15 @@ class PairwiseService:
         if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
             raise RuntimeError("缺少可复用的 %s 已交付提交" % arm.get("arm", "Arm"))
         self._invalidate_recordings(pair_id, [arm.get("arm")], error)
-        repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
-        canonical = Path(str(repo.get("local_root") or "")) / str(arm["arm"])
         restarted = self.claude.archive_failed_attempt(
             arm, error, prepare_retry=True,
             count_development_failure=True, count_error_retry=True,
         )
         self.db.execute(
-            "UPDATE arm_runs SET status='waiting_retry',error=?,updated_at=? WHERE id=?",
-            (redact(error)[-2000:], now_iso(), arm["id"]),
+            "UPDATE arm_runs SET status='waiting_retry',commit_sha=?,error=?,updated_at=? WHERE id=?",
+            (source_sha, redact(error)[-2000:], now_iso(), arm["id"]),
         )
+        canonical = self.git.prepare_arm_commit(pair_id, str(arm["arm"]), source_sha)
         time.sleep(8)
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
         self.claude.launch(restarted)

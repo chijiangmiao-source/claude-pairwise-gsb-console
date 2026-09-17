@@ -237,3 +237,40 @@ class GitOps:
             "arm": arm, "baseline_sha": baseline, "replaced_sha": remote_sha,
         })
         return path
+
+    def prepare_arm_commit(self, pair_id: str, arm: str, commit_sha: str) -> Path:
+        """Prepare the canonical checkout from the exact delivered commit."""
+        if arm not in ("A", "B"):
+            raise ValueError("arm must be A or B")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(commit_sha or "")):
+            raise RuntimeError("%s 已交付提交无效，无法返工" % arm)
+        repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
+        path = Path(str(repo.get("local_root") or "")) / arm
+        if not (path / ".git").is_dir():
+            raise RuntimeError("找不到 %s 的规范仓库目录" % arm)
+        remote = self._github_git(
+            ["ls-remote", "origin", "refs/heads/%s" % arm], cwd=path, timeout=60,
+        ).stdout.strip().split()
+        remote_sha = remote[0] if remote else ""
+        if remote_sha != commit_sha:
+            raise RuntimeError("远端 %s 分支与待返工提交不一致" % arm)
+        self._github_git(
+            ["fetch", "origin", "refs/heads/%s" % arm], cwd=path, timeout=120,
+        )
+        run_command(["git", "checkout", "-f", arm], cwd=path, timeout=60)
+        run_command(["git", "reset", "--hard", commit_sha], cwd=path, timeout=60)
+        run_command(["git", "clean", "-fd"], cwd=path, timeout=60)
+        verified_sha = run_command(["git", "rev-parse", "HEAD"], cwd=path, timeout=30).stdout.strip()
+        verified_branch = run_command(["git", "branch", "--show-current"], cwd=path, timeout=30).stdout.strip()
+        verified_status = run_command(["git", "status", "--porcelain"], cwd=path, timeout=30).stdout.strip()
+        if verified_sha != commit_sha or verified_branch != arm or verified_status:
+            raise RuntimeError("%s 规范仓库未能准备为待返工提交" % arm)
+        column = "a_sha" if arm == "A" else "b_sha"
+        self.db.execute(
+            "UPDATE git_repositories SET %s=?,updated_at=? WHERE id=?" % column,
+            (commit_sha, now_iso(), repo["id"]),
+        )
+        self.db.audit("git.arm_prepared_from_commit", "pair", pair_id, {
+            "arm": arm, "commit_sha": commit_sha,
+        })
+        return path
