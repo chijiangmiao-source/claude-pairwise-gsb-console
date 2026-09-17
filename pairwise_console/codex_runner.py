@@ -150,10 +150,12 @@ class CodexRunner:
 GSB_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["verdict", "reason", "evidence"],
+    "required": ["verdict", "aReason", "bReason", "preferenceReason", "evidence"],
     "properties": {
         "verdict": {"type": "string", "enum": ["A better", "Same", "B better"]},
-        "reason": {"type": "string", "minLength": 20, "maxLength": 600},
+        "aReason": {"type": "string", "minLength": 20, "maxLength": 300},
+        "bReason": {"type": "string", "minLength": 20, "maxLength": 300},
+        "preferenceReason": {"type": "string", "minLength": 10, "maxLength": 240},
         "evidence": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
     },
 }
@@ -161,11 +163,14 @@ GSB_SCHEMA = {
 GSB_RECHECK_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["status", "suggestedVerdict", "suggestedReason", "issues", "evidenceRefs"],
+    "required": ["status", "suggestedVerdict", "suggestedAReason", "suggestedBReason",
+                 "suggestedPreferenceReason", "issues", "evidenceRefs"],
     "properties": {
         "status": {"type": "string", "enum": ["passed", "suggested_revision", "fact_conflict"]},
         "suggestedVerdict": {"type": "string", "enum": ["A better", "Same", "B better"]},
-        "suggestedReason": {"type": "string", "minLength": 20, "maxLength": 600},
+        "suggestedAReason": {"type": "string", "minLength": 20, "maxLength": 300},
+        "suggestedBReason": {"type": "string", "minLength": 20, "maxLength": 300},
+        "suggestedPreferenceReason": {"type": "string", "minLength": 10, "maxLength": 240},
         "issues": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 10},
         "evidenceRefs": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 12},
     },

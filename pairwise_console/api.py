@@ -145,7 +145,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, result)
             match = re.fullmatch(r"/api/pairs/([^/]+)/gsb/confirm", path)
             if match:
-                result = self.app.service.confirm_gsb(match.group(1), str(body.get("verdict", "")), str(body.get("reason", "")), str(body.get("confirmedBy", "人工确认")))
+                legacy_reason = str(body.get("reason", ""))
+                result = self.app.service.confirm_gsb(
+                    match.group(1), str(body.get("verdict", "")),
+                    str(body.get("aReason", legacy_reason)), str(body.get("bReason", legacy_reason)),
+                    str(body.get("preferenceReason", legacy_reason)),
+                    str(body.get("confirmedBy", "人工确认")),
+                )
                 return self._json(200, result)
             if path == "/api/deliveries/preflight":
                 pair_ids = self._pair_ids(body)
@@ -367,8 +373,8 @@ class Handler(BaseHTTPRequestHandler):
         clauses, params = [], []
         q = self._query(query, "q")
         if q:
-            clauses.append("(g.pair_id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR g.reason LIKE ? OR g.confirmed_by LIKE ?)")
-            params += ["%" + q + "%"] * 5
+            clauses.append("(g.pair_id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR g.reason LIKE ? OR g.a_reason LIKE ? OR g.b_reason LIKE ? OR g.preference_reason LIKE ? OR g.confirmed_by LIKE ?)")
+            params += ["%" + q + "%"] * 8
         for key, column in (("status", "g.status"), ("verdict", "g.verdict"), ("task_type", "t.task_type"),
                             ("project_category", "t.project_category"),
                             ("difficulty", "t.difficulty"), ("recheck_status", "r.result_status")):
@@ -382,7 +388,8 @@ class Handler(BaseHTTPRequestHandler):
         if date_to:
             clauses.append(review_date + "<=date(?)"); params.append(date_to)
         select = """SELECT g.*,p.chain_id project_number,p.status pair_status,p.stage,t.title,t.task_type,t.difficulty,t.project_category,
-          r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,r.issues_json,
+          r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,
+          r.suggested_a_reason,r.suggested_b_reason,r.suggested_preference_reason,r.issues_json,
           r.evidence_refs_json,r.model recheck_model,r.reasoning_effort recheck_effort,r.evidence_version recheck_evidence_version,
           r.created_at rechecked_at"""
         from_sql = """FROM gsb_reviews g JOIN pairs p ON p.id=g.pair_id JOIN tasks t ON t.id=p.task_id
@@ -397,7 +404,8 @@ class Handler(BaseHTTPRequestHandler):
           ca.status a_check_status,cb.status b_check_status,ra.id a_recording_id,ra.status a_recording_status,
           ra.sha256 a_recording_sha,ra.commit_match a_recording_match,rb.id b_recording_id,
           rb.status b_recording_status,rb.sha256 b_recording_sha,rb.commit_match b_recording_match,
-          g.verdict,g.reason,g.status gsb_status,g.confirmed_by,g.confirmed_at,g.evidence_version,
+          g.verdict,g.reason,g.a_reason,g.b_reason,g.preference_reason,g.status gsb_status,
+          g.confirmed_by,g.confirmed_at,g.evidence_version,
           r.id recheck_id,r.result_status recheck_status,r.evidence_version recheck_evidence_version,
           d.status submission_status,d.remote_id,d.remote_url submission_url,d.error submission_error,d.hidden_at,d.submitted_at"""
         from_sql = """FROM pairs p JOIN tasks t ON t.id=p.task_id
@@ -417,8 +425,8 @@ class Handler(BaseHTTPRequestHandler):
     def _decorate_delivery(row: Dict[str, Any]) -> Dict[str, Any]:
         required = (
             row.get("a_session_id"), row.get("a_prompt_id"), row.get("a_commit"), row.get("b_session_id"),
-            row.get("b_prompt_id"), row.get("b_commit"), row.get("a_check_status") == "passed",
-            row.get("b_check_status") == "passed", row.get("a_recording_status") == "passed",
+            row.get("b_prompt_id"), row.get("b_commit"), row.get("a_check_status") in ("passed", "failed"),
+            row.get("b_check_status") in ("passed", "failed"), row.get("a_recording_status") == "passed",
             row.get("b_recording_status") == "passed", int(row.get("a_recording_match") or 0) == 1,
             int(row.get("b_recording_match") or 0) == 1, row.get("gsb_status") == "confirmed",
         )
@@ -444,7 +452,7 @@ class Handler(BaseHTTPRequestHandler):
         ready_expression = """(
           COALESCE(aa.session_id,'')<>'' AND COALESCE(aa.prompt_id,'')<>'' AND COALESCE(aa.commit_sha,'')<>'' AND
           COALESCE(bb.session_id,'')<>'' AND COALESCE(bb.prompt_id,'')<>'' AND COALESCE(bb.commit_sha,'')<>'' AND
-          ca.status='passed' AND cb.status='passed' AND ra.status='passed' AND rb.status='passed' AND
+          ca.status IN ('passed','failed') AND cb.status IN ('passed','failed') AND ra.status='passed' AND rb.status='passed' AND
           COALESCE(ra.commit_match,0)=1 AND COALESCE(rb.commit_match,0)=1 AND g.status='confirmed' AND
           COALESCE(r.result_status,'')<>'fact_conflict'
         )"""

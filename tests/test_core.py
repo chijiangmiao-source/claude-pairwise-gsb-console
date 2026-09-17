@@ -77,13 +77,54 @@ class CoreTests(unittest.TestCase):
                    VALUES(?,?,?,?,1280,720,30,'passed',?,?)""",
                 ("rec-" + arm, pair["id"], arm, str(self.root / (arm + ".mov")), stamp, stamp),
             )
-        result = self.service.confirm_gsb(pair["id"], "A better", "A 的真实验收覆盖更完整，B 的异常路径仍有失败，因此 A 的交付更可靠。", "刘昱")
+        result = self.service.confirm_gsb(
+            pair["id"], "A better",
+            "A 完成了主要流程和异常路径，真实验收覆盖完整，录像中的操作结果稳定。",
+            "B 完成了主要流程，但异常路径仍有可复现失败，部分结果无法正常返回。",
+            "A 的真实验收覆盖更完整，因此最终选择 A。", "刘昱",
+        )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["stage"], "completed")
         self.assertEqual(result["gsb"]["confirmed_by"], "刘昱")
         self.assertEqual(result["gsb"]["draft_verdict"], "Same")
         self.assertEqual(result["gsb"]["final_verdict"], "A better")
         self.assertEqual(result["delivery"]["status"], "ready_to_submit")
+
+    def test_gsb_draft_keeps_a_b_and_preference_separate(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute("UPDATE pairs SET status='running',stage='gsb_ready' WHERE id=?", (pair["id"],))
+        for arm in ("A", "B"):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-gsb-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""", ("check-gsb-" + arm, pair["id"], arm, sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO recordings(id,pair_id,arm,path,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'passed',?,?)""", ("rec-gsb-" + arm, pair["id"], arm,
+                    str(self.root / (arm + ".mp4")), sha, stamp, stamp),
+            )
+        result_payload = {
+            "verdict": "A better",
+            "aReason": "A 完成了全部主要流程，并且异常路径与持久化结果都有可见验收证据。",
+            "bReason": "B 完成了核心流程，但异常恢复场景仍然出现了可以复现的结果偏差。",
+            "preferenceReason": "A 的交付覆盖更完整，因此选择 A。",
+            "evidence": ["A Docker 通过", "B 异常路径失败"],
+        }
+        with patch.object(self.service.codex, "run", return_value=result_payload):
+            review = self.service.generate_gsb(pair["id"])
+        self.assertEqual(review["a_reason"], result_payload["aReason"])
+        self.assertEqual(review["b_reason"], result_payload["bReason"])
+        self.assertEqual(review["preference_reason"], result_payload["preferenceReason"])
+        self.assertIn("偏好依据：", review["reason"])
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
@@ -93,7 +134,9 @@ class CoreTests(unittest.TestCase):
         attempt_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recording_attempts)")}
         self.assertIn("interaction_mode", attempt_columns)
         gsb_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_reviews)")}
-        self.assertTrue({"draft_verdict", "final_verdict", "evidence_version"} <= gsb_columns)
+        self.assertTrue({"draft_verdict", "final_verdict", "evidence_version", "a_reason", "b_reason", "preference_reason"} <= gsb_columns)
+        arm_columns = {row["name"] for row in self.db.all("PRAGMA table_info(arm_runs)")}
+        self.assertTrue({"attempt_no", "error_retry_count"} <= arm_columns)
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='gsb_rechecks'"))
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_submissions'"))
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='recording_attempts'"))
@@ -157,7 +200,12 @@ class CoreTests(unittest.TestCase):
             ("gsb-complete", pair["id"], "Same", "A 和 B 均完成主要要求，验收结果一致，最终交付没有影响使用的差异。",
              "Same", "A 和 B 均完成主要要求，验收结果一致，最终交付没有影响使用的差异。", stamp, stamp),
         )
-        self.service.confirm_gsb(pair["id"], "Same", "A 和 B 均完成主要要求，验收结果一致，最终交付没有影响使用的差异。", "刘昱")
+        self.service.confirm_gsb(
+            pair["id"], "Same",
+            "A 完成了全部主要要求，Docker 验收与真实操作录像均显示核心流程可用。",
+            "B 也完成了全部主要要求，Docker 验收与真实操作录像呈现相同结果。",
+            "两边交付结果和可见问题接近，因此选择 Same。", "刘昱",
+        )
         check = self.service.delivery_preflight(pair["id"])
         self.assertTrue(check["eligible"])
         self.assertTrue(check["warnings"])
@@ -180,7 +228,8 @@ class CoreTests(unittest.TestCase):
             "difficulty": "困难", "prompt": "实现复杂功能", "main_sha": "1" * 40,
             "a_session_id": "sa", "a_prompt_id": "pa", "a_commit": "2" * 40,
             "b_session_id": "sb", "b_prompt_id": "pb", "b_commit": "3" * 40,
-            "verdict": "A better", "reason": "A 的实际交付更完整，B 的主流程存在可复现问题。",
+            "verdict": "A better", "a_reason": "A 的实际交付更完整。", "b_reason": "B 的主流程存在可复现问题。",
+            "preference_reason": "A 的主要功能更可靠。",
             "readiness": "ready", "submission_status": "ready_to_submit",
         }])
         self.assertTrue(filename.endswith(".xlsx"))
@@ -248,6 +297,54 @@ class CoreTests(unittest.TestCase):
         with patch("pairwise_console.recording.threading.Thread.start"):
             attempt = self.service.start_recording(pair["id"], "A", manual=True)
         self.assertEqual(attempt["interaction_mode"], "manual")
+
+    def test_failed_artifact_can_start_failure_evidence_recording(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+            ("arm-failed-recording", pair["id"], "A", "A", str(self.root), "container", "screen",
+             "auto_model/urm", "image", "a" * 40, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,error,created_at,updated_at)
+               VALUES(?,?,?,?, 'failed',?,?,?,?)""",
+            ("check-failed", pair["id"], "A", "a" * 40,
+             '[{"name":"compose_file","passed":false,"detail":"未找到 Compose 文件"}]',
+             "缺少 Docker Compose", stamp, stamp),
+        )
+        with patch("pairwise_console.recording.threading.Thread.start"):
+            attempt = self.service.start_recording(pair["id"], "A")
+        self.assertEqual(attempt["status"], "starting")
+        self.assertEqual(attempt["interaction_mode"], "failure")
+
+    def test_api_error_invalidates_attempt_even_if_trace_later_finishes(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-api-error", "container_name": "container-api-error"}
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": prompt}},
+            {"type": "assistant", "isApiErrorMessage": True,
+             "message": {"content": [{"type": "text", "text": "API Error: 504 Gateway Timeout"}]}},
+            {"type": "assistant", "message": {
+                "stop_reason": "end_turn", "content": [{"type": "text", "text": "Finished after internal retry"}],
+            }},
+            {"type": "system", "subtype": "turn_duration"},
+        ]
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            state = self.service.claude.trace_state(arm, prompt)
+        self.assertIn("504", state["api_error"])
+        self.assertFalse(hasattr(self.service.claude, "send_continue"))
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()

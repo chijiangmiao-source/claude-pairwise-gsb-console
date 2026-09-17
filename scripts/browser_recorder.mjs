@@ -145,6 +145,23 @@ async function demonstrateSwaggerWorkflow(page) {
   return result;
 }
 
+async function demonstrateFailureEvidence(page) {
+  await page.waitForTimeout(2500);
+  const sections = page.locator("section");
+  for (let index = 0; index < await sections.count(); index += 1) {
+    const section = sections.nth(index);
+    await section.scrollIntoViewIfNeeded();
+    const box = await section.boundingBox();
+    if (box) {
+      await page.mouse.move(Math.min(1180, box.x + 80), Math.min(650, box.y + 45), { steps: 24 });
+    }
+    await page.waitForTimeout(2200);
+  }
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: "smooth" }));
+  await page.waitForTimeout(3500);
+  return { required: true, ok: true, interactionMode: "failure", evidence: "docker-validation-output" };
+}
+
 async function finish(reason) {
   if (finishing) return;
   finishing = true;
@@ -250,7 +267,9 @@ try {
   await page.bringToFront();
   monitorRequests = true;
   process.stdout.write(`${JSON.stringify({ event: "ready", url: page.url() })}\n`);
-  demonstrationPromise = interactionMode === "manual"
+  demonstrationPromise = interactionMode === "failure"
+    ? demonstrateFailureEvidence(page)
+    : interactionMode === "manual"
     ? Promise.resolve({ required: false, ok: true, interactionMode })
     : demonstrateSwaggerWorkflow(page).catch((error) => ({
       required: new URL(page.url()).pathname.startsWith("/docs"), ok: false, error: error?.message || String(error),

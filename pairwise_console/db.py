@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def now_iso() -> str:
@@ -56,6 +56,8 @@ class Database:
             for name, definition in (
                 ("result", "TEXT NOT NULL DEFAULT ''"),
                 ("warning_at", "TEXT"),
+                ("attempt_no", "INTEGER NOT NULL DEFAULT 1"),
+                ("error_retry_count", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     c.execute("ALTER TABLE arm_runs ADD COLUMN %s %s" % (name, definition))
@@ -101,6 +103,9 @@ class Database:
                 ("final_verdict", "TEXT NOT NULL DEFAULT ''"),
                 ("final_reason", "TEXT NOT NULL DEFAULT ''"),
                 ("evidence_version", "TEXT NOT NULL DEFAULT ''"),
+                ("a_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("b_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("preference_reason", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in gsb_columns:
                     c.execute("ALTER TABLE gsb_reviews ADD COLUMN %s %s" % (name, definition))
@@ -111,6 +116,18 @@ class Database:
                      final_verdict=CASE WHEN status='confirmed' AND final_verdict='' THEN verdict ELSE final_verdict END,
                      final_reason=CASE WHEN status='confirmed' AND final_reason='' THEN reason ELSE final_reason END"""
             )
+            c.execute(
+                """UPDATE gsb_reviews SET preference_reason=reason
+                     WHERE preference_reason='' AND a_reason='' AND b_reason='' AND reason<>''"""
+            )
+            recheck_columns = {row[1] for row in c.execute("PRAGMA table_info(gsb_rechecks)")}
+            for name, definition in (
+                ("suggested_a_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("suggested_b_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("suggested_preference_reason", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in recheck_columns:
+                    c.execute("ALTER TABLE gsb_rechecks ADD COLUMN %s %s" % (name, definition))
             c.execute(
                 """UPDATE recordings SET commit_sha=COALESCE((
                      SELECT commit_sha FROM arm_runs a
@@ -294,6 +311,8 @@ CREATE TABLE IF NOT EXISTS arm_runs (
   exit_code INTEGER,
   result TEXT NOT NULL DEFAULT '',
   warning_at TEXT,
+  attempt_no INTEGER NOT NULL DEFAULT 1,
+  error_retry_count INTEGER NOT NULL DEFAULT 0,
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -417,6 +436,9 @@ CREATE TABLE IF NOT EXISTS gsb_reviews (
   final_verdict TEXT NOT NULL DEFAULT '',
   final_reason TEXT NOT NULL DEFAULT '',
   evidence_version TEXT NOT NULL DEFAULT '',
+  a_reason TEXT NOT NULL DEFAULT '',
+  b_reason TEXT NOT NULL DEFAULT '',
+  preference_reason TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'draft',
   confirmed_by TEXT NOT NULL DEFAULT '',
   confirmed_at TEXT,
@@ -432,6 +454,9 @@ CREATE TABLE IF NOT EXISTS gsb_rechecks (
   result_status TEXT NOT NULL CHECK(result_status IN ('passed','suggested_revision','fact_conflict')),
   suggested_verdict TEXT NOT NULL DEFAULT '',
   suggested_reason TEXT NOT NULL DEFAULT '',
+  suggested_a_reason TEXT NOT NULL DEFAULT '',
+  suggested_b_reason TEXT NOT NULL DEFAULT '',
+  suggested_preference_reason TEXT NOT NULL DEFAULT '',
   issues_json TEXT NOT NULL DEFAULT '[]',
   evidence_refs_json TEXT NOT NULL DEFAULT '[]',
   model TEXT NOT NULL,

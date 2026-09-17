@@ -1,4 +1,5 @@
 import hashlib
+from html import escape as html_escape
 import json
 import os
 import plistlib
@@ -75,13 +76,16 @@ class RecordingManager:
         if not run or not run.get("commit_sha"):
             raise ValueError("该 Arm 尚无最终提交")
         check = self.db.one(
-            "SELECT * FROM artifact_checks WHERE pair_id=? AND arm=? AND commit_sha=? AND status='passed'",
-            (pair_id, arm, run["commit_sha"]),
+            """SELECT * FROM artifact_checks WHERE pair_id=? AND arm=? AND commit_sha=?
+               ORDER BY created_at DESC LIMIT 1""", (pair_id, arm, run["commit_sha"]),
         )
         if not check:
-            raise ValueError("最终提交尚未通过 Docker 产物验收")
-        compose = Path(str(check.get("compose_file") or ""))
-        if not compose.is_file():
+            raise ValueError("最终提交尚未执行 Docker 产物验收")
+        if check.get("status") not in ("passed", "failed"):
+            raise ValueError("Docker 产物验收尚未结束")
+        compose_value = str(check.get("compose_file") or "")
+        compose = Path(compose_value) if compose_value else None
+        if check.get("status") == "passed" and (not compose or not compose.is_file()):
             raise ValueError("Docker Compose 文件不存在")
         attempt_id = "rec-attempt-" + uuid.uuid4().hex[:16]
         folder = self.root / pair_id
@@ -89,17 +93,18 @@ class RecordingManager:
         path = folder / ("%s-%s.mp4" % (arm, attempt_id[-8:]))
         stamp = now_iso()
         project = "pairdemo-%s-%s" % (pair_id[-8:].lower(), arm.lower())
+        interaction_mode = "manual" if manual else ("failure" if check.get("status") == "failed" else "auto")
         self.db.execute(
             """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,capture_mode,interaction_mode,runtime_project,
                compose_file,status,started_at,created_at,updated_at) VALUES(?,?,?,?,?,'browser',?,?,?, 'starting',?,?,?)""",
-            (attempt_id, pair_id, arm, run["commit_sha"], str(path), "manual" if manual else "auto",
-             project, str(compose), stamp, stamp, stamp),
+            (attempt_id, pair_id, arm, run["commit_sha"], str(path), interaction_mode,
+             project, str(compose or ""), stamp, stamp, stamp),
         )
         threading.Thread(
-            target=self._launch, args=(attempt_id, Path(run["workspace_path"]), compose, project, path), daemon=True
+            target=self._launch, args=(attempt_id, Path(run["workspace_path"]), compose, project, path, check), daemon=True
         ).start()
         self.db.audit("recording.start_requested", "recording_attempt", attempt_id, {
-            "pair_id": pair_id, "arm": arm, "interaction_mode": "manual" if manual else "auto",
+            "pair_id": pair_id, "arm": arm, "interaction_mode": interaction_mode,
         })
         return self.db.one("SELECT * FROM recording_attempts WHERE id=?", (attempt_id,)) or {}
 
@@ -117,7 +122,11 @@ class RecordingManager:
             Path(str(row["path"]) + ".stop").touch()
         return row
 
-    def _launch(self, attempt_id: str, workspace: Path, compose: Path, project: str, path: Path) -> None:
+    def _launch(self, attempt_id: str, workspace: Path, compose: Path, project: str,
+                path: Path, check: Dict[str, Any]) -> None:
+        if check.get("status") != "passed":
+            self._launch_failure_evidence(attempt_id, workspace, path, check)
+            return
         env = os.environ.copy()
         port = self._free_port()
         env["API_PORT"] = str(port)
@@ -165,12 +174,75 @@ class RecordingManager:
             )
             self.db.audit("recording.finished", "recording_attempt", attempt_id, {"status": "failed", "error": str(exc)[-1000:]})
 
+    def _launch_failure_evidence(self, attempt_id: str, workspace: Path, path: Path,
+                                 check: Dict[str, Any]) -> None:
+        """Record the real Docker validation output in a browser-only evidence page."""
+        try:
+            checks = json.loads(check.get("checks_json") or "[]")
+        except ValueError:
+            checks = []
+        blocks = []
+        for item in checks:
+            state = "通过" if item.get("passed") else "失败"
+            blocks.append(
+                "<section><h2>%s · %s</h2><pre>%s</pre></section>" % (
+                    html_escape(str(item.get("name") or "Docker 检查")), state,
+                    html_escape(str(item.get("detail") or "无输出")),
+                )
+            )
+        error = html_escape(str(check.get("error") or "Docker 产物验收未通过"))
+        page = path.with_suffix(".failure.html")
+        page.write_text("""<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">
+<title>Docker 失败过程</title><style>
+body{margin:0;background:#101915;color:#e8f0ea;font:18px/1.65 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif}
+main{width:1120px;margin:0 auto;padding:44px 0 100px}header{border:1px solid #8c4a43;background:#2b1818;padding:28px;border-radius:16px}
+h1{margin:0 0 10px;font-size:34px}header p{margin:5px 0;color:#f1b7ae}section{margin-top:24px;border:1px solid #365448;background:#17241f;padding:24px;border-radius:14px}
+h2{font-size:21px;margin:0 0 12px}pre{white-space:pre-wrap;word-break:break-word;background:#0a100d;padding:18px;border-radius:10px;color:#d6e5db;font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
+</style><main><header><h1>Docker 清洁验收失败</h1><p>提交：%s</p><p>工作区：%s</p><p>真实错误：%s</p></header>%s</main></html>""" % (
+            html_escape(str(check.get("commit_sha") or "未知")), html_escape(str(workspace)), error,
+            "".join(blocks) or "<section><h2>未生成检查步骤</h2><pre>%s</pre></section>" % error,
+        ), encoding="utf-8")
+        entry_url = page.resolve().as_uri()
+        profile = self.root / "profiles" / attempt_id
+        profile.mkdir(parents=True, exist_ok=True)
+        command = [str(self.config.web_dir.parent / "node_modules" / ".bin" / "node")]
+        if not Path(command[0]).exists():
+            command = ["node"]
+        command += [str(self.config.web_dir.parent / "scripts" / "browser_recorder.mjs"), entry_url,
+                    str(path), str(profile), "38", str(path) + ".stop", "failure"]
+        try:
+            process = subprocess.Popen(command, cwd=str(self.config.web_dir.parent), stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
+            first = process.stdout.readline().strip() if process.stdout else ""
+            if not first or '"event":"ready"' not in first:
+                _, recorder_error = process.communicate(timeout=15)
+                raise RuntimeError("失败过程录像启动失败：" + redact(recorder_error or first))
+            with self._lock:
+                self._processes[attempt_id] = process
+            self.db.execute(
+                """UPDATE recording_attempts SET status='recording',entry_url=?,updated_at=? WHERE id=?""",
+                (entry_url, now_iso(), attempt_id),
+            )
+            self.db.audit("recording.failure_evidence_started", "recording_attempt", attempt_id, {
+                "entry_url": entry_url, "artifact_status": check.get("status"),
+            })
+            self._wait(attempt_id, process, path, None, workspace, os.environ.copy())
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE recording_attempts SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
+                (redact(str(exc))[-3000:], now_iso(), now_iso(), attempt_id),
+            )
+            self.db.audit("recording.finished", "recording_attempt", attempt_id, {
+                "status": "failed", "error": str(exc)[-1000:],
+            })
+
     def _wait(self, attempt_id: str, process: subprocess.Popen, path: Path, base, workspace: Path, env) -> None:
         stdout, stderr = process.communicate()
         with self._lock:
             self._processes.pop(attempt_id, None)
             self._cancelled.discard(attempt_id)
-        run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=env)
+        if base:
+            run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=env)
         result = inspect_recording(path)
         status = "passed" if process.returncode == 0 and result.get("ok") else "failed"
         error = "" if status == "passed" else (result.get("error") or redact(str(stderr or "")))

@@ -97,6 +97,53 @@ class ClaudeRunner:
             (now_iso(), arm_run["id"]),
         )
 
+    def restart_after_api_error(self, arm_run: Dict[str, Any], error: str) -> Dict[str, Any]:
+        """Archive an invalid attempt and return the arm to a clean, unsent state.
+
+        An API failure invalidates that session.  The retry must therefore use a
+        new container, empty workspace and new SessionID; sending a follow-up to
+        the failed session would turn the sample into a multi-turn run.
+        """
+        attempt_no = max(1, int(arm_run.get("attempt_no") or 1))
+        archive = self.config.data_dir / "claude-attempts" / (
+            "%s-attempt-%d-%s" % (arm_run["id"], attempt_no, uuid.uuid4().hex[:8])
+        )
+        archive.mkdir(parents=True, exist_ok=True)
+        container = arm_run["container_name"]
+        container_exists = run_command(["docker", "inspect", container], check=False, timeout=20).returncode == 0
+        if container_exists:
+            traces = archive / "traces"
+            traces.mkdir(parents=True, exist_ok=True)
+            run_command(
+                ["docker", "cp", "%s:%s/." % (container, CONTAINER_TRACE_PATH), str(traces)],
+                check=False, timeout=180,
+            )
+            run_command(["docker", "rm", "-f", container], check=False, timeout=60)
+        if self._screen_running(arm_run["screen_name"]):
+            run_command(["screen", "-S", arm_run["screen_name"], "-X", "quit"], check=False, timeout=20)
+        root = self.runtime_dir / arm_run["id"]
+        self._close_terminal_window(root / "terminal-window.json", arm_run["screen_name"])
+        for name in ("terminal.log", "exit-status", "permission-status", "prompt.txt"):
+            source = root / name
+            if source.is_file():
+                shutil.copy2(source, archive / name)
+            source.unlink(missing_ok=True)
+        (archive / "error.txt").write_text(redact(error)[-4000:] + "\n", encoding="utf-8")
+        workspace = Path(arm_run["workspace_path"]).resolve()
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        self.db.execute(
+            """UPDATE arm_runs SET status='queued',image_id='',session_id='',prompt_id='',trace_path='',
+               commit_sha='',result='',warning_at=NULL,error='',prompt_sent_at=NULL,finished_at=NULL,
+               attempt_no=?,error_retry_count=error_retry_count+1,updated_at=? WHERE id=?""",
+            (attempt_no + 1, now_iso(), arm_run["id"]),
+        )
+        self.db.audit("claude.api_error_attempt_archived", "arm_run", arm_run["id"], {
+            "attempt": attempt_no, "archive": str(archive), "error": redact(error)[-1000:],
+        })
+        return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_run["id"],)) or {}
+
     def materialize_repository(self, arm_run: Dict[str, Any], source: Path, expected_sha: str) -> None:
         """Import an exact branch snapshot after Claude accepts the empty mount."""
         destination = Path(arm_run["workspace_path"]).resolve()
@@ -269,16 +316,18 @@ exit "$code"
                 if event.get("type") != "user":
                     continue
                 content = (event.get("message") or {}).get("content") if isinstance(event.get("message"), dict) else None
-                if isinstance(content, str) and content.rstrip("\r\n") == prompt.rstrip("\r\n"):
+                if start_index is None and isinstance(content, str) and content.rstrip("\r\n") == prompt.rstrip("\r\n"):
                     start_index, prompt_id = index, str(event.get("promptId") or "")
             if start_index is None:
                 continue
             final_text, final_index, api_error, api_index = "", None, "", None
+            extra_user_message = ""
             for index in range(start_index + 1, len(events)):
                 event = events[index]
                 if event.get("type") == "user":
                     content = (event.get("message") or {}).get("content") if isinstance(event.get("message"), dict) else ""
-                    if isinstance(content, str) and content.strip() not in ("继续", ""):
+                    if isinstance(content, str) and content.strip():
+                        extra_user_message = content.strip()[:300]
                         break
                 if event.get("type") != "assistant":
                     continue
@@ -294,7 +343,10 @@ exit "$code"
                 e.get("type") == "last-prompt" or (e.get("type") == "system" and e.get("subtype") == "turn_duration")
                 for e in events[final_index + 1:]
             ))
-            unresolved_error = bool(not finished and api_index is not None and (final_index is None or api_index > final_index))
+            # Any API error makes this attempt ineligible, even when the CLI
+            # later emits a final message by retrying internally. The service
+            # archives it and replays the original prompt in a new session.
+            unresolved_error = api_index is not None
             return {
                 "complete": finished,
                 "result": final_text,
@@ -302,16 +354,10 @@ exit "$code"
                 "session_id": path.stem,
                 "prompt_id": prompt_id,
                 "path": str(path),
+                "followup_detected": bool(extra_user_message),
+                "followup_text": extra_user_message,
             }
         return {"complete": False, "api_error": "", "path": ""}
-
-    def send_continue(self, arm_run: Dict[str, Any]) -> None:
-        path = self.runtime_dir / arm_run["id"] / "api-resume-prompt.txt"
-        path.write_text("继续", encoding="utf-8")
-        run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "readbuf", str(path)])
-        run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "paste", "."])
-        time.sleep(0.4)
-        run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "stuff", "\r"])
 
     @staticmethod
     def has_business_code(workspace: Path, baseline_sha: str = "") -> bool:
