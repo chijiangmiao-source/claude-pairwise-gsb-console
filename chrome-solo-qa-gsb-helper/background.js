@@ -171,7 +171,28 @@ async function uploadFile(meta, uploadKind = "") {
 }
 
 function normalizeLabel(value) {
-  return String(value || "").replace(/[＊*：:]/g, "").replace(/\s+/g, "").toLowerCase();
+  return String(value || "")
+    .replace(/[＊*：:\s_\-—–/\\（）()【】\[\]]/g, "")
+    .toLowerCase();
+}
+const FIELD_SOURCE_BY_LABEL = new Map([
+  ["a运行录屏", "a_video"],
+  ["a运行录像", "a_video"],
+  ["a录屏", "a_video"],
+  ["a录像", "a_video"],
+  ["b运行录屏", "b_video"],
+  ["b运行录像", "b_video"],
+  ["b录屏", "b_video"],
+  ["b录像", "b_video"],
+]);
+function fieldSourceKeys(field) {
+  const schemaKey = String(field.field_key || "");
+  const keys = [schemaKey];
+  for (const label of [field.label, field.name, field.title]) {
+    const alias = FIELD_SOURCE_BY_LABEL.get(normalizeLabel(label));
+    if (alias && !keys.includes(alias)) keys.push(alias);
+  }
+  return keys;
 }
 function choices(field) {
   return [field.options, field.choices, field.validation?.options].find(Array.isArray) || [];
@@ -197,8 +218,11 @@ function buildData(schema, bundle, uploaded) {
     if (field.is_enabled === false) continue;
     const key = String(field.field_key || "");
     if (!key) continue;
-    if (Object.prototype.hasOwnProperty.call(uploaded, key)) result[key] = uploaded[key];
-    else if (Object.prototype.hasOwnProperty.call(bundle.values || {}, key)) result[key] = normalizeChoice(field, bundle.values[key]);
+    const sourceKeys = fieldSourceKeys(field);
+    const uploadKey = sourceKeys.find((candidate) => Object.prototype.hasOwnProperty.call(uploaded, candidate));
+    const valueKey = sourceKeys.find((candidate) => Object.prototype.hasOwnProperty.call(bundle.values || {}, candidate));
+    if (uploadKey) result[key] = uploaded[uploadKey];
+    else if (valueKey) result[key] = normalizeChoice(field, bundle.values[valueKey]);
     else if (field.is_required) missing.push(field.label || key);
   }
   if (missing.length) throw new Error(`SOLO-QA 本期新增了无法映射的必填项：${missing.join("、")}`);

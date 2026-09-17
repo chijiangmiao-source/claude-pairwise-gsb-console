@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pairwise GSB → SOLO-QA",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "将本地 A/B Pair 的题面、双轨迹、双产物、双录像与 GSB 结论提交到 SOLO-QA。",
   "permissions": ["scripting"],
   "host_permissions": [
