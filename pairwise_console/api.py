@@ -469,8 +469,8 @@ class Handler(BaseHTTPRequestHandler):
     def _decorate_delivery(row: Dict[str, Any]) -> Dict[str, Any]:
         required = (
             row.get("a_session_id"), row.get("a_prompt_id"), row.get("a_commit"), row.get("b_session_id"),
-            row.get("b_prompt_id"), row.get("b_commit"), row.get("a_check_status") in ("passed", "failed"),
-            row.get("b_check_status") in ("passed", "failed"), row.get("a_recording_status") == "passed",
+            row.get("b_prompt_id"), row.get("b_commit"), row.get("a_check_status") == "passed",
+            row.get("b_check_status") == "passed", row.get("a_recording_status") == "passed",
             row.get("b_recording_status") == "passed", int(row.get("a_recording_match") or 0) == 1,
             int(row.get("b_recording_match") or 0) == 1,
             row.get("a_recording_review_status") == "confirmed",

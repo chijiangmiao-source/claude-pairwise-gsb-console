@@ -152,6 +152,18 @@ class CoreTests(unittest.TestCase):
         )
         self.db.execute("UPDATE pairs SET stage='recording' WHERE id=?", (pair["id"],))
         for arm in ("A", "B"):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-confirm-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""",
+                ("check-confirm-" + arm, pair["id"], arm, sha, stamp, stamp),
+            )
             self.db.execute(
                 """INSERT INTO recordings(id,pair_id,arm,path,width,height,duration_seconds,status,created_at,updated_at)
                    VALUES(?,?,?,?,1280,720,30,'passed',?,?)""",
@@ -360,8 +372,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["summary"]["totalPairs"], 1)
         self.assertEqual(result["taskTypes"], [{"task_type": "zero_to_one", "count": 1}])
         self.assertEqual(result["projectCategories"], [{"project_category": "全栈", "count": 1}])
-        self.assertEqual(len(result["recentPairs"]), 1)
-        self.assertEqual(result["recentPairs"][0]["checks_passed"], 2)
+        self.assertNotIn("recentPairs", result)
+        self.assertEqual(result["summary"]["completedPairs24h"], 0)
+        self.assertEqual(len(result["trend24h"]), 24)
 
     def test_manual_recording_attempt_is_saved_as_manual_mode(self):
         self.insert_ready_task()
@@ -385,7 +398,7 @@ class CoreTests(unittest.TestCase):
             attempt = self.service.start_recording(pair["id"], "A", manual=True)
         self.assertEqual(attempt["interaction_mode"], "manual")
 
-    def test_failed_artifact_can_start_failure_evidence_recording(self):
+    def test_failed_artifact_cannot_start_delivery_recording(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -403,10 +416,60 @@ class CoreTests(unittest.TestCase):
              '[{"name":"compose_file","passed":false,"detail":"未找到 Compose 文件"}]',
              "缺少 Docker Compose", stamp, stamp),
         )
-        with patch("pairwise_console.recording.threading.Thread.start"):
-            attempt = self.service.start_recording(pair["id"], "A")
-        self.assertEqual(attempt["status"], "starting")
-        self.assertEqual(attempt["interaction_mode"], "failure")
+        with self.assertRaisesRegex(ValueError, "Docker 产物验收未通过"):
+            self.service.start_recording(pair["id"], "A")
+
+    def test_failed_artifact_restarts_only_failed_arm_before_recording(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-artifact-" + arm, pair["id"], arm, arm, str(self.root / arm), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", arm.lower() * 40, stamp, stamp),
+            )
+        checks = [
+            {"arm": "A", "status": "failed", "error": "缺少 Docker Compose 或 Dockerfile"},
+            {"arm": "B", "status": "passed", "error": ""},
+        ]
+        restarted = {"id": "arm-artifact-A", "arm": "A", "status": "developing"}
+        with patch.object(self.service.artifacts, "validate", side_effect=checks), \
+             patch.object(self.service, "_handle_attempt_failure", return_value=restarted) as retry, \
+             patch.object(self.service, "_submit") as submit:
+            result = self.service._validate_pair_artifacts(pair["id"])
+        self.assertEqual(result["restarted"], ["A"])
+        self.assertIn("Docker 产物验收失败", retry.call_args.args[3])
+        submit.assert_called_once_with("monitor-arm-artifact-A", self.service._monitor_arm,
+                                       "arm-artifact-A", pair["id"], "Build a hard project with Docker Compose")
+        current = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current["stage"], "development")
+
+    def test_completed_pair_with_current_failed_artifact_is_quarantined(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm, status in (("A", "failed"), ("B", "passed")):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-quarantine-" + arm, pair["id"], arm, arm, str(self.root / arm), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                ("check-quarantine-" + arm, pair["id"], arm, sha, status, stamp, stamp),
+            )
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',completed_at=? WHERE id=?",
+            (stamp, pair["id"]),
+        )
+        self.service._quarantine_invalid_completed_pairs()
+        current = self.db.one("SELECT status,stage,completed_at FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {"status": "failed", "stage": "artifact_failed", "completed_at": None})
 
     def test_api_error_invalidates_attempt_even_if_trace_later_finishes(self):
         prompt = "Build the requested project"

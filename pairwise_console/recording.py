@@ -81,11 +81,11 @@ class RecordingManager:
         )
         if not check:
             raise ValueError("最终提交尚未执行 Docker 产物验收")
-        if check.get("status") not in ("passed", "failed"):
-            raise ValueError("Docker 产物验收尚未结束")
+        if check.get("status") != "passed":
+            raise ValueError("Docker 产物验收未通过，不能录制或生成 GSB；请先从共同基线重跑该 Arm")
         compose_value = str(check.get("compose_file") or "")
         compose = Path(compose_value) if compose_value else None
-        if check.get("status") == "passed" and (not compose or not compose.is_file()):
+        if not compose or not compose.is_file():
             raise ValueError("Docker Compose 文件不存在")
         attempt_id = "rec-attempt-" + uuid.uuid4().hex[:16]
         folder = self.root / pair_id
@@ -93,7 +93,7 @@ class RecordingManager:
         path = folder / ("%s-%s.mp4" % (arm, attempt_id[-8:]))
         stamp = now_iso()
         project = "pairdemo-%s-%s" % (pair_id[-8:].lower(), arm.lower())
-        interaction_mode = "manual" if manual else ("failure" if check.get("status") == "failed" else "auto")
+        interaction_mode = "manual" if manual else "auto"
         self.db.execute(
             """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,capture_mode,interaction_mode,runtime_project,
                compose_file,status,started_at,created_at,updated_at) VALUES(?,?,?,?,?,'browser',?,?,?, 'starting',?,?,?)""",

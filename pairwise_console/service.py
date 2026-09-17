@@ -58,6 +58,7 @@ class PairwiseService:
         self._automation_lock = threading.Lock()
         self._auto_retry_after: Dict[str, float] = {}
         self._seed_settings()
+        self._quarantine_invalid_completed_pairs()
         self.db.execute(
             """UPDATE codex_jobs SET status='failed',error='服务重启时作业仍处于运行态，已安全释放以便重新排队',
                finished_at=?,updated_at=? WHERE status='running'""",
@@ -99,6 +100,40 @@ class PairwiseService:
         configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         if configured > MAX_PAIR_PROJECTS or configured < 1:
             self.db.set_setting("max_pairs_parallel", MAX_PAIR_PROJECTS)
+
+    def _quarantine_invalid_completed_pairs(self) -> None:
+        """Stop historical Docker failures from being presented as deliveries."""
+        rows = self.db.all(
+            """SELECT DISTINCT p.id,p.chain_id FROM pairs p
+                 JOIN arm_runs a ON a.pair_id=p.id
+            LEFT JOIN artifact_checks c ON c.pair_id=p.id AND c.arm=a.arm AND c.commit_sha=a.commit_sha
+                WHERE p.status='completed' AND COALESCE(c.status,'missing')<>'passed'"""
+        )
+        for row in rows:
+            stamp = now_iso()
+            error = "A/B Docker 产物验收未全部通过，原完成记录已拦截；失败侧需要从共同基线重跑"
+            with self.db.transaction() as conn:
+                conn.execute(
+                    """UPDATE pairs SET status='failed',stage='artifact_failed',winner='',completed_at=NULL,
+                       error=?,updated_at=? WHERE id=?""",
+                    (error, stamp, row["id"]),
+                )
+                conn.execute(
+                    """UPDATE gsb_reviews SET status='draft',confirmed_by='',confirmed_at=NULL,updated_at=?
+                       WHERE pair_id=?""",
+                    (stamp, row["id"]),
+                )
+                conn.execute(
+                    """UPDATE delivery_submissions SET status='blocked',error=?,updated_at=? WHERE pair_id=?""",
+                    (error, stamp, row["id"]),
+                )
+                if row.get("chain_id"):
+                    conn.execute(
+                        """UPDATE project_chains SET status='active',followup_completed=0,completed_at=NULL,
+                           updated_at=? WHERE id=?""",
+                        (stamp, row["chain_id"]),
+                    )
+            self.db.audit("artifact.invalid_delivery_quarantined", "pair", row["id"], {"error": error})
 
     def start_scheduler(self) -> None:
         if self._scheduler_started:
@@ -801,9 +836,33 @@ class PairwiseService:
         pair = self._pair(pair_id)
         if pair["stage"] != "recording":
             return
-        rows = self.db.all("SELECT status FROM recordings WHERE pair_id=?", (pair_id,))
+        checks = self._current_artifact_checks(pair_id)
+        if len(checks) != 2 or any(row.get("status") != "passed" for row in checks):
+            return
+        rows = self.db.all(
+            """SELECT r.status FROM recordings r
+                 JOIN arm_runs a ON a.pair_id=r.pair_id AND a.arm=r.arm AND a.commit_sha=r.commit_sha
+                WHERE r.pair_id=? AND r.commit_match=1""",
+            (pair_id,),
+        )
         if len(rows) == 2 and all(row["status"] == "passed" for row in rows):
             self.db.execute("UPDATE pairs SET stage='gsb_ready',updated_at=? WHERE id=?", (now_iso(), pair_id))
+
+    def _current_artifact_checks(self, pair_id: str) -> List[Dict[str, Any]]:
+        return self.db.all(
+            """SELECT c.* FROM artifact_checks c
+                 JOIN arm_runs a ON a.pair_id=c.pair_id AND a.arm=c.arm AND a.commit_sha=c.commit_sha
+                WHERE c.pair_id=? ORDER BY c.arm""",
+            (pair_id,),
+        )
+
+    def _require_passed_artifacts(self, pair_id: str) -> List[Dict[str, Any]]:
+        checks = self._current_artifact_checks(pair_id)
+        by_arm = {row.get("arm"): row for row in checks}
+        failed = [arm for arm in ("A", "B") if (by_arm.get(arm) or {}).get("status") != "passed"]
+        if failed:
+            raise ValueError("A/B 必须先通过 Docker 产物验收；未通过：" + "、".join(failed))
+        return checks
 
     @staticmethod
     def _clean_gsb_part(value: Any, limit: int) -> str:
@@ -819,9 +878,9 @@ class PairwiseService:
         pair = self._pair(pair_id)
         if pair["stage"] != "gsb_ready":
             raise ValueError("A/B 两侧必须先通过 Docker 验收并完成合格录像")
+        checks = self._require_passed_artifacts(pair_id)
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
-        checks = self.db.all("SELECT * FROM artifact_checks WHERE pair_id=? ORDER BY arm", (pair_id,))
         recordings = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair_id,))
         by_arm = {arm["arm"]: arm for arm in arms}
         check_by_arm = {item["arm"]: item for item in checks}
@@ -872,6 +931,7 @@ class PairwiseService:
                     confirmed_by: str) -> Dict[str, Any]:
         if verdict not in ("A better", "Same", "B better"):
             raise ValueError("GSB 结论无效")
+        self._require_passed_artifacts(pair_id)
         clean_a = self._clean_gsb_part(a_reason, 300)
         clean_b = self._clean_gsb_part(b_reason, 300)
         if len(clean_a) < 20 or len(clean_b) < 20:
@@ -1030,7 +1090,7 @@ class PairwiseService:
             if not item.get("prompt_id"): blockers.append(arm + " 缺少 PromptID")
             if not item.get("commit_sha"): blockers.append(arm + " 缺少最终提交")
             check_status = (checks.get(arm) or {}).get("status")
-            if check_status not in ("passed", "failed"): blockers.append(arm + " 缺少已完成的 Docker 验收")
+            if check_status != "passed": blockers.append(arm + " Docker 产物验收未通过")
             rec = recs.get(arm) or {}
             if rec.get("status") != "passed": blockers.append(arm + " 录像未通过")
             if not int(rec.get("commit_match") or 0): blockers.append(arm + " 录像与最终提交不匹配")
@@ -1290,7 +1350,7 @@ class PairwiseService:
         pair["task"] = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],))
         pair["repository"] = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,))
         pair["arms"] = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
-        pair["checks"] = self.db.all("SELECT * FROM artifact_checks WHERE pair_id=? ORDER BY arm", (pair_id,))
+        pair["checks"] = self._current_artifact_checks(pair_id)
         pair["recordings"] = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair_id,))
         pair["recording_attempts"] = self.db.all(
             "SELECT * FROM recording_attempts WHERE pair_id=? ORDER BY created_at DESC", (pair_id,)
@@ -1307,10 +1367,8 @@ class PairwiseService:
     def _restart_arm_from_baseline(self, pair_id: str, arm: Dict[str, Any], prompt: str,
                                    error: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)
-        repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
-        local_root = Path(str(repo.get("local_root") or ""))
-        canonical = local_root / str(arm["arm"])
         restarted = self.claude.archive_failed_attempt(arm, error, prepare_retry=True)
+        canonical = self.git.reset_arm_to_baseline(pair_id, str(arm["arm"]))
         lowered = error.casefold()
         delay = 20 if any(token in lowered for token in ("429", "504", "rate limit", "rate_limit")) else 8
         self.db.execute(
@@ -1524,11 +1582,47 @@ class PairwiseService:
         results = []
         for arm in arms:
             results.append(self.artifacts.validate(pair_id, arm["arm"], Path(arm["workspace_path"]), arm["commit_sha"]))
-        failed = [item.get("arm") for item in results if item.get("status") != "passed"]
+        failed = [item for item in results if item.get("status") != "passed"]
+        if failed:
+            task = self.db.one(
+                """SELECT t.prompt FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
+                (pair_id,),
+            ) or {}
+            prompt = str(task.get("prompt") or "")
+            by_arm = {arm["arm"]: arm for arm in arms}
+            names = [str(item.get("arm") or "") for item in failed]
+            self.db.execute(
+                """UPDATE pairs SET status='running',stage='development',error=?,updated_at=? WHERE id=?""",
+                ("Docker 产物验收未通过，正在从共同基线用新会话重跑：" + "、".join(names), now_iso(), pair_id),
+            )
+            for item in failed:
+                arm = by_arm.get(str(item.get("arm") or ""))
+                if arm:
+                    self.db.execute(
+                        "UPDATE arm_runs SET status='waiting_retry',error=?,updated_at=? WHERE id=?",
+                        ("Docker 产物验收失败，等待从共同基线重跑", now_iso(), arm["id"]),
+                    )
+            restarted = []
+            for item in failed:
+                arm_name = str(item.get("arm") or "")
+                arm = by_arm.get(arm_name)
+                if not arm:
+                    continue
+                reason = "Docker 产物验收失败：" + str(item.get("error") or "未通过清洁 Compose 验收")
+                current = self._handle_attempt_failure(pair_id, arm, prompt, reason)
+                pair = self._pair(pair_id)
+                if pair.get("stage") in ("task_replacement", "replaced", "replacement_failed"):
+                    return {"pairId": pair_id, "checks": results, "restarted": restarted, "retired": True}
+                if current.get("status") != "failed":
+                    restarted.append(arm_name)
+                    self._submit("monitor-" + current["id"], self._monitor_arm, current["id"], pair_id, prompt)
+            self.db.audit("artifact.failed_arms_restarted", "pair", pair_id, {
+                "arms": restarted, "rule": "fresh_session_from_common_baseline",
+            })
+            return {"pairId": pair_id, "checks": results, "restarted": restarted}
         self.db.execute(
-            "UPDATE pairs SET status='running',stage='recording',error=?,updated_at=? WHERE id=?",
-            (("以下 Arm 的 Docker 验收失败，必须录制真实报错过程：" + "、".join(failed)) if failed else "",
-             now_iso(), pair_id),
+            "UPDATE pairs SET status='running',stage='recording',error='',updated_at=? WHERE id=?",
+            (now_iso(), pair_id),
         )
         return {"pairId": pair_id, "checks": results}
 

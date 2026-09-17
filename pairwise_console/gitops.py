@@ -188,3 +188,52 @@ class GitOps:
         column = "a_sha" if arm == "A" else "b_sha"
         self.db.execute("UPDATE git_repositories SET %s=?,updated_at=? WHERE id=?" % column, (sha, now_iso(), repo["id"]))
         return sha
+
+    def reset_arm_to_baseline(self, pair_id: str, arm: str) -> Path:
+        """Restore a delivered arm to the Pair baseline before a clean retry.
+
+        Artifact validation happens after the first implementation has already
+        been pushed.  A retry must therefore rewind both the canonical checkout
+        and its remote A/B branch; otherwise a fresh implementation is either
+        based on the invalid delivery or rejected as a non-fast-forward push.
+        """
+        if arm not in ("A", "B"):
+            raise ValueError("arm must be A or B")
+        pair = self.db.one("SELECT baseline_sha FROM pairs WHERE id=?", (pair_id,)) or {}
+        repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
+        baseline = str(pair.get("baseline_sha") or repo.get("main_sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", baseline):
+            raise RuntimeError("Pair 基线提交无效，无法重跑 %s" % arm)
+        path = Path(str(repo.get("local_root") or "")) / arm
+        if not (path / ".git").is_dir():
+            raise RuntimeError("找不到 %s 的规范仓库目录" % arm)
+
+        remote = self._github_git(
+            ["ls-remote", "origin", "refs/heads/%s" % arm], cwd=path, timeout=60,
+        ).stdout.strip().split()
+        remote_sha = remote[0] if remote else ""
+        run_command(["git", "checkout", "-f", arm], cwd=path, timeout=60)
+        run_command(["git", "reset", "--hard", baseline], cwd=path, timeout=60)
+        run_command(["git", "clean", "-fd"], cwd=path, timeout=60)
+        if remote_sha != baseline:
+            if not re.fullmatch(r"[0-9a-f]{40}", remote_sha):
+                raise RuntimeError("无法确认远端 %s 分支当前提交" % arm)
+            lease = "--force-with-lease=refs/heads/%s:%s" % (arm, remote_sha)
+            self._github_git(
+                ["push", lease, "origin", "%s:refs/heads/%s" % (baseline, arm)],
+                cwd=path, timeout=180,
+            )
+        verified = self._github_git(
+            ["ls-remote", "origin", "refs/heads/%s" % arm], cwd=path, timeout=60,
+        ).stdout.strip().split()
+        if not verified or verified[0] != baseline:
+            raise RuntimeError("%s 分支未能恢复到共同基线" % arm)
+        column = "a_sha" if arm == "A" else "b_sha"
+        self.db.execute(
+            "UPDATE git_repositories SET %s=?,updated_at=? WHERE id=?" % column,
+            (baseline, now_iso(), repo["id"]),
+        )
+        self.db.audit("git.arm_reset_to_baseline", "pair", pair_id, {
+            "arm": arm, "baseline_sha": baseline, "replaced_sha": remote_sha,
+        })
+        return path
