@@ -83,6 +83,7 @@ class PairwiseService:
             "repository_prefix": self.config.repository_prefix,
             "first_prompt_warning_minutes": 15,
             "first_prompt_stop_minutes": 25,
+            "development_max_attempts": 3,
             "terminal_idle_seconds": 120,
             "recording_width": 1280,
             "recording_height": 720,
@@ -158,13 +159,9 @@ class PairwiseService:
             })
             return self._monitor_arm(pair_id, arm_id, prompt)
         except Exception as exc:
-            failure = "恢复 API 报错后的全新 Session 失败：%s" % redact(str(exc))
-            self.db.execute(
-                "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
-                (failure[-3000:], now_iso(), now_iso(), arm_id),
-            )
-            self._refresh_pair_after_arm(pair_id)
-            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+            failure = "恢复全新 Session 失败：%s" % redact(str(exc))
+            current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
+            return self._handle_attempt_failure(pair_id, current, prompt, failure)
 
     def _scheduler_loop(self) -> None:
         # Let HTTP start first, then maintain the pool independently of A/B
@@ -637,8 +634,8 @@ class PairwiseService:
         return re.sub(r"[`\r\n]+", " ", str(value or "")).strip()[:limit]
 
     @staticmethod
-    def _compose_gsb_reason(a_reason: str, b_reason: str, preference_reason: str) -> str:
-        return "A：%s B：%s 偏好依据：%s" % (a_reason, b_reason, preference_reason)
+    def _compose_gsb_reason(a_reason: str, b_reason: str) -> str:
+        return "A：%s B：%s" % (a_reason, b_reason)
 
     def generate_gsb(self, pair_id: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)
@@ -672,8 +669,7 @@ class PairwiseService:
         )
         a_reason = self._clean_gsb_part(result["aReason"], 300)
         b_reason = self._clean_gsb_part(result["bReason"], 300)
-        preference_reason = self._clean_gsb_part(result["preferenceReason"], 240)
-        reason = self._compose_gsb_reason(a_reason, b_reason, preference_reason)
+        reason = self._compose_gsb_reason(a_reason, b_reason)
         review_id = "gsb-" + uuid.uuid4().hex[:16]
         stamp = now_iso()
         evidence_version = self.gsb_evidence_version(pair_id, result["verdict"], reason)
@@ -687,23 +683,24 @@ class PairwiseService:
                  draft_reason=excluded.draft_reason,final_verdict='',final_reason='',
                  evidence_version=excluded.evidence_version,status='draft',confirmed_by='',confirmed_at=NULL,
                  updated_at=excluded.updated_at""",
-            (review_id, pair_id, result["verdict"], reason, a_reason, b_reason, preference_reason,
+            (review_id, pair_id, result["verdict"], reason, a_reason, b_reason, "",
              json.dumps(result["evidence"], ensure_ascii=False), result["verdict"], reason,
              evidence_version, stamp, stamp),
         )
         self.db.execute("UPDATE pairs SET status='review',stage='gsb_confirmation',updated_at=? WHERE id=?", (stamp, pair_id))
-        return self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,)) or {}
+        review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,)) or {}
+        review.pop("preference_reason", None)
+        return review
 
     def confirm_gsb(self, pair_id: str, verdict: str, a_reason: str, b_reason: str,
-                    preference_reason: str, confirmed_by: str) -> Dict[str, Any]:
+                    confirmed_by: str) -> Dict[str, Any]:
         if verdict not in ("A better", "Same", "B better"):
             raise ValueError("GSB 结论无效")
         clean_a = self._clean_gsb_part(a_reason, 300)
         clean_b = self._clean_gsb_part(b_reason, 300)
-        clean_preference = self._clean_gsb_part(preference_reason, 240)
-        if len(clean_a) < 20 or len(clean_b) < 20 or len(clean_preference) < 10:
-            raise ValueError("A、B 理由均至少 20 个字符，偏好依据至少 10 个字符")
-        clean = self._compose_gsb_reason(clean_a, clean_b, clean_preference)
+        if len(clean_a) < 20 or len(clean_b) < 20:
+            raise ValueError("A、B 评价均至少 20 个字符，并在两段中说明支持结论的依据")
+        clean = self._compose_gsb_reason(clean_a, clean_b)
         stamp = now_iso()
         evidence_version = self.gsb_evidence_version(pair_id, verdict, clean)
         self.db.execute(
@@ -713,7 +710,7 @@ class PairwiseService:
                final_verdict=?,final_reason=?,evidence_version=?,
                status='confirmed',confirmed_by=?,confirmed_at=?,updated_at=?
                WHERE pair_id=?""",
-            (verdict, clean, clean_a, clean_b, clean_preference, verdict, clean, evidence_version,
+            (verdict, clean, clean_a, clean_b, "", verdict, clean, evidence_version,
              confirmed_by.strip() or "人工确认", stamp, stamp, pair_id),
         )
         self.db.execute("UPDATE pairs SET status='completed',stage='completed',winner=?,completed_at=?,updated_at=? WHERE id=?", (verdict, stamp, stamp, pair_id))
@@ -779,8 +776,7 @@ class PairwiseService:
         verdict = str(review.get("verdict") or "")
         a_reason = str(review.get("a_reason") or "")
         b_reason = str(review.get("b_reason") or "")
-        preference_reason = str(review.get("preference_reason") or review.get("reason") or "")
-        reason = self._compose_gsb_reason(a_reason, b_reason, preference_reason)
+        reason = self._compose_gsb_reason(a_reason, b_reason)
         evidence = self._gsb_evidence_bundle(pair_id)
         version = self.gsb_evidence_version(pair_id, verdict, reason)
         model = str(self.db.setting("gsb_recheck_model", "gpt-6-astra"))
@@ -788,7 +784,7 @@ class PairwiseService:
         result = self.codex.run(
             "gsb_recheck",
             gsb_recheck_prompt(str(evidence["task"].get("prompt") or ""), verdict, a_reason, b_reason,
-                               preference_reason, json.dumps(evidence, ensure_ascii=False)),
+                               json.dumps(evidence, ensure_ascii=False)),
             GSB_RECHECK_SCHEMA,
             pair_id=pair_id,
             task_id=pair["task_id"],
@@ -798,8 +794,7 @@ class PairwiseService:
         )
         suggested_a = self._clean_gsb_part(result["suggestedAReason"], 300)
         suggested_b = self._clean_gsb_part(result["suggestedBReason"], 300)
-        suggested_preference = self._clean_gsb_part(result["suggestedPreferenceReason"], 240)
-        suggested_reason = self._compose_gsb_reason(suggested_a, suggested_b, suggested_preference)
+        suggested_reason = self._compose_gsb_reason(suggested_a, suggested_b)
         latest_job = self.db.one(
             "SELECT id FROM codex_jobs WHERE pair_id=? AND job_type='gsb_recheck' ORDER BY created_at DESC LIMIT 1",
             (pair_id,),
@@ -812,13 +807,15 @@ class PairwiseService:
                suggested_preference_reason,issues_json,evidence_refs_json,model,reasoning_effort,
                codex_job_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (recheck_id, pair_id, version, verdict, reason, result["status"], result["suggestedVerdict"],
-             suggested_reason, suggested_a, suggested_b, suggested_preference,
+             suggested_reason, suggested_a, suggested_b, "",
              json.dumps(result["issues"], ensure_ascii=False),
              json.dumps(result["evidenceRefs"], ensure_ascii=False), model, effort,
              str(latest_job.get("id") or ""), stamp),
         )
         self.db.audit("gsb.rechecked", "pair", pair_id, {"recheck_id": recheck_id, "status": result["status"], "model": model, "effort": effort})
-        return self.db.one("SELECT * FROM gsb_rechecks WHERE id=?", (recheck_id,)) or {}
+        recheck = self.db.one("SELECT * FROM gsb_rechecks WHERE id=?", (recheck_id,)) or {}
+        recheck.pop("suggested_preference_reason", None)
+        return recheck
 
     def apply_gsb_recheck(self, pair_id: str, recheck_id: str) -> Dict[str, Any]:
         row = self.db.one("SELECT * FROM gsb_rechecks WHERE id=? AND pair_id=?", (recheck_id, pair_id))
@@ -832,13 +829,12 @@ class PairwiseService:
         verdict = row["suggested_verdict"]
         a_reason = row.get("suggested_a_reason") or ""
         b_reason = row.get("suggested_b_reason") or ""
-        preference_reason = row.get("suggested_preference_reason") or row.get("suggested_reason") or ""
-        reason = self._compose_gsb_reason(a_reason, b_reason, preference_reason)
+        reason = self._compose_gsb_reason(a_reason, b_reason)
         self.db.execute(
             """UPDATE gsb_reviews SET verdict=?,reason=?,a_reason=?,b_reason=?,preference_reason=?,
                final_verdict='',final_reason='',status='draft',
                confirmed_by='',confirmed_at=NULL,evidence_version=?,updated_at=? WHERE pair_id=?""",
-            (verdict, reason, a_reason, b_reason, preference_reason,
+            (verdict, reason, a_reason, b_reason, "",
              self.gsb_evidence_version(pair_id, verdict, reason), stamp, pair_id),
         )
         self.db.execute("UPDATE pairs SET status='review',stage='gsb_confirmation',winner='',completed_at=NULL,updated_at=? WHERE id=?", (stamp, pair_id))
@@ -924,7 +920,11 @@ class PairwiseService:
             "SELECT * FROM recording_attempts WHERE pair_id=? ORDER BY created_at DESC", (pair_id,)
         )
         pair["gsb"] = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,))
+        if pair["gsb"]:
+            pair["gsb"].pop("preference_reason", None)
         pair["gsb_rechecks"] = self.db.all("SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC", (pair_id,))
+        for recheck in pair["gsb_rechecks"]:
+            recheck.pop("suggested_preference_reason", None)
         pair["delivery"] = self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,))
         return pair
 
@@ -934,7 +934,7 @@ class PairwiseService:
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
         local_root = Path(str(repo.get("local_root") or ""))
         canonical = local_root / str(arm["arm"])
-        restarted = self.claude.restart_after_api_error(arm, error)
+        restarted = self.claude.archive_failed_attempt(arm, error, prepare_retry=True)
         lowered = error.casefold()
         delay = 20 if any(token in lowered for token in ("429", "504", "rate limit", "rate_limit")) else 8
         self.db.execute(
@@ -956,6 +956,100 @@ class PairwiseService:
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
 
+    def _handle_attempt_failure(self, pair_id: str, arm: Dict[str, Any], prompt: str,
+                                error: str) -> Dict[str, Any]:
+        """Retry every failed development attempt in a new session.
+
+        The initial run counts as attempt one. After the third failed attempt the
+        whole Pair is retired and a different ready task is started automatically.
+        """
+        arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
+        attempt = max(1, int(arm.get("attempt_no") or 1))
+        maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
+        self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
+            "attempt": attempt, "maximum": maximum, "error": redact(error)[-1000:],
+            "action": "replace_task" if attempt >= maximum else "fresh_session_from_baseline",
+        })
+        if attempt >= maximum:
+            archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
+            self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error)
+            return archived
+        try:
+            return self._restart_arm_from_baseline(pair_id, arm, prompt, error)
+        except Exception as exc:
+            current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
+            return self._handle_attempt_failure(
+                pair_id, current, prompt,
+                "第 %d 次失败后启动全新 Session 仍失败：%s" % (attempt, redact(str(exc))),
+            )
+
+    def _retire_pair_and_schedule_replacement(self, pair_id: str, failed_arm_id: str,
+                                              error: str) -> None:
+        stamp = now_iso()
+        with self.db.transaction() as conn:
+            pair = conn.execute("SELECT status,stage FROM pairs WHERE id=?", (pair_id,)).fetchone()
+            if not pair or pair["stage"] in ("task_replacement", "replaced", "replacement_failed"):
+                return
+            conn.execute(
+                "UPDATE pairs SET status='failed',stage='task_replacement',error=?,updated_at=? WHERE id=?",
+                (("开发连续 3 次失败，正在自动换题：" + redact(error))[-3000:], stamp, pair_id),
+            )
+        for other in self.db.all("SELECT * FROM arm_runs WHERE pair_id=? AND id<>?", (pair_id, failed_arm_id)):
+            if other["status"] in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
+                try:
+                    self.claude.archive_failed_attempt(
+                        other, "同一 Pair 的另一侧连续 3 次失败，当前 Pair 已换题", prepare_retry=False,
+                    )
+                except Exception as exc:
+                    self.db.audit("claude.peer_retire_failed", "arm_run", other["id"], {
+                        "error": redact(str(exc))[-1000:],
+                    })
+        self.db.audit("pair.task_replacement_scheduled", "pair", pair_id, {
+            "failed_arm_id": failed_arm_id, "reason": redact(error)[-1000:],
+        })
+        self._submit("replace-task-" + pair_id, self._start_replacement_pair, pair_id)
+
+    def _start_replacement_pair(self, retired_pair_id: str) -> Dict[str, Any]:
+        retired = self._pair(retired_pair_id)
+        old_task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (retired["task_id"],)) or {}
+        task_type = str(old_task.get("task_type") or "zero_to_one")
+        try:
+            candidate = self.db.one(
+                """SELECT * FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')
+                   ORDER BY CASE WHEN task_type=? THEN 0 ELSE 1 END,created_at LIMIT 1""",
+                (task_type,),
+            )
+            if not candidate:
+                for _ in range(3):
+                    generated = self.generate_tasks(1, "zero_to_one")
+                    if generated.get("accepted"):
+                        candidate = self.db.one("SELECT * FROM tasks WHERE id=?", (generated["accepted"][0],))
+                        break
+            if not candidate:
+                raise RuntimeError("连续生成 3 次仍没有通过准入的困难或地狱新题")
+            replacement = self.create_pair(candidate["id"])
+            replacement_id = replacement["id"]
+            self.prepare_pair_repository(replacement_id)
+            self.start_pair(replacement_id)
+            self.db.execute(
+                "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
+                ("开发连续 3 次失败，已自动换题为 %s" % replacement_id, now_iso(), retired_pair_id),
+            )
+            self.db.audit("pair.task_replaced", "pair", retired_pair_id, {
+                "replacement_pair_id": replacement_id, "replacement_task_id": candidate["id"],
+            })
+            return {"retiredPairId": retired_pair_id, "replacementPairId": replacement_id,
+                    "replacementTaskId": candidate["id"]}
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE pairs SET stage='replacement_failed',error=?,updated_at=? WHERE id=?",
+                (("自动换题失败：" + redact(str(exc)))[-3000:], now_iso(), retired_pair_id),
+            )
+            self.db.audit("pair.task_replacement_failed", "pair", retired_pair_id, {
+                "error": redact(str(exc))[-1000:],
+            })
+            raise
+
     def _monitor_arm(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
         started = time.monotonic()
         pair_baseline = (self.db.one("SELECT baseline_sha FROM pairs WHERE id=?", (pair_id,)) or {}).get("baseline_sha", "")
@@ -972,7 +1066,13 @@ class PairwiseService:
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,))
             if not arm or arm["status"] not in ("developing", "running", "waiting_retry"):
                 return arm or {}
-            state = self.claude.trace_state(arm, prompt)
+            pair_state = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair_id,)) or {}
+            if pair_state.get("stage") != "development":
+                return arm
+            try:
+                state = self.claude.trace_state(arm, prompt)
+            except Exception as exc:
+                state = {"complete": False, "api_error": "轨迹监控失败：%s" % redact(str(exc))}
             if state.get("session_id") or state.get("prompt_id"):
                 self.db.execute(
                     "UPDATE arm_runs SET session_id=?,prompt_id=?,updated_at=? WHERE id=?",
@@ -981,35 +1081,40 @@ class PairwiseService:
             error = str(state.get("api_error") or "")
             if state.get("followup_detected"):
                 error = "检测到首轮后的追加消息，当前 Session 作废并从共同基线重跑：%s" % state.get("followup_text", "")
+            if not error and not state.get("complete") and not self.claude.runtime_alive(arm):
+                error = "Claude 容器或终端意外结束，当前 Session 没有形成完整结果"
             if error:
                 self.db.audit("claude.session_invalidated", "arm_run", arm_id, {
                     "error": redact(error)[-1000:], "action": "fresh_session_from_baseline",
                 })
-                try:
-                    self._restart_arm_from_baseline(pair_id, arm, prompt, error)
-                except Exception as exc:
-                    failure = "API 报错后全新 Session 重跑启动失败：%s" % redact(str(exc))
-                    self.db.execute(
-                        "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
-                        (failure[-3000:], now_iso(), now_iso(), arm_id),
-                    )
-                    self._refresh_pair_after_arm(pair_id)
-                    return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+                retried = self._handle_attempt_failure(pair_id, arm, prompt, error)
+                if retried.get("status") == "failed":
+                    return retried
                 started = time.monotonic()
                 warned = False
                 continue
             if state.get("complete"):
                 result = str(state.get("result") or "")
-                self.db.execute("UPDATE arm_runs SET status='checkpointing',result=?,updated_at=? WHERE id=?", (result, now_iso(), arm_id))
-                trace_dir = self.claude.export_and_stop(arm)
-                sha = self.git.push_arm(pair_id, arm["arm"])
-                self.db.execute(
-                    """UPDATE arm_runs SET status='completed',trace_path=?,commit_sha=?,result=?,finished_at=?,updated_at=? WHERE id=?""",
-                    (str(trace_dir), sha, result, now_iso(), now_iso(), arm_id),
-                )
-                self.db.audit("claude.arm_completed", "arm_run", arm_id, {"arm": arm["arm"], "commit_sha": sha})
-                self._refresh_pair_after_arm(pair_id)
-                return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+                try:
+                    self.db.execute("UPDATE arm_runs SET status='checkpointing',result=?,updated_at=? WHERE id=?", (result, now_iso(), arm_id))
+                    trace_dir = self.claude.export_and_stop(arm)
+                    sha = self.git.push_arm(pair_id, arm["arm"])
+                    self.db.execute(
+                        """UPDATE arm_runs SET status='completed',trace_path=?,commit_sha=?,result=?,finished_at=?,updated_at=? WHERE id=?""",
+                        (str(trace_dir), sha, result, now_iso(), now_iso(), arm_id),
+                    )
+                    self.db.audit("claude.arm_completed", "arm_run", arm_id, {"arm": arm["arm"], "commit_sha": sha})
+                    self._refresh_pair_after_arm(pair_id)
+                    return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+                except Exception as exc:
+                    failure = "完成后导出轨迹或推送代码失败：%s" % redact(str(exc))
+                    current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
+                    retried = self._handle_attempt_failure(pair_id, current, prompt, failure)
+                    if retried.get("status") == "failed":
+                        return retried
+                    started = time.monotonic()
+                    warned = False
+                    continue
             elapsed = time.monotonic() - started
             workspace = Path(arm["workspace_path"])
             has_code = self.claude.has_business_code(workspace, pair_baseline)
@@ -1018,14 +1123,12 @@ class PairwiseService:
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
             if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 25)) * 60 and not has_code:
-                # A no-output arm is stopped; the other arm remains independent.
-                try:
-                    self.claude.export_and_stop(arm)
-                except Exception:
-                    pass
-                self.db.execute("UPDATE arm_runs SET status='failed',error='首轮超时且无代码产出',finished_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
-                self._refresh_pair_after_arm(pair_id)
-                return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+                retried = self._handle_attempt_failure(pair_id, arm, prompt, "首轮超时且无代码产出")
+                if retried.get("status") == "failed":
+                    return retried
+                started = time.monotonic()
+                warned = False
+                continue
             time.sleep(5)
 
     def _refresh_pair_after_arm(self, pair_id: str) -> None:

@@ -97,31 +97,57 @@ class ClaudeRunner:
             (now_iso(), arm_run["id"]),
         )
 
-    def restart_after_api_error(self, arm_run: Dict[str, Any], error: str) -> Dict[str, Any]:
-        """Archive an invalid attempt and return the arm to a clean, unsent state.
+    def archive_failed_attempt(self, arm_run: Dict[str, Any], error: str,
+                               prepare_retry: bool = True) -> Dict[str, Any]:
+        """Preserve one failed attempt and optionally prepare a fresh session.
 
-        An API failure invalidates that session.  The retry must therefore use a
-        new container, empty workspace and new SessionID; sending a follow-up to
-        the failed session would turn the sample into a multi-turn run.
+        The old container is removed only after its trace copy has been checked.
+        If export fails the stopped container and its workspace are retained as
+        evidence, while a retry receives new names and a new empty workspace.
         """
+        arm_run = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_run["id"],)) or arm_run
         attempt_no = max(1, int(arm_run.get("attempt_no") or 1))
         archive = self.config.data_dir / "claude-attempts" / (
             "%s-attempt-%d-%s" % (arm_run["id"], attempt_no, uuid.uuid4().hex[:8])
         )
         archive.mkdir(parents=True, exist_ok=True)
         container = arm_run["container_name"]
-        container_exists = run_command(["docker", "inspect", container], check=False, timeout=20).returncode == 0
+        root = self.runtime_dir / arm_run["id"]
+        stop_error = ""
+        try:
+            self._graceful_stop(arm_run)
+        except Exception as exc:
+            stop_error = redact(str(exc))
+        container_exists = self._container_exists(container)
+        trace_exported = False
+        trace_error = ""
         if container_exists:
             traces = archive / "traces"
             traces.mkdir(parents=True, exist_ok=True)
-            run_command(
-                ["docker", "cp", "%s:%s/." % (container, CONTAINER_TRACE_PATH), str(traces)],
-                check=False, timeout=180,
-            )
-            run_command(["docker", "rm", "-f", container], check=False, timeout=60)
+            copied = self._copy_traces(container, traces)
+            if copied.returncode == 0:
+                try:
+                    self._verify_trace_export(traces, arm_run, require_complete=False)
+                    trace_exported = True
+                except RuntimeError as exc:
+                    trace_error = str(exc)
+            else:
+                trace_error = redact(copied.stderr or copied.stdout or "轨迹导出失败")
+            if trace_exported:
+                removed = run_command(["docker", "rm", container], check=False, timeout=60)
+                if removed.returncode != 0:
+                    trace_error = redact(removed.stderr or removed.stdout or "容器删除失败")
+        else:
+            previous = root / "traces"
+            if previous.is_dir():
+                shutil.copytree(previous, archive / "traces", dirs_exist_ok=True)
+                try:
+                    self._verify_trace_export(archive / "traces", arm_run, require_complete=False)
+                    trace_exported = True
+                except RuntimeError as exc:
+                    trace_error = str(exc)
         if self._screen_running(arm_run["screen_name"]):
             run_command(["screen", "-S", arm_run["screen_name"], "-X", "quit"], check=False, timeout=20)
-        root = self.runtime_dir / arm_run["id"]
         self._close_terminal_window(root / "terminal-window.json", arm_run["screen_name"])
         for name in ("terminal.log", "exit-status", "permission-status", "prompt.txt"):
             source = root / name
@@ -130,19 +156,51 @@ class ClaudeRunner:
             source.unlink(missing_ok=True)
         (archive / "error.txt").write_text(redact(error)[-4000:] + "\n", encoding="utf-8")
         workspace = Path(arm_run["workspace_path"]).resolve()
-        if workspace.exists():
-            shutil.rmtree(workspace)
-        workspace.mkdir(parents=True, exist_ok=True)
+        archived_workspace = archive / "workspace"
+        workspace_archived = False
+        if workspace.is_dir():
+            try:
+                shutil.copytree(workspace, archived_workspace, dirs_exist_ok=True, symlinks=True)
+                workspace_archived = True
+            except OSError as exc:
+                (archive / "workspace-export-error.txt").write_text(redact(str(exc)), encoding="utf-8")
+        next_attempt = attempt_no + 1
+        next_workspace = workspace
+        next_container = container
+        next_screen = arm_run["screen_name"]
+        if prepare_retry:
+            suffix = "r%d-%s" % (next_attempt, uuid.uuid4().hex[:6])
+            next_workspace = workspace.parent / ("%s-%s" % (arm_run["arm"], suffix))
+            next_workspace.mkdir(parents=True, exist_ok=False)
+            base = "pairwise-%s-%s" % (arm_run["pair_id"].replace("pair-", "")[:12], arm_run["arm"].lower())
+            next_container = "%s-%s" % (base, suffix)
+            next_screen = "%s-%s" % (base, suffix)
+        status = "queued" if prepare_retry else "failed"
+        finished_at = None if prepare_retry else now_iso()
         self.db.execute(
-            """UPDATE arm_runs SET status='queued',image_id='',session_id='',prompt_id='',trace_path='',
+            """UPDATE arm_runs SET status=?,workspace_path=?,container_name=?,screen_name=?,
+               image_id='',session_id='',prompt_id='',trace_path='',
                commit_sha='',result='',warning_at=NULL,error='',prompt_sent_at=NULL,finished_at=NULL,
                attempt_no=?,error_retry_count=error_retry_count+1,updated_at=? WHERE id=?""",
-            (attempt_no + 1, now_iso(), arm_run["id"]),
+            (status, str(next_workspace), next_container, next_screen,
+             next_attempt if prepare_retry else attempt_no, now_iso(), arm_run["id"]),
         )
-        self.db.audit("claude.api_error_attempt_archived", "arm_run", arm_run["id"], {
+        if not prepare_retry:
+            self.db.execute(
+                "UPDATE arm_runs SET finished_at=?,error=? WHERE id=?",
+                (finished_at, redact(error)[-3000:], arm_run["id"]),
+            )
+        self.db.audit("claude.failed_attempt_archived", "arm_run", arm_run["id"], {
             "attempt": attempt_no, "archive": str(archive), "error": redact(error)[-1000:],
+            "trace_exported": trace_exported, "trace_error": trace_error, "stop_error": stop_error,
+            "container_retained": bool(container_exists and self._container_exists(container)),
+            "workspace_archived": workspace_archived, "retry_prepared": prepare_retry,
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_run["id"],)) or {}
+
+    def restart_after_api_error(self, arm_run: Dict[str, Any], error: str) -> Dict[str, Any]:
+        """Backward-compatible entry point for fresh-session error recovery."""
+        return self.archive_failed_attempt(arm_run, error, prepare_retry=True)
 
     def materialize_repository(self, arm_run: Dict[str, Any], source: Path, expected_sha: str) -> None:
         """Import an exact branch snapshot after Claude accepts the empty mount."""
@@ -270,13 +328,22 @@ exit "$code"
         raise RuntimeError("Claude 权限确认后未进入对话主界面")
 
     def export_and_stop(self, arm_run: Dict[str, Any]) -> Path:
+        arm_run = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_run["id"],)) or arm_run
         root = self.runtime_dir / arm_run["id"]
         trace_dir = root / "traces"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        copied = run_command(["docker", "cp", "%s:%s/." % (arm_run["container_name"], CONTAINER_TRACE_PATH), str(trace_dir)], check=False, timeout=180)
+        staging = root / (".traces-export-%s" % uuid.uuid4().hex[:8])
+        staging.mkdir(parents=True, exist_ok=False)
+        self._graceful_stop(arm_run)
+        copied = self._copy_traces(arm_run["container_name"], staging)
         if copied.returncode != 0:
             raise RuntimeError(redact(copied.stderr or copied.stdout or "轨迹导出失败"))
-        run_command(["docker", "rm", "-f", arm_run["container_name"]], check=False, timeout=60)
+        self._verify_trace_export(staging, arm_run, require_complete=True)
+        if trace_dir.exists():
+            shutil.rmtree(trace_dir)
+        staging.rename(trace_dir)
+        removed = run_command(["docker", "rm", arm_run["container_name"]], check=False, timeout=60)
+        if removed.returncode != 0:
+            raise RuntimeError(redact(removed.stderr or removed.stdout or "轨迹已校验，但容器删除失败"))
         if self._screen_running(arm_run["screen_name"]):
             run_command(["screen", "-S", arm_run["screen_name"], "-X", "quit"], check=False, timeout=20)
         self._close_terminal_window(root / "terminal-window.json", arm_run["screen_name"])
@@ -285,6 +352,80 @@ exit "$code"
             (str(trace_dir), now_iso(), now_iso(), arm_run["id"]),
         )
         return trace_dir
+
+    def runtime_alive(self, arm_run: Dict[str, Any]) -> bool:
+        return self._container_running(arm_run["container_name"]) or self._screen_running(arm_run["screen_name"])
+
+    def _graceful_stop(self, arm_run: Dict[str, Any]) -> None:
+        container = arm_run["container_name"]
+        if not self._container_exists(container) or not self._container_running(container):
+            return
+        screen = arm_run["screen_name"]
+        if self._screen_running(screen):
+            for _ in range(2):
+                run_command(["screen", "-S", screen, "-p", "0", "-X", "stuff", "\x04"], check=False, timeout=20)
+                time.sleep(0.5)
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline and self._container_running(container):
+                time.sleep(0.5)
+        if self._container_running(container):
+            stopped = run_command(["docker", "stop", "--time", "15", container], check=False, timeout=30)
+            if stopped.returncode != 0:
+                raise RuntimeError(redact(stopped.stderr or stopped.stdout or "容器无法正常停止"))
+
+    @staticmethod
+    def _copy_traces(container: str, destination: Path):
+        result = None
+        for _ in range(3):
+            result = run_command(
+                ["docker", "cp", "%s:%s/." % (container, CONTAINER_TRACE_PATH), str(destination)],
+                check=False, timeout=180,
+            )
+            if result.returncode == 0:
+                return result
+            time.sleep(1)
+        return result
+
+    @staticmethod
+    def _verify_trace_export(trace_dir: Path, arm_run: Dict[str, Any], require_complete: bool) -> Path:
+        expected_session = str(arm_run.get("session_id") or "")
+        expected_prompt = str(arm_run.get("prompt_id") or "")
+        prompt_file = trace_dir.parent / "prompt.txt"
+        expected_text = ""
+        try:
+            expected_text = prompt_file.read_text(encoding="utf-8").rstrip("\r\n")
+        except OSError:
+            pass
+        candidates = [path for path in trace_dir.rglob("*.jsonl") if path.is_file() and path.stat().st_size > 0]
+        if not candidates:
+            raise RuntimeError("轨迹导出后没有非空 JSONL，已保留容器")
+        for path in candidates:
+            if expected_session and path.stem != expected_session:
+                continue
+            matched_prompt = not expected_prompt and not expected_text
+            completed = False
+            try:
+                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") == "user":
+                        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                        content = message.get("content")
+                        if ((expected_prompt and str(event.get("promptId") or "") == expected_prompt) or
+                                (expected_text and isinstance(content, str) and content.rstrip("\r\n") == expected_text)):
+                            matched_prompt = True
+                    if event.get("type") == "last-prompt" or (
+                            event.get("type") == "system" and event.get("subtype") == "turn_duration"):
+                        completed = True
+            except OSError:
+                continue
+            if matched_prompt and (completed or not require_complete):
+                return path
+        raise RuntimeError("轨迹与当前 SessionID/PromptID 不匹配或尚未完整收尾，已保留容器")
 
     def trace_state(self, arm_run: Dict[str, Any], prompt: str) -> Dict[str, Any]:
         root = self.runtime_dir / arm_run["id"]
@@ -395,6 +536,10 @@ exit "$code"
     def _container_running(name: str) -> bool:
         probe = run_command(["docker", "inspect", "-f", "{{.State.Running}}", name], check=False, timeout=20)
         return probe.returncode == 0 and probe.stdout.strip().casefold() == "true"
+
+    @staticmethod
+    def _container_exists(name: str) -> bool:
+        return run_command(["docker", "inspect", name], check=False, timeout=20).returncode == 0
 
     @staticmethod
     def _open_terminal(screen_name: str, metadata_path: Path) -> None:

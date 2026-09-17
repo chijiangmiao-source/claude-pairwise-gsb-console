@@ -149,7 +149,6 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.app.service.confirm_gsb(
                     match.group(1), str(body.get("verdict", "")),
                     str(body.get("aReason", legacy_reason)), str(body.get("bReason", legacy_reason)),
-                    str(body.get("preferenceReason", legacy_reason)),
                     str(body.get("confirmedBy", "人工确认")),
                 )
                 return self._json(200, result)
@@ -387,9 +386,11 @@ class Handler(BaseHTTPRequestHandler):
             clauses.append(review_date + ">=date(?)"); params.append(date_from)
         if date_to:
             clauses.append(review_date + "<=date(?)"); params.append(date_to)
-        select = """SELECT g.*,p.chain_id project_number,p.status pair_status,p.stage,t.title,t.task_type,t.difficulty,t.project_category,
+        select = """SELECT g.id,g.pair_id,g.verdict,g.reason,g.evidence_json,g.draft_verdict,g.draft_reason,
+          g.final_verdict,g.final_reason,g.evidence_version,g.a_reason,g.b_reason,g.status,g.confirmed_by,
+          g.confirmed_at,g.created_at,g.updated_at,p.chain_id project_number,p.status pair_status,p.stage,t.title,t.task_type,t.difficulty,t.project_category,
           r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,
-          r.suggested_a_reason,r.suggested_b_reason,r.suggested_preference_reason,r.issues_json,
+          r.suggested_a_reason,r.suggested_b_reason,r.issues_json,
           r.evidence_refs_json,r.model recheck_model,r.reasoning_effort recheck_effort,r.evidence_version recheck_evidence_version,
           r.created_at rechecked_at"""
         from_sql = """FROM gsb_reviews g JOIN pairs p ON p.id=g.pair_id JOIN tasks t ON t.id=p.task_id
@@ -404,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
           ca.status a_check_status,cb.status b_check_status,ra.id a_recording_id,ra.status a_recording_status,
           ra.sha256 a_recording_sha,ra.commit_match a_recording_match,rb.id b_recording_id,
           rb.status b_recording_status,rb.sha256 b_recording_sha,rb.commit_match b_recording_match,
-          g.verdict,g.reason,g.a_reason,g.b_reason,g.preference_reason,g.status gsb_status,
+          g.verdict,g.reason,g.a_reason,g.b_reason,g.status gsb_status,
           g.confirmed_by,g.confirmed_at,g.evidence_version,
           r.id recheck_id,r.result_status recheck_status,r.evidence_version recheck_evidence_version,
           d.status submission_status,d.remote_id,d.remote_url submission_url,d.error submission_error,d.hidden_at,d.submitted_at"""

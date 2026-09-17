@@ -81,7 +81,7 @@ class CoreTests(unittest.TestCase):
             pair["id"], "A better",
             "A 完成了主要流程和异常路径，真实验收覆盖完整，录像中的操作结果稳定。",
             "B 完成了主要流程，但异常路径仍有可复现失败，部分结果无法正常返回。",
-            "A 的真实验收覆盖更完整，因此最终选择 A。", "刘昱",
+            "刘昱",
         )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["stage"], "completed")
@@ -90,7 +90,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["gsb"]["final_verdict"], "A better")
         self.assertEqual(result["delivery"]["status"], "ready_to_submit")
 
-    def test_gsb_draft_keeps_a_b_and_preference_separate(self):
+    def test_gsb_draft_keeps_preference_inside_a_and_b_reviews(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -114,17 +114,16 @@ class CoreTests(unittest.TestCase):
             )
         result_payload = {
             "verdict": "A better",
-            "aReason": "A 完成了全部主要流程，并且异常路径与持久化结果都有可见验收证据。",
-            "bReason": "B 完成了核心流程，但异常恢复场景仍然出现了可以复现的结果偏差。",
-            "preferenceReason": "A 的交付覆盖更完整，因此选择 A。",
+            "aReason": "A 完成了全部主要流程，异常路径与持久化结果都有可见验收证据，因此本次更倾向 A。",
+            "bReason": "B 完成了核心流程，但异常恢复场景仍有可复现偏差，因此相比 A 不优先选择 B。",
             "evidence": ["A Docker 通过", "B 异常路径失败"],
         }
         with patch.object(self.service.codex, "run", return_value=result_payload):
             review = self.service.generate_gsb(pair["id"])
         self.assertEqual(review["a_reason"], result_payload["aReason"])
         self.assertEqual(review["b_reason"], result_payload["bReason"])
-        self.assertEqual(review["preference_reason"], result_payload["preferenceReason"])
-        self.assertIn("偏好依据：", review["reason"])
+        self.assertNotIn("preference_reason", review)
+        self.assertNotIn("偏好依据：", review["reason"])
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
@@ -202,9 +201,9 @@ class CoreTests(unittest.TestCase):
         )
         self.service.confirm_gsb(
             pair["id"], "Same",
-            "A 完成了全部主要要求，Docker 验收与真实操作录像均显示核心流程可用。",
-            "B 也完成了全部主要要求，Docker 验收与真实操作录像呈现相同结果。",
-            "两边交付结果和可见问题接近，因此选择 Same。", "刘昱",
+            "A 完成了全部主要要求，Docker 验收与录像均显示核心流程可用，与 B 的结果接近。",
+            "B 也完成了全部主要要求，Docker 验收与录像呈现相同结果，因此两边判为 Same。",
+            "刘昱",
         )
         check = self.service.delivery_preflight(pair["id"])
         self.assertTrue(check["eligible"])
@@ -345,6 +344,88 @@ class CoreTests(unittest.TestCase):
             state = self.service.claude.trace_state(arm, prompt)
         self.assertIn("504", state["api_error"])
         self.assertFalse(hasattr(self.service.claude, "send_continue"))
+
+    def test_failed_trace_copy_retains_old_container_and_prepares_fresh_session(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        workspace = self.root / "projects" / pair["id"] / "workspaces" / "A"
+        workspace.mkdir(parents=True)
+        (workspace / "partial.py").write_text("print('partial')\n", encoding="utf-8")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,session_id,prompt_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?,?,?,?)""",
+            ("arm-copy-fail", pair["id"], "A", "A", str(workspace), "old-container", "old-screen",
+             "auto_model/urm", "image", stamp, "session-1", "prompt-1", stamp, stamp),
+        )
+        failed_copy = type("Result", (), {"returncode": 1, "stdout": "", "stderr": "copy failed"})()
+        with patch.object(self.service.claude, "_graceful_stop"), \
+             patch.object(self.service.claude, "_container_exists", return_value=True), \
+             patch.object(self.service.claude, "_copy_traces", return_value=failed_copy), \
+             patch.object(self.service.claude, "_screen_running", return_value=False), \
+             patch.object(self.service.claude, "_close_terminal_window"), \
+             patch("pairwise_console.claude_runner.run_command") as command:
+            updated = self.service.claude.archive_failed_attempt(
+                self.db.one("SELECT * FROM arm_runs WHERE id='arm-copy-fail'"), "API Error: 429", True,
+            )
+        self.assertEqual(updated["attempt_no"], 2)
+        self.assertEqual(updated["status"], "queued")
+        self.assertNotEqual(updated["container_name"], "old-container")
+        self.assertNotEqual(updated["workspace_path"], str(workspace))
+        self.assertTrue(Path(updated["workspace_path"]).is_dir())
+        self.assertFalse(any(call.args[0][:2] == ["docker", "rm"] for call in command.call_args_list))
+
+    def test_completed_trace_is_verified_before_container_removal(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        workspace = self.root / "verified-workspace"
+        workspace.mkdir()
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,session_id,prompt_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'checkpointing',?,?,?,?,?)""",
+            ("arm-verified", pair["id"], "A", "A", str(workspace), "verified-container", "verified-screen",
+             "auto_model/urm", "image", stamp, "session-verified", "prompt-verified", stamp, stamp),
+        )
+        root = self.service.claude.runtime_dir / "arm-verified"
+        root.mkdir(parents=True)
+        (root / "prompt.txt").write_text("Build verified output", encoding="utf-8")
+
+        def copy_trace(_container, destination):
+            events = [
+                {"type": "user", "promptId": "prompt-verified", "message": {"content": "Build verified output"}},
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+            (destination / "session-verified.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        removed = type("Result", (), {"returncode": 0, "stdout": "verified-container", "stderr": ""})()
+        with patch.object(self.service.claude, "_graceful_stop"), \
+             patch.object(self.service.claude, "_copy_traces", side_effect=copy_trace), \
+             patch.object(self.service.claude, "_screen_running", return_value=False), \
+             patch.object(self.service.claude, "_close_terminal_window"), \
+             patch("pairwise_console.claude_runner.run_command", return_value=removed) as command:
+            trace_dir = self.service.claude.export_and_stop(
+                self.db.one("SELECT * FROM arm_runs WHERE id='arm-verified'"),
+            )
+        self.assertTrue((trace_dir / "session-verified.jsonl").is_file())
+        command.assert_called_once_with(["docker", "rm", "verified-container"], check=False, timeout=60)
+
+    def test_third_development_failure_retires_pair_and_schedules_new_task(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
+        arm = {"id": "arm-third-failure", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
+        with patch.object(self.service.claude, "archive_failed_attempt", return_value={**arm, "status": "failed"}) as archive, \
+             patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
+            result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", "container exited")
+        self.assertEqual(result["status"], "failed")
+        archive.assert_called_once()
+        replace.assert_called_once_with(pair["id"], arm["id"], "container exited")
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()

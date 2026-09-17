@@ -10,7 +10,7 @@ DELIVERY_COLUMNS = (
     "A SessionID", "A PromptID", "A 提交", "A 提交永久链接", "A Docker 验收",
     "A 录像状态", "A 录像 SHA256", "B SessionID", "B PromptID", "B 提交",
     "B 提交永久链接", "B Docker 验收", "B 录像状态", "B 录像 SHA256",
-    "GSB 结论", "A 评价", "B 评价", "偏好依据", "审核人", "确认时间", "模型复检", "资料完整性",
+    "GSB 结论", "A 评价", "B 评价", "审核人", "确认时间", "模型复检", "资料完整性",
     "正式提交状态", "完成时间",
 )
 
@@ -25,8 +25,7 @@ def delivery_row(item: Dict[str, Any]) -> List[Any]:
         item.get("a_recording_status"), item.get("a_recording_sha"), item.get("b_session_id"),
         item.get("b_prompt_id"), item.get("b_commit"), link("b"), item.get("b_check_status"),
         item.get("b_recording_status"), item.get("b_recording_sha"), item.get("verdict"),
-        item.get("a_reason"), item.get("b_reason"), item.get("preference_reason") or item.get("reason"),
-        item.get("confirmed_by"), item.get("confirmed_at"),
+        item.get("a_reason"), item.get("b_reason"), item.get("confirmed_by"), item.get("confirmed_at"),
         item.get("recheck_status") or "未复检", item.get("readiness"),
         item.get("submission_status") or "not_submitted", item.get("completed_at"),
     ]
@@ -45,11 +44,14 @@ def build_xlsx(rows: Iterable[Dict[str, Any]]) -> Tuple[bytes, str]:
                 ref, style, escape(text),
             ))
         sheet_rows.append('<row r="%d">%s</row>' % (row_index, "".join(cells)))
+    final_column = _column_name(len(DELIVERY_COLUMNS))
     sheet = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
-    <cols><col min="1" max="32" width="22" customWidth="1"/></cols>
-    <sheetData>%s</sheetData><autoFilter ref="A1:AF%d"/></worksheet>""" % ("".join(sheet_rows), len(values))
+    <cols><col min="1" max="%d" width="22" customWidth="1"/></cols>
+    <sheetData>%s</sheetData><autoFilter ref="A1:%s%d"/></worksheet>""" % (
+        len(DELIVERY_COLUMNS), "".join(sheet_rows), final_column, len(values),
+    )
     files = {
         "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>""",
         "_rels/.rels": """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>""",
