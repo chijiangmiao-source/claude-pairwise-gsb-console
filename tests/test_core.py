@@ -625,6 +625,85 @@ class CoreTests(unittest.TestCase):
         current = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(current["stage"], "development")
 
+    def test_completed_trace_prompt_mismatch_restarts_only_invalid_arm(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,session_id,prompt_id,trace_path,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?,?,?,?)""",
+                ("arm-trace-" + arm, pair["id"], arm, arm, str(self.root / arm), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", "session-" + arm, "prompt-" + arm,
+                 str(self.root / "traces" / arm), arm.lower() * 40, stamp, stamp),
+            )
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,a_reason,b_reason,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'confirmed',?,?)""",
+            ("gsb-trace", pair["id"], "Same", "old", "old A", "old B", stamp, stamp),
+        )
+        restarted = {"id": "arm-trace-B", "arm": "B", "status": "developing"}
+        with patch.object(self.service, "_inspect_trace", side_effect=[
+                (Path("A.jsonl"), "2.1.269", []),
+                (Path("B.jsonl"), "2.1.269", ["B 轨迹中没有与题面逐字一致的首轮 User Prompt"]),
+             ]), \
+             patch.object(self.service, "_restart_arm_from_baseline", return_value=restarted) as restart, \
+             patch.object(self.service, "_submit_monitor") as submit, \
+             patch.object(self.service, "_submit") as submit_operation:
+            self.service._refresh_pair_after_arm(pair["id"])
+        restart.assert_called_once()
+        restart_args, restart_kwargs = restart.call_args
+        self.assertEqual(restart_args[0], pair["id"])
+        self.assertEqual(restart_args[1]["id"], "arm-trace-B")
+        self.assertEqual(restart_args[2:4], (
+            "Build a hard project with Docker Compose",
+            "轨迹首轮题面不一致，按数据库原题面重新运行",
+        ))
+        self.assertEqual(restart_kwargs, {"count_development_failure": False})
+        submit.assert_called_once_with(
+            "monitor-arm-trace-B", self.service._monitor_arm,
+            pair["id"], "arm-trace-B", "Build a hard project with Docker Compose",
+        )
+        submit_operation.assert_not_called()
+        states = {row["arm"]: row["status"] for row in self.db.all(
+            "SELECT arm,status FROM arm_runs WHERE pair_id=?", (pair["id"],)
+        )}
+        self.assertEqual(states, {"A": "completed", "B": "waiting_retry"})
+        self.assertEqual(self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))["stage"], "development")
+        self.assertEqual(self.db.one("SELECT status FROM gsb_reviews WHERE pair_id=?", (pair["id"],))["status"], "draft")
+
+    def test_gsb_process_evidence_excludes_discarded_arm_sessions(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm, sent_at in (("A", "2026-09-17T10:00:00+00:00"), ("B", "2026-09-17T12:00:00+00:00")):
+            arm_id = pair["id"] + "-" + arm.lower()
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,prompt_sent_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?,?)""",
+                (arm_id, pair["id"], arm, arm, str(self.root / arm), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sent_at, stamp, stamp),
+            )
+        events = (
+            (pair["id"] + "-a", "A-old", "2026-09-17T09:00:00+00:00"),
+            (pair["id"] + "-a", "A-current", "2026-09-17T10:30:00+00:00"),
+            (pair["id"] + "-b", "B-old", "2026-09-17T11:00:00+00:00"),
+            (pair["id"] + "-b", "B-current", "2026-09-17T12:30:00+00:00"),
+            (pair["id"], "pair-old", "2026-09-17T11:30:00+00:00"),
+            (pair["id"], "pair-current", "2026-09-17T12:30:00+00:00"),
+        )
+        for entity_id, marker, created_at in events:
+            self.db.execute(
+                """INSERT INTO audit_events(event_type,entity_type,entity_id,detail_json,created_at)
+                   VALUES('claude.test','arm_run',?,?,?)""",
+                (entity_id, json.dumps({"marker": marker}), created_at),
+            )
+        markers = [json.loads(row["detail_json"])["marker"] for row in self.service._current_process_events(pair["id"])]
+        self.assertEqual(markers, ["A-current", "B-current", "pair-current"])
+
     def test_completed_pair_with_current_failed_artifact_is_quarantined(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

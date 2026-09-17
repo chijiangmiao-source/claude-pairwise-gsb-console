@@ -67,6 +67,7 @@ class PairwiseService:
         self._scheduler_started = False
         self._automation_lock = threading.Lock()
         self._pair_creation_lock = threading.Lock()
+        self._pair_completion_lock = threading.Lock()
         self._auto_retry_after: Dict[str, float] = {}
         self._seed_settings()
         self._quarantine_invalid_completed_pairs()
@@ -693,6 +694,26 @@ class PairwiseService:
         self._submit(operation, self.generate_gsb, pair_id)
         return operation
 
+    def repair_trace_prompt_async(self, pair_id: str, arm: str) -> str:
+        operation = "trace-repair-%s-%s" % (pair_id, arm.lower())
+        self._submit(operation, self.repair_trace_prompt, pair_id, arm)
+        return operation
+
+    def repair_trace_prompt(self, pair_id: str, arm: str) -> Dict[str, Any]:
+        if arm not in ("A", "B"):
+            raise ValueError("arm must be A or B")
+        pair = self._pair(pair_id)
+        task = self.db.one("SELECT prompt FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        run = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (pair_id, arm))
+        if not run or run.get("status") != "completed":
+            raise ValueError("只有已完成且轨迹不合格的 Arm 才能按原题面重跑")
+        _, _, issues = self._inspect_trace(run, str(task.get("prompt") or ""))
+        if not any("首轮 User Prompt" in issue for issue in issues):
+            raise ValueError("该 Arm 没有首轮题面逐字不一致问题")
+        return self._restart_trace_invalid_arms(
+            pair_id, [run], str(task.get("prompt") or ""), issues,
+        )
+
     def discover_bugs_async(self, pair_id: str) -> str:
         operation = "bugs-" + pair_id
         self._submit(operation, self.discover_bugs, pair_id)
@@ -885,6 +906,26 @@ class PairwiseService:
             raise ValueError("A/B 必须先通过 Docker 产物验收；未通过：" + "、".join(failed))
         return checks
 
+    def _current_process_events(self, pair_id: str) -> List[Dict[str, Any]]:
+        arms = self.db.all(
+            "SELECT id,prompt_sent_at FROM arm_runs WHERE pair_id=?", (pair_id,),
+        )
+        cutoffs = {str(arm["id"]): str(arm.get("prompt_sent_at") or "") for arm in arms}
+        pair_cutoff = max(cutoffs.values(), default="")
+        rows = self.db.all(
+            """SELECT event_type,entity_id,detail_json,created_at FROM audit_events
+               WHERE (entity_id=? OR entity_id LIKE ? OR detail_json LIKE ?)
+                 AND (event_type LIKE 'claude.%' OR event_type LIKE 'artifact.%' OR event_type LIKE 'recording.%')
+               ORDER BY id""",
+            (pair_id, pair_id + "-%", "%" + pair_id + "%"),
+        )
+        current = []
+        for row in rows:
+            cutoff = cutoffs.get(str(row.get("entity_id") or ""), pair_cutoff)
+            if not cutoff or str(row.get("created_at") or "") >= cutoff:
+                current.append(row)
+        return current
+
     @staticmethod
     def _clean_gsb_part(value: Any, limit: int) -> str:
         return re.sub(r"[`\r\n]+", " ", str(value or "")).strip()[:limit]
@@ -936,11 +977,7 @@ class PairwiseService:
                 "docker": check_by_arm.get(arm, {}),
                 "recording": rec_by_arm.get(arm, {}),
             }
-        evidence["processEvents"] = self.db.all(
-            """SELECT event_type,entity_id,detail_json,created_at FROM audit_events
-               WHERE entity_id=? OR entity_id LIKE ? OR detail_json LIKE ? ORDER BY id""",
-            (pair_id, pair_id + "-%", "%" + pair_id + "%"),
-        )
+        evidence["processEvents"] = self._current_process_events(pair_id)
         review_prompt = gsb_prompt(
             task.get("prompt", ""),
             json.dumps(evidence["A"], ensure_ascii=False),
@@ -1053,13 +1090,7 @@ class PairwiseService:
                    started_at,finished_at FROM recordings WHERE pair_id=? ORDER BY arm""",
                 (pair_id,),
             ),
-            "processEvents": self.db.all(
-                """SELECT event_type,entity_id,detail_json,created_at FROM audit_events
-                   WHERE (entity_id=? OR entity_id LIKE ? OR detail_json LIKE ?)
-                     AND (event_type LIKE 'claude.%' OR event_type LIKE 'artifact.%' OR event_type LIKE 'recording.%')
-                   ORDER BY id""",
-                (pair_id, pair_id + "-%", "%" + pair_id + "%"),
-            ),
+            "processEvents": self._current_process_events(pair_id),
         }
 
     def gsb_evidence_version(self, pair_id: str, verdict: str = "", reason: str = "") -> str:
@@ -1763,15 +1794,88 @@ class PairwiseService:
                 continue
             time.sleep(5)
 
+    def _restart_trace_invalid_arms(self, pair_id: str, arms: List[Dict[str, Any]],
+                                    prompt: str, issues: List[str]) -> Dict[str, Any]:
+        active_arms = int((self.db.one(
+            """SELECT COUNT(*) count FROM arm_runs
+               WHERE status IN ('queued','running','developing','waiting_retry','checkpointing')"""
+        ) or {"count": 0})["count"])
+        if active_arms + len(arms) > MAX_PAIR_PROJECTS * 2:
+            raise RuntimeError("当前 6 个开发终端均在运行，轨迹返工需等待一个终端空位")
+        stamp = now_iso()
+        reason = "；".join(dict.fromkeys(str(issue) for issue in issues))[-2500:]
+        pair = self._pair(pair_id)
+        with self.db.transaction() as conn:
+            conn.execute(
+                """UPDATE pairs SET status='running',stage='development',winner='',completed_at=NULL,
+                   error=?,updated_at=? WHERE id=?""",
+                ("轨迹题面不一致，正在按原题面用新 Session 重跑：" + reason, stamp, pair_id),
+            )
+            for arm in arms:
+                conn.execute(
+                    "UPDATE arm_runs SET status='waiting_retry',error=?,updated_at=? WHERE id=?",
+                    (reason, stamp, arm["id"]),
+                )
+            conn.execute("DELETE FROM gsb_rechecks WHERE pair_id=?", (pair_id,))
+            conn.execute(
+                """UPDATE gsb_reviews SET status='draft',confirmed_by='',confirmed_at=NULL,
+                   final_verdict='',final_reason='',updated_at=? WHERE pair_id=?""",
+                (stamp, pair_id),
+            )
+            conn.execute(
+                """UPDATE delivery_submissions SET status='needs_review',error=?,updated_at=?
+                   WHERE pair_id=?""",
+                ("轨迹题面不一致，等待单侧重跑和重新验收", stamp, pair_id),
+            )
+            if pair.get("chain_id"):
+                conn.execute(
+                    """UPDATE project_chains SET status='active',followup_completed=0,
+                       completed_at=NULL,updated_at=? WHERE id=?""",
+                    (stamp, pair["chain_id"]),
+                )
+        restarted = []
+        for arm in arms:
+            current = self._restart_arm_from_baseline(
+                pair_id, arm, prompt,
+                "轨迹首轮题面不一致，按数据库原题面重新运行",
+                count_development_failure=False,
+            )
+            restarted.append(str(arm["arm"]))
+            self._submit_monitor(
+                "monitor-" + current["id"], self._monitor_arm,
+                pair_id, current["id"], prompt,
+            )
+        self.db.audit("claude.trace_prompt_repair_started", "pair", pair_id, {
+            "arms": restarted, "issues": list(dict.fromkeys(issues)),
+            "prompt_mode": "exact_database_prompt_new_session",
+            "counts_toward_development_attempts": False,
+        })
+        return {"pairId": pair_id, "restarted": restarted, "issues": list(dict.fromkeys(issues))}
+
     def _refresh_pair_after_arm(self, pair_id: str) -> None:
-        arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
-        if len(arms) != 2:
-            return
-        statuses = {arm["status"] for arm in arms}
-        if "failed" in statuses:
-            self.db.execute("UPDATE pairs SET status='failed',stage='development_failed',error='A/B 至少一侧开发失败',updated_at=? WHERE id=?", (now_iso(), pair_id))
-            return
-        if statuses == {"completed"}:
+        with self._pair_completion_lock:
+            arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
+            if len(arms) != 2:
+                return
+            statuses = {arm["status"] for arm in arms}
+            if "failed" in statuses:
+                self.db.execute("UPDATE pairs SET status='failed',stage='development_failed',error='A/B 至少一侧开发失败',updated_at=? WHERE id=?", (now_iso(), pair_id))
+                return
+            if statuses != {"completed"}:
+                return
+            pair = self._pair(pair_id)
+            task = self.db.one("SELECT prompt FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+            prompt = str(task.get("prompt") or "")
+            invalid = []
+            issues = []
+            for arm in arms:
+                _, _, arm_issues = self._inspect_trace(arm, prompt)
+                if arm_issues:
+                    invalid.append(arm)
+                    issues.extend(arm_issues)
+            if invalid:
+                self._restart_trace_invalid_arms(pair_id, invalid, prompt, issues)
+                return
             self.db.execute("UPDATE pairs SET status='running',stage='artifact_validation',updated_at=? WHERE id=?", (now_iso(), pair_id))
             self._submit("artifacts-" + pair_id, self._validate_pair_artifacts, pair_id)
 

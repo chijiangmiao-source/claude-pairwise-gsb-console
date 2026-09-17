@@ -132,6 +132,10 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 operation = self.app.service.generate_gsb_async(match.group(1))
                 return self._json(202, {"operationId": operation})
+            match = re.fullmatch(r"/api/pairs/([^/]+)/traces/([AB])/repair", path)
+            if match:
+                operation = self.app.service.repair_trace_prompt_async(match.group(1), match.group(2))
+                return self._json(202, {"operationId": operation})
             match = re.fullmatch(r"/api/pairs/([^/]+)/gsb/recheck", path)
             if match:
                 operation = self.app.service.recheck_gsb_async(match.group(1))
