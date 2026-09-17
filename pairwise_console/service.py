@@ -1734,23 +1734,24 @@ class PairwiseService:
         attempt = max(1, int(arm.get("attempt_no") or 1))
         maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
         transient_api_error_kind = self._transient_claude_api_error_kind(error)
-        transient_api_error = bool(transient_api_error_kind)
-        count_error_retry = transient_api_error_kind != "rate_limit"
+        rate_limit_error = transient_api_error_kind == "rate_limit"
+        count_development_failure = not rate_limit_error
+        count_error_retry = not rate_limit_error
         self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
             "attempt": attempt, "maximum": maximum, "error": redact(error)[-1000:],
-            "action": "fresh_session_from_baseline_without_failure_count" if transient_api_error
+            "action": "fresh_session_from_baseline_without_failure_count" if rate_limit_error
                       else ("replace_task" if attempt >= maximum else "fresh_session_from_baseline"),
-            "counts_toward_development_attempts": not transient_api_error,
+            "counts_toward_development_attempts": count_development_failure,
             "counts_toward_error_retries": count_error_retry,
         })
-        if not transient_api_error and attempt >= maximum:
+        if count_development_failure and attempt >= maximum:
             archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
             self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error)
             return archived
         try:
             return self._restart_arm_from_baseline(
                 pair_id, arm, prompt, error,
-                count_development_failure=not transient_api_error,
+                count_development_failure=count_development_failure,
                 count_error_retry=count_error_retry,
             )
         except Exception as exc:

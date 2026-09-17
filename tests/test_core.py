@@ -1008,16 +1008,16 @@ class CoreTests(unittest.TestCase):
         archive.assert_called_once()
         replace.assert_called_once_with(pair["id"], arm["id"], "container exited")
 
-    def test_429_and_504_restart_without_consuming_development_attempts(self):
+    def test_429_is_free_but_504_consumes_a_development_attempt(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
-        arm = {"id": "arm-transient-api", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
+        arm = {"id": "arm-transient-api", "pair_id": pair["id"], "attempt_no": 2, "arm": "A"}
         errors = (
-            ("API Error: Request rejected (429) · litellm.RateLimitError: max_parallel_requests", False),
-            ("API Error: 504 Gateway Timeout", True),
+            ("API Error: Request rejected (429) · litellm.RateLimitError: max_parallel_requests", False, False),
+            ("API Error: 504 Gateway Timeout", True, True),
         )
-        for error, count_error_retry in errors:
+        for error, count_development_failure, count_error_retry in errors:
             with self.subTest(error=error), \
                  patch.object(self.service, "_restart_arm_from_baseline",
                               return_value={**arm, "status": "developing"}) as restart, \
@@ -1026,10 +1026,24 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(result["status"], "developing")
             restart.assert_called_once_with(
                 pair["id"], arm, "same prompt", error,
-                count_development_failure=False,
+                count_development_failure=count_development_failure,
                 count_error_retry=count_error_retry,
             )
             replace.assert_not_called()
+
+    def test_third_504_retires_pair_and_schedules_replacement(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
+        arm = {"id": "arm-third-504", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
+        error = "API Error: 504 Gateway Timeout"
+        with patch.object(self.service.claude, "archive_failed_attempt",
+                          return_value={**arm, "status": "failed"}) as archive, \
+             patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
+            result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", error)
+        self.assertEqual(result["status"], "failed")
+        archive.assert_called_once()
+        replace.assert_called_once_with(pair["id"], arm["id"], error)
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()
