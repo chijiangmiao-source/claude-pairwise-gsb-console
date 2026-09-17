@@ -174,11 +174,12 @@ GSB_RECHECK_SCHEMA = {
 TASK_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["title", "prompt", "taskType", "difficulty", "difficultyEvidence", "stack", "acceptance"],
+    "required": ["title", "prompt", "taskType", "projectCategory", "difficulty", "difficultyEvidence", "stack", "acceptance"],
     "properties": {
         "title": {"type": "string"},
         "prompt": {"type": "string"},
         "taskType": {"type": "string", "enum": ["zero_to_one", "feature"]},
+        "projectCategory": {"type": "string", "enum": ["纯后端", "纯前端", "全栈"]},
         "difficulty": {"type": "string", "enum": ["困难", "地狱"]},
         "difficultyEvidence": {"type": "array", "items": {"type": "string"}, "minItems": 2},
         "stack": {"type": "string"},

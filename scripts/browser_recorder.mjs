@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 
-const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`] = process.argv.slice(2);
+const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`, interactionMode = "auto"] = process.argv.slice(2);
 if (!url || !outputPath || !profileDir) {
   console.error("usage: browser_recorder.mjs URL OUTPUT PROFILE [MAX_SECONDS]");
   process.exit(2);
@@ -250,9 +250,11 @@ try {
   await page.bringToFront();
   monitorRequests = true;
   process.stdout.write(`${JSON.stringify({ event: "ready", url: page.url() })}\n`);
-  demonstrationPromise = demonstrateSwaggerWorkflow(page).catch((error) => ({
-    required: new URL(page.url()).pathname.startsWith("/docs"), ok: false, error: error?.message || String(error),
-  }));
+  demonstrationPromise = interactionMode === "manual"
+    ? Promise.resolve({ required: false, ok: true, interactionMode })
+    : demonstrateSwaggerWorkflow(page).catch((error) => ({
+      required: new URL(page.url()).pathname.startsWith("/docs"), ok: false, error: error?.message || String(error),
+    }));
   setTimeout(() => finish("maximum_duration"), maximum * 1000);
   setInterval(() => { if (existsSync(stopFile)) finish("manual_stop"); }, 250);
   process.on("SIGINT", () => finish("manual_stop"));

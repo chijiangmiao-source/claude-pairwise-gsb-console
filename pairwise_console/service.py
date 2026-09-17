@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from .analytics import dashboard
 from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
+from .classification import normalize_project_category
 from .codex_runner import BUG_DISCOVERY_SCHEMA, CodexRunner, GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA
 from .config import Config
 from .db import Database, now_iso
@@ -214,10 +215,11 @@ class PairwiseService:
                     continue
                 stamp = now_iso()
                 self.db.execute(
-                    """INSERT INTO tasks(id,source,task_type,title,prompt,stack,acceptance_json,difficulty,
+                    """INSERT INTO tasks(id,source,task_type,title,prompt,stack,project_category,acceptance_json,difficulty,
                        difficulty_evidence_json,fingerprint,status,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (task_id, "generated", result["taskType"], result["title"], result["prompt"], result["stack"],
+                     normalize_project_category(result.get("projectCategory"), result["stack"], result["prompt"]),
                      json.dumps(result["acceptance"], ensure_ascii=False), result["difficulty"],
                      json.dumps(result["difficultyEvidence"], ensure_ascii=False), key, "candidate", stamp, stamp),
                 )
@@ -271,7 +273,8 @@ class PairwiseService:
         for _ in range(3):
             result = self.codex.run(
                 "task_generation",
-                feature_generation_prompt(task.get("prompt", ""), summary, json.dumps(known, ensure_ascii=False)),
+                feature_generation_prompt(task.get("prompt", ""), summary, json.dumps(known, ensure_ascii=False),
+                                          task.get("project_category", "")),
                 TASK_SCHEMA, cwd=workspace, pair_id=pair_id, task_id=pair["task_id"], timeout=1800,
             )
             if result.get("taskType") != "feature" or result.get("difficulty") not in ("困难", "地狱"):
@@ -284,10 +287,11 @@ class PairwiseService:
                 continue
             stamp = now_iso()
             self.db.execute(
-                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,acceptance_json,difficulty,
+                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,acceptance_json,difficulty,
                    difficulty_evidence_json,baseline_path,baseline_repo_url,baseline_sha,parent_pair_id,fingerprint,
-                   status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (task_id, "generated_followup", pair_id, "feature", result["title"], result["prompt"], result["stack"],
+                 normalize_project_category(task.get("project_category"), result["stack"], result["prompt"]),
                  json.dumps(result["acceptance"], ensure_ascii=False), result["difficulty"],
                  json.dumps(result["difficultyEvidence"], ensure_ascii=False), str(workspace),
                  (self.db.one("SELECT remote_url FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}).get("remote_url", ""),
@@ -537,6 +541,10 @@ class PairwiseService:
         if candidate["status"] != "reproduced" or candidate["reproduce_count"] < 2 or candidate["difficulty"] not in ("困难", "地狱"):
             raise ValueError("只有双次复现且难度为困难或地狱的 Bug 才能创建任务")
         arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (candidate["source_pair_id"], candidate["source_arm"])) or {}
+        source_task = self.db.one(
+            """SELECT t.* FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
+            (candidate["source_pair_id"],),
+        ) or {}
         prompt = "%s\n\n前置条件：%s\n\n复现步骤：\n%s\n\n实际结果：%s\n\n预期结果：%s\n\n请修复该问题，保留现有 Docker Compose 启动与验收链路，并补充覆盖复现路径的自动化验收。" % (
             candidate["title"], candidate["preconditions"],
             "\n".join("%d. %s" % (i + 1, step) for i, step in enumerate(json.loads(candidate["reproduction_steps_json"]))),
@@ -546,10 +554,12 @@ class PairwiseService:
         key = fingerprint("bugfix", prompt, candidate["source_sha"])
         stamp = now_iso()
         self.db.execute(
-            """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,difficulty,difficulty_evidence_json,
+            """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,project_category,difficulty,difficulty_evidence_json,
                baseline_path,baseline_sha,parent_pair_id,fingerprint,status,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (task_id, "bug_discovery", candidate_id, "bugfix", candidate["title"], prompt, candidate["difficulty"],
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, "bug_discovery", candidate_id, "bugfix", candidate["title"], prompt,
+             normalize_project_category(source_task.get("project_category"), source_task.get("stack"), source_task.get("prompt")),
+             candidate["difficulty"],
              candidate["difficulty_evidence_json"], arm.get("workspace_path", ""), candidate["source_sha"],
              candidate["source_pair_id"], key, "ready", stamp, stamp),
         )
@@ -557,9 +567,9 @@ class PairwiseService:
         self.db.audit("bug.converted_to_task", "bug_candidate", candidate_id, {"task_id": task_id})
         return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
 
-    def start_recording(self, pair_id: str, arm: str, x: int = 0, y: int = 0) -> Dict[str, Any]:
+    def start_recording(self, pair_id: str, arm: str, x: int = 0, y: int = 0, manual: bool = False) -> Dict[str, Any]:
         self._pair(pair_id)
-        return self.recordings.start(pair_id, arm, x, y)
+        return self.recordings.start(pair_id, arm, x, y, manual=manual)
 
     def stop_recording(self, pair_id: str, arm: str) -> Dict[str, Any]:
         row = self.recordings.stop(pair_id, arm)

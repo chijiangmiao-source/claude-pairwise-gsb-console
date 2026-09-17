@@ -6,7 +6,7 @@ from xml.sax.saxutils import escape
 
 
 DELIVERY_COLUMNS = (
-    "项目编号", "Pair ID", "题目", "任务类型", "难度", "题面", "main SHA",
+    "项目编号", "Pair ID", "题目", "任务类型", "系统类型", "难度", "题面", "main SHA",
     "A SessionID", "A PromptID", "A 提交", "A 提交永久链接", "A Docker 验收",
     "A 录像状态", "A 录像 SHA256", "B SessionID", "B PromptID", "B 提交",
     "B 提交永久链接", "B Docker 验收", "B 录像状态", "B 录像 SHA256",
@@ -20,7 +20,7 @@ def delivery_row(item: Dict[str, Any]) -> List[Any]:
     link = lambda arm: "%s/commit/%s" % (remote, item.get(arm + "_commit")) if remote and item.get(arm + "_commit") else ""
     return [
         item.get("project_number"), item.get("pair_id"), item.get("title"), item.get("task_type"),
-        item.get("difficulty"), item.get("prompt"), item.get("main_sha"), item.get("a_session_id"),
+        item.get("project_category"), item.get("difficulty"), item.get("prompt"), item.get("main_sha"), item.get("a_session_id"),
         item.get("a_prompt_id"), item.get("a_commit"), link("a"), item.get("a_check_status"),
         item.get("a_recording_status"), item.get("a_recording_sha"), item.get("b_session_id"),
         item.get("b_prompt_id"), item.get("b_commit"), link("b"), item.get("b_check_status"),
@@ -47,8 +47,8 @@ def build_xlsx(rows: Iterable[Dict[str, Any]]) -> Tuple[bytes, str]:
     sheet = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
-<cols><col min="1" max="29" width="22" customWidth="1"/></cols>
-<sheetData>%s</sheetData><autoFilter ref="A1:AC%d"/></worksheet>""" % ("".join(sheet_rows), len(values))
+<cols><col min="1" max="30" width="22" customWidth="1"/></cols>
+<sheetData>%s</sheetData><autoFilter ref="A1:AD%d"/></worksheet>""" % ("".join(sheet_rows), len(values))
     files = {
         "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>""",
         "_rels/.rels": """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>""",

@@ -137,7 +137,9 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 pair_id, arm, action = match.groups()
                 if action == "start":
-                    result = self.app.service.start_recording(pair_id, arm, int(body.get("x", 0)), int(body.get("y", 0)))
+                    result = self.app.service.start_recording(
+                        pair_id, arm, int(body.get("x", 0)), int(body.get("y", 0)), bool(body.get("manual", False))
+                    )
                 else:
                     result = self.app.service.stop_recording(pair_id, arm)
                 return self._json(200, result)
@@ -308,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
         where = " AND ".join(clauses) or "1=1"
         count = self.app.db.one("SELECT COUNT(*) count FROM pairs p WHERE " + where, params) or {"count": 0}
         rows = self.app.db.all(
-            """SELECT p.*,t.title,t.task_type,t.difficulty,g.verdict,g.reason,g.status gsb_status
+            """SELECT p.*,t.title,t.task_type,t.difficulty,t.project_category,g.verdict,g.reason,g.status gsb_status
                FROM pairs p JOIN tasks t ON t.id=p.task_id
                LEFT JOIN gsb_reviews g ON g.pair_id=p.id
                WHERE %s ORDER BY p.created_at DESC LIMIT ? OFFSET ?""" % where,
@@ -340,19 +342,19 @@ class Handler(BaseHTTPRequestHandler):
         if q:
             clauses.append("(p.id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR a.commit_sha LIKE ?)")
             params += ["%" + q + "%"] * 4
-        for key, column in (("arm", "a.arm"), ("task_type", "t.task_type"),
+        for key, column in (("arm", "a.arm"), ("task_type", "t.task_type"), ("project_category", "t.project_category"),
                             ("artifact_status", "c.status"), ("recording_status", "r.status")):
             value = self._query(query, key)
             if value:
                 clauses.append(column + "=?"); params.append(value)
         if self._query(query, "missing") == "1":
             clauses.append("(c.status IS NULL OR c.status<>'passed' OR r.status IS NULL OR r.status<>'passed' OR r.commit_match<>1)")
-        select = """SELECT p.id pair_id,p.chain_id project_number,t.title,t.task_type,t.difficulty,a.arm,
+        select = """SELECT p.id pair_id,p.chain_id project_number,t.title,t.task_type,t.difficulty,t.project_category,a.arm,
           a.branch,a.commit_sha,c.id check_id,c.status artifact_status,c.checks_json,c.error artifact_error,
           c.started_at check_started_at,c.finished_at check_finished_at,r.id recording_id,r.status recording_status,
           r.path,r.sha256,r.width,r.height,r.duration_seconds,r.commit_sha recording_commit_sha,
           r.commit_match,r.error recording_error,r.capture_mode,r.entry_url,r.updated_at,
-          latest.id latest_attempt_id,latest.status latest_attempt_status,latest.error latest_attempt_error,
+          latest.id latest_attempt_id,latest.status latest_attempt_status,latest.interaction_mode latest_interaction_mode,latest.error latest_attempt_error,
           latest.entry_url latest_attempt_url,latest.created_at latest_attempt_at"""
         from_sql = """FROM arm_runs a JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
           LEFT JOIN artifact_checks c ON c.pair_id=a.pair_id AND c.arm=a.arm AND c.commit_sha=a.commit_sha
@@ -368,6 +370,7 @@ class Handler(BaseHTTPRequestHandler):
             clauses.append("(g.pair_id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR g.reason LIKE ? OR g.confirmed_by LIKE ?)")
             params += ["%" + q + "%"] * 5
         for key, column in (("status", "g.status"), ("verdict", "g.verdict"), ("task_type", "t.task_type"),
+                            ("project_category", "t.project_category"),
                             ("difficulty", "t.difficulty"), ("recheck_status", "r.result_status")):
             value = self._query(query, key)
             if value:
@@ -378,7 +381,7 @@ class Handler(BaseHTTPRequestHandler):
             clauses.append(review_date + ">=date(?)"); params.append(date_from)
         if date_to:
             clauses.append(review_date + "<=date(?)"); params.append(date_to)
-        select = """SELECT g.*,p.chain_id project_number,p.status pair_status,p.stage,t.title,t.task_type,t.difficulty,
+        select = """SELECT g.*,p.chain_id project_number,p.status pair_status,p.stage,t.title,t.task_type,t.difficulty,t.project_category,
           r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,r.issues_json,
           r.evidence_refs_json,r.model recheck_model,r.reasoning_effort recheck_effort,r.evidence_version recheck_evidence_version,
           r.created_at rechecked_at"""
@@ -388,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _delivery_select(self) -> Tuple[str, str]:
         select = """SELECT p.id pair_id,p.chain_id project_number,p.status pair_status,p.stage,p.completed_at,
-          t.title,t.task_type,t.difficulty,t.source,t.prompt,repo.remote_url,repo.main_sha,
+          t.title,t.task_type,t.difficulty,t.project_category,t.source,t.prompt,repo.remote_url,repo.main_sha,
           aa.session_id a_session_id,aa.prompt_id a_prompt_id,aa.commit_sha a_commit,
           bb.session_id b_session_id,bb.prompt_id b_prompt_id,bb.commit_sha b_commit,
           ca.status a_check_status,cb.status b_check_status,ra.id a_recording_id,ra.status a_recording_status,
@@ -430,7 +433,7 @@ class Handler(BaseHTTPRequestHandler):
         if q:
             clauses.append("(p.id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR t.prompt LIKE ?)")
             params += ["%" + q + "%"] * 4
-        for key, column in (("task_type", "t.task_type"), ("difficulty", "t.difficulty"),
+        for key, column in (("task_type", "t.task_type"), ("project_category", "t.project_category"), ("difficulty", "t.difficulty"),
                             ("submission_status", "d.status"), ("recheck_status", "r.result_status")):
             value = self._query(query, key)
             if value:

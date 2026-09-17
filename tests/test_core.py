@@ -10,6 +10,7 @@ from unittest.mock import patch
 from pairwise_console.commands import run_command
 from pairwise_console.config import load_config
 from pairwise_console.db import Database, now_iso
+from pairwise_console.analytics import dashboard
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
 from pairwise_console.service import PairwiseService
@@ -87,6 +88,10 @@ class CoreTests(unittest.TestCase):
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
         self.assertTrue({"commit_sha", "commit_match", "steps_json", "direct_url", "attempt_id", "capture_mode", "entry_url"} <= recording_columns)
+        task_columns = {row["name"] for row in self.db.all("PRAGMA table_info(tasks)")}
+        self.assertIn("project_category", task_columns)
+        attempt_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recording_attempts)")}
+        self.assertIn("interaction_mode", attempt_columns)
         gsb_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_reviews)")}
         self.assertTrue({"draft_verdict", "final_verdict", "evidence_version"} <= gsb_columns)
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='gsb_rechecks'"))
@@ -202,6 +207,47 @@ class CoreTests(unittest.TestCase):
         result = import_historical_tasks(self.db, self.config.old_db_path)
         self.assertEqual(result["imported"], 1)
         self.assertEqual(self.db.one("SELECT COUNT(*) count FROM tasks")["count"], 1)
+        self.assertEqual(self.db.one("SELECT project_category FROM tasks")["project_category"], "纯后端")
+
+    def test_dashboard_counts_each_pair_once_and_groups_task_and_system_types(self):
+        self.insert_ready_task()
+        self.db.execute("UPDATE tasks SET project_category='全栈' WHERE id='task-1'")
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""",
+                ("check-dashboard-" + arm, pair["id"], arm, arm * 8, stamp, stamp),
+            )
+        result = dashboard(self.db)
+        self.assertEqual(result["summary"]["totalPairs"], 1)
+        self.assertEqual(result["taskTypes"], [{"task_type": "zero_to_one", "count": 1}])
+        self.assertEqual(result["projectCategories"], [{"project_category": "全栈", "count": 1}])
+        self.assertEqual(len(result["recentPairs"]), 1)
+        self.assertEqual(result["recentPairs"][0]["checks_passed"], 2)
+
+    def test_manual_recording_attempt_is_saved_as_manual_mode(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        compose = self.root / "compose.yaml"
+        compose.write_text("services: {}\n", encoding="utf-8")
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+            ("arm-manual", pair["id"], "A", "A", str(self.root), "container", "screen",
+             "auto_model/urm", "image", "a" * 40, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,compose_file,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'passed',?,?)""",
+            ("check-manual", pair["id"], "A", "a" * 40, str(compose), stamp, stamp),
+        )
+        with patch("pairwise_console.recording.threading.Thread.start"):
+            attempt = self.service.start_recording(pair["id"], "A", manual=True)
+        self.assertEqual(attempt["interaction_mode"], "manual")
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()

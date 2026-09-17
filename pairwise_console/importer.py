@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .db import Database, now_iso
+from .classification import normalize_project_category
 
 
 TASK_TYPES = {
@@ -27,13 +28,15 @@ def import_historical_tasks(db: Database, old_db_path: Path, limit: int = 500) -
     source = sqlite3.connect("file:%s?mode=ro" % old_db_path, uri=True)
     source.row_factory = sqlite3.Row
     try:
+        source_columns = {row[1] for row in source.execute("PRAGMA table_info(runs)").fetchall()}
+        category_select = "project_category" if "project_category" in source_columns else "'未记录' AS project_category"
         rows = source.execute(
-            """SELECT id,repo_name,task_type,task_difficulty,language_framework,repo_path,repo_url,
+            """SELECT id,repo_name,task_type,task_difficulty,language_framework,%s,repo_path,repo_url,
                       base_sha,first_prompt,status_detail,phase,created_at
                FROM runs
                WHERE deleted_at IS NULL AND task_difficulty IN ('困难','地狱')
                  AND task_type IN ('0-1 代码生成','0-1 重跑','Feature 迭代','Feature 迭代重跑')
-               ORDER BY created_at DESC LIMIT ?""",
+               ORDER BY created_at DESC LIMIT ?""" % category_select,
             (max(1, min(limit, 2000)),),
         ).fetchall()
         for row in rows:
@@ -45,7 +48,11 @@ def import_historical_tasks(db: Database, old_db_path: Path, limit: int = 500) -
                 continue
             base_sha = str(row["base_sha"] or "")
             key = fingerprint(kind, prompt, base_sha)
-            if db.one("SELECT id FROM tasks WHERE fingerprint=?", (key,)):
+            category = normalize_project_category(row["project_category"], row["language_framework"], prompt)
+            existing = db.one("SELECT id,project_category FROM tasks WHERE fingerprint=?", (key,))
+            if existing:
+                if existing.get("project_category") != category:
+                    db.execute("UPDATE tasks SET project_category=?,updated_at=? WHERE id=?", (category, now_iso(), existing["id"]))
                 stats["skipped"] += 1
                 continue
             # A finished 0-1 task is reused as a prompt with a clean baseline. A
@@ -56,12 +63,12 @@ def import_historical_tasks(db: Database, old_db_path: Path, limit: int = 500) -
             task_id = "task-" + uuid.uuid4().hex[:16]
             stamp = now_iso()
             db.execute(
-                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,difficulty,
+                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,difficulty,
                    difficulty_evidence_json,baseline_path,baseline_repo_url,baseline_sha,fingerprint,status,
                    rejection_reason,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (task_id, "legacy", row["id"], kind, row["repo_name"], prompt,
-                 str(row["language_framework"] or ""), row["task_difficulty"],
+                 str(row["language_framework"] or ""), category, row["task_difficulty"],
                  '["来源记录已判定为困难或地狱","进入 Pair 前仍需完成禁题、去重和基线复核"]',
                  baseline_path, str(row["repo_url"] or ""), base_sha, key,
                  "candidate" if baseline_complete else "rejected",
@@ -72,4 +79,3 @@ def import_historical_tasks(db: Database, old_db_path: Path, limit: int = 500) -
         return stats
     finally:
         source.close()
-

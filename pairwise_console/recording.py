@@ -61,7 +61,7 @@ class RecordingManager:
                 "playwright": playwright.is_dir(), "ffmpeg": str(ffmpeg[-1]) if ffmpeg else "",
                 "mp4Converter": str(converter) if converter.is_file() else ""}
 
-    def start(self, pair_id: str, arm: str, x: int = 0, y: int = 0) -> Dict[str, Any]:
+    def start(self, pair_id: str, arm: str, x: int = 0, y: int = 0, manual: bool = False) -> Dict[str, Any]:
         if arm not in ("A", "B"):
             raise ValueError("arm must be A or B")
         active = self.db.one(
@@ -90,14 +90,17 @@ class RecordingManager:
         stamp = now_iso()
         project = "pairdemo-%s-%s" % (pair_id[-8:].lower(), arm.lower())
         self.db.execute(
-            """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,capture_mode,runtime_project,
-               compose_file,status,started_at,created_at,updated_at) VALUES(?,?,?,?,?,'browser',?,?, 'starting',?,?,?)""",
-            (attempt_id, pair_id, arm, run["commit_sha"], str(path), project, str(compose), stamp, stamp, stamp),
+            """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,capture_mode,interaction_mode,runtime_project,
+               compose_file,status,started_at,created_at,updated_at) VALUES(?,?,?,?,?,'browser',?,?,?, 'starting',?,?,?)""",
+            (attempt_id, pair_id, arm, run["commit_sha"], str(path), "manual" if manual else "auto",
+             project, str(compose), stamp, stamp, stamp),
         )
         threading.Thread(
             target=self._launch, args=(attempt_id, Path(run["workspace_path"]), compose, project, path), daemon=True
         ).start()
-        self.db.audit("recording.start_requested", "recording_attempt", attempt_id, {"pair_id": pair_id, "arm": arm})
+        self.db.audit("recording.start_requested", "recording_attempt", attempt_id, {
+            "pair_id": pair_id, "arm": arm, "interaction_mode": "manual" if manual else "auto",
+        })
         return self.db.one("SELECT * FROM recording_attempts WHERE id=?", (attempt_id,)) or {}
 
     def stop(self, pair_id: str, arm: str) -> Dict[str, Any]:
@@ -138,7 +141,8 @@ class RecordingManager:
                 command = ["node"]
             command += [str(self.config.web_dir.parent / "scripts" / "browser_recorder.mjs"), entry_url,
                         str(path), str(profile), str(min(88, int(self.db.setting("recording_max_seconds", 90)) - 2)),
-                        str(path) + ".stop"]
+                        str(path) + ".stop",
+                        str((self.db.one("SELECT interaction_mode FROM recording_attempts WHERE id=?", (attempt_id,)) or {}).get("interaction_mode") or "auto")]
             process = subprocess.Popen(command, cwd=str(self.config.web_dir.parent), stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True, start_new_session=True)
             first = process.stdout.readline().strip() if process.stdout else ""

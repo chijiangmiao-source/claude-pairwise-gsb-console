@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def now_iso() -> str:
@@ -44,6 +44,14 @@ class Database:
     def initialize(self) -> None:
         with self.transaction() as c:
             c.executescript(SCHEMA)
+            task_columns = {row[1] for row in c.execute("PRAGMA table_info(tasks)")}
+            if "project_category" not in task_columns:
+                c.execute("ALTER TABLE tasks ADD COLUMN project_category TEXT NOT NULL DEFAULT '未记录'")
+            from .classification import normalize_project_category
+            for row in c.execute("SELECT id,project_category,title,prompt,stack FROM tasks").fetchall():
+                category = normalize_project_category(row[1], row[2], row[3], row[4])
+                if row[1] != category:
+                    c.execute("UPDATE tasks SET project_category=? WHERE id=?", (category, row[0]))
             columns = {row[1] for row in c.execute("PRAGMA table_info(arm_runs)")}
             for name, definition in (
                 ("result", "TEXT NOT NULL DEFAULT ''"),
@@ -73,6 +81,9 @@ class Database:
             ):
                 if name not in recording_columns:
                     c.execute("ALTER TABLE recordings ADD COLUMN %s %s" % (name, definition))
+            attempt_columns = {row[1] for row in c.execute("PRAGMA table_info(recording_attempts)")}
+            if "interaction_mode" not in attempt_columns:
+                c.execute("ALTER TABLE recording_attempts ADD COLUMN interaction_mode TEXT NOT NULL DEFAULT 'auto'")
             c.execute("UPDATE recordings SET capture_mode='screen' WHERE attempt_id='' AND path LIKE '%.mov'")
             c.execute(
                 """INSERT OR IGNORE INTO recording_attempts(
@@ -191,6 +202,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   title TEXT NOT NULL,
   prompt TEXT NOT NULL,
   stack TEXT NOT NULL DEFAULT '',
+  project_category TEXT NOT NULL DEFAULT '未记录',
   acceptance_json TEXT NOT NULL DEFAULT '[]',
   difficulty TEXT NOT NULL,
   difficulty_evidence_json TEXT NOT NULL DEFAULT '[]',
@@ -377,6 +389,7 @@ CREATE TABLE IF NOT EXISTS recording_attempts (
   commit_sha TEXT NOT NULL,
   path TEXT NOT NULL,
   capture_mode TEXT NOT NULL DEFAULT 'browser',
+  interaction_mode TEXT NOT NULL DEFAULT 'auto',
   entry_url TEXT NOT NULL DEFAULT '',
   runtime_port INTEGER NOT NULL DEFAULT 0,
   runtime_project TEXT NOT NULL DEFAULT '',
