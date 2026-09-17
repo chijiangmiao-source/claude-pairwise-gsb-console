@@ -7,7 +7,7 @@ import unittest
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from pairwise_console.commands import run_command
 from pairwise_console.config import OLD_APP_DIR, load_config
@@ -19,6 +19,7 @@ from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
 from pairwise_console.prompts import gsb_prompt, gsb_recheck_prompt
+from pairwise_console.recording import RecordingManager
 from pairwise_console.service import PairwiseService
 
 
@@ -573,6 +574,51 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(all(row["review_status"] == "confirmed" and row["reviewed_at"] for row in rows))
         updated = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(updated["stage"], "gsb_ready")
+
+    def test_recording_stop_immediately_enters_saving_state(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        output = self.root / "manual.mp4"
+        self.db.execute(
+            """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,status,created_at,updated_at)
+               VALUES(? ,?,'A',?,?, 'recording',?,?)""",
+            ("attempt-stop", pair["id"], "a" * 40, str(output), stamp, stamp),
+        )
+        process = MagicMock()
+        process.poll.return_value = None
+        self.service.recordings._processes["attempt-stop"] = process
+
+        row = self.service.recordings.stop(pair["id"], "A")
+
+        self.assertEqual(row["status"], "stopping")
+        self.assertTrue(Path(str(output) + ".stop").is_file())
+        event = self.db.one(
+            "SELECT event_type FROM audit_events WHERE entity_id='attempt-stop' ORDER BY id DESC LIMIT 1"
+        )
+        self.assertEqual(event["event_type"], "recording.stop_requested")
+
+    def test_service_restart_recovers_a_completed_stop_save(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,status,created_at,updated_at)
+               VALUES(?,?,'B',?,?, 'stopping',?,?)""",
+            ("attempt-recover", pair["id"], "b" * 40, str(self.root / "recovered.mp4"), stamp, stamp),
+        )
+        inspected = {
+            "ok": True, "sha256": "c" * 64, "width": 1280, "height": 720,
+            "duration_seconds": 32.5, "error": "",
+        }
+        with patch("pairwise_console.recording.inspect_recording", return_value=inspected), \
+             patch.object(RecordingManager, "_promote") as promote:
+            RecordingManager(self.config, self.db)
+
+        recovered = self.db.one("SELECT * FROM recording_attempts WHERE id='attempt-recover'")
+        self.assertEqual(recovered["status"], "passed")
+        self.assertEqual(recovered["width"], 1280)
+        promote.assert_called_once_with("attempt-recover")
 
     def test_delivery_preflight_allows_style_suggestion_but_blocks_fact_conflict(self):
         self.insert_ready_task()

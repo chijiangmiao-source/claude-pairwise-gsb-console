@@ -42,14 +42,35 @@ class RecordingManager:
         later attempt reuses the deterministic Compose project name and cleans up
         any remaining containers before it starts.
         """
-        stamp = now_iso()
-        self.db.execute(
-            """UPDATE recording_attempts
-                  SET status='failed',error='服务重启导致本次录像中断，请重新录制',
-                      finished_at=?,updated_at=?
-                WHERE status IN ('starting','recording')""",
-            (stamp, stamp),
+        rows = self.db.all(
+            "SELECT * FROM recording_attempts WHERE status IN ('starting','recording','stopping')"
         )
+        for row in rows:
+            stamp = now_iso()
+            if row["status"] == "stopping":
+                result = inspect_recording(Path(row["path"]))
+                if result.get("ok"):
+                    self.db.execute(
+                        """UPDATE recording_attempts SET sha256=?,width=?,height=?,duration_seconds=?,
+                           status='passed',error='',finished_at=?,updated_at=? WHERE id=?""",
+                        (result.get("sha256", ""), result.get("width", 0), result.get("height", 0),
+                         result.get("duration_seconds", 0), stamp, stamp, row["id"]),
+                    )
+                    self._promote(row["id"])
+                    self.db.audit("recording.save_recovered", "recording_attempt", row["id"], {
+                        "reason": "service_restarted_after_stop_request",
+                    })
+                    continue
+            message = (
+                "服务重启时录像正在保存，但未形成完整文件，请重新录制"
+                if row["status"] == "stopping"
+                else "服务重启导致本次录像中断，请重新录制"
+            )
+            self.db.execute(
+                """UPDATE recording_attempts SET status='failed',error=?,
+                   finished_at=?,updated_at=? WHERE id=?""",
+                (message, stamp, stamp, row["id"]),
+            )
 
     def preflight(self) -> Dict[str, Any]:
         chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
@@ -67,7 +88,7 @@ class RecordingManager:
         if arm not in ("A", "B"):
             raise ValueError("arm must be A or B")
         active = self.db.one(
-            "SELECT * FROM recording_attempts WHERE status IN ('starting','recording') ORDER BY created_at DESC LIMIT 1"
+            "SELECT * FROM recording_attempts WHERE status IN ('starting','recording','stopping') ORDER BY created_at DESC LIMIT 1"
         )
         if active:
             if active["pair_id"] == pair_id and active["arm"] == arm:
@@ -112,16 +133,25 @@ class RecordingManager:
     def stop(self, pair_id: str, arm: str) -> Dict[str, Any]:
         row = self.db.one(
             """SELECT * FROM recording_attempts WHERE pair_id=? AND arm=?
-               AND status IN ('starting','recording') ORDER BY created_at DESC LIMIT 1""", (pair_id, arm)
+               AND status IN ('starting','recording','stopping') ORDER BY created_at DESC LIMIT 1""", (pair_id, arm)
         )
         if not row:
             raise KeyError("没有正在进行的浏览器录像")
+        if row["status"] == "stopping":
+            return row
         with self._lock:
             process = self._processes.get(row["id"])
             self._cancelled.add(row["id"])
+        self.db.execute(
+            "UPDATE recording_attempts SET status='stopping',updated_at=? WHERE id=?",
+            (now_iso(), row["id"]),
+        )
         if process and process.poll() is None:
             Path(str(row["path"]) + ".stop").touch()
-        return row
+        self.db.audit("recording.stop_requested", "recording_attempt", row["id"], {
+            "pair_id": pair_id, "arm": arm,
+        })
+        return self.db.one("SELECT * FROM recording_attempts WHERE id=?", (row["id"],)) or row
 
     def _launch(self, attempt_id: str, workspace: Path, compose: Path, project: str,
                 path: Path, check: Dict[str, Any]) -> None:
