@@ -12,6 +12,23 @@ const maximum = Math.max(5, Math.min(88, Number(maximumRaw) || 88));
 let context;
 let stopping = false;
 
+async function demonstrateReadOnlyDocs(page) {
+  if (!new URL(page.url()).pathname.startsWith("/docs")) return;
+  await page.waitForTimeout(1200);
+  const operations = page.locator(".opblock-summary");
+  const count = Math.min(3, await operations.count());
+  for (let index = 0; index < count && !stopping; index += 1) {
+    const operation = operations.nth(index);
+    await operation.scrollIntoViewIfNeeded();
+    await operation.click({ timeout: 5000 });
+    await page.waitForTimeout(900);
+  }
+  if (!stopping) {
+    await page.locator("body").press("Home");
+    await page.waitForTimeout(800);
+  }
+}
+
 async function finish(reason) {
   if (stopping) return;
   stopping = true;
@@ -55,6 +72,7 @@ try {
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.bringToFront();
   process.stdout.write(`${JSON.stringify({ event: "ready", url: page.url() })}\n`);
+  demonstrateReadOnlyDocs(page).catch(() => {});
   setTimeout(() => finish("maximum_duration"), maximum * 1000);
   setInterval(() => { if (existsSync(stopFile)) finish("manual_stop"); }, 250);
   process.on("SIGINT", () => finish("manual_stop"));
