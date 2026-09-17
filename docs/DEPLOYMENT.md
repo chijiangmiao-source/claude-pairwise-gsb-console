@@ -26,10 +26,18 @@ Claude 容器从 `~/.claude/settings.json` 的 `env.ANTHROPIC_AUTH_TOKEN` 或 `e
 
 ## 2. 准备 Claude Docker 镜像
 
-目标电脑必须存在配置指定的 Claude 镜像：
+目标电脑必须先存在基础 Claude 镜像：
 
 ```bash
 docker image inspect claude-eval-runtime:claude-2.1.269
+```
+
+安装脚本会基于该镜像构建 `claude-eval-runtime:prepared-2.1.269`，预装 Python
+venv/pip、pnpm、CMake、SQLite、编译、压缩和常用网络诊断工具。这样 A/B 新会话可以
+直接安装项目依赖；基础镜像仍保留，便于以后重建预装镜像。也可手动执行：
+
+```bash
+./scripts/build_claude_runtime.sh
 ```
 
 如果镜像只在原电脑上，可离线迁移：
@@ -51,9 +59,11 @@ docker image inspect claude-eval-runtime:claude-2.1.269
 git clone https://github.com/chijiangmiao-source/claude-pairwise-gsb-console.git
 cd claude-pairwise-gsb-console
 chmod +x scripts/*.sh
-./scripts/preflight.sh
 ./scripts/install_launch_agent.sh
 ```
+
+安装脚本会先构建预装开发镜像，再执行完整预检并启动服务。需要单独诊断环境时再运行
+`./scripts/preflight.sh`。
 
 首次执行安装脚本会创建：
 
@@ -140,6 +150,11 @@ npm test
 `config.env`、数据库、项目、录像和轨迹位于运行副本之外，不会被 `rsync --delete` 删除。
 
 升级完成后打开“题目池”，点击“一键自动运行完整流程”即可持续维持 3 个活动 Pair。该开关保存在数据库中，服务重启后会继续生效；需要暂停自动补位时点击“停止自动运行”，已启动的项目不会被强制中断。
+
+A/B 任一侧完成后，系统会立即校验该侧首轮轨迹并运行 Docker 清洁验收；验收结果与
+当前提交 SHA 绑定。另一侧继续开发或单独返工时，已通过的一侧不会重复运行。只有 A/B
+当前提交都通过后才进入录像。首轮题面发送后 15 分钟仍无业务代码会告警，40 分钟仍无
+业务代码才会终止本次开发并按重试规则处理。
 
 ## 8. 日志、重启与卸载
 

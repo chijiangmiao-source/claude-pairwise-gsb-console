@@ -67,7 +67,7 @@ class PairwiseService:
         self._scheduler_started = False
         self._automation_lock = threading.Lock()
         self._pair_creation_lock = threading.Lock()
-        self._pair_completion_lock = threading.Lock()
+        self._pair_completion_lock = threading.RLock()
         self._auto_retry_after: Dict[str, float] = {}
         self._artifact_retry_after: Dict[str, float] = {}
         self._seed_settings()
@@ -100,7 +100,7 @@ class PairwiseService:
             "github_visibility": self.config.github_visibility,
             "repository_prefix": self.config.repository_prefix,
             "first_prompt_warning_minutes": 15,
-            "first_prompt_stop_minutes": 25,
+            "first_prompt_stop_minutes": 40,
             "development_max_attempts": 3,
             "terminal_idle_seconds": 120,
             "recording_width": 1280,
@@ -110,6 +110,14 @@ class PairwiseService:
         for key, value in defaults.items():
             if self.db.one("SELECT key FROM settings WHERE key=?", (key,)) is None:
                 self.db.set_setting(key, value)
+        # Upgrade the original shipped timeout while preserving any later
+        # explicit customization made by an operator.
+        if int(self.db.setting("first_prompt_stop_minutes", 40)) == 25:
+            self.db.set_setting("first_prompt_stop_minutes", 40)
+        if (str(self.db.setting("claude_image", self.config.claude_image))
+                == "claude-eval-runtime:claude-2.1.269"
+                and self.config.claude_image == "claude-eval-runtime:prepared-2.1.269"):
+            self.db.set_setting("claude_image", self.config.claude_image)
         configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         if configured > MAX_PAIR_PROJECTS or configured < 1:
             self.db.set_setting("max_pairs_parallel", MAX_PAIR_PROJECTS)
@@ -124,7 +132,7 @@ class PairwiseService:
         )
         for row in rows:
             stamp = now_iso()
-            error = "A/B Docker 产物验收未全部通过，原完成记录已拦截；失败侧需要从共同基线重跑"
+            error = "A/B Docker 产物验收未全部通过，原完成记录已拦截；失败侧需要从已交付提交返工"
             with self.db.transaction() as conn:
                 conn.execute(
                     """UPDATE pairs SET status='failed',stage='artifact_failed',winner='',completed_at=NULL,
@@ -319,12 +327,8 @@ class PairwiseService:
                     self._submit_auto("repo-" + pair_id, self.prepare_pair_repository, pair_id)
                 elif stage == "ready_to_start":
                     self._submit_auto("start-" + pair_id, self.start_pair, pair_id)
-                elif stage == "artifact_validation":
-                    arms = self.db.all("SELECT status FROM arm_runs WHERE pair_id=?", (pair_id,))
-                    retry_at = self._artifact_retry_after.get(pair_id, 0.0)
-                    if (time.monotonic() >= retry_at and len(arms) == 2
-                            and all(item["status"] == "completed" for item in arms)):
-                        self._submit_auto("artifacts-" + pair_id, self._validate_pair_artifacts, pair_id)
+                elif stage in ("development", "artifact_validation"):
+                    self._schedule_completed_arm_validations(pair_id)
                 elif stage == "recording":
                     recording_pairs.append(pair)
                 elif stage == "gsb_ready":
@@ -1909,7 +1913,7 @@ class PairwiseService:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
-            if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 25)) * 60 and not has_code:
+            if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 40)) * 60 and not has_code:
                 retried = self._handle_attempt_failure(pair_id, arm, prompt, "首轮超时且无代码产出")
                 if retried.get("status") == "failed":
                     return retried
@@ -1985,14 +1989,13 @@ class PairwiseService:
             if "failed" in statuses:
                 self.db.execute("UPDATE pairs SET status='failed',stage='development_failed',error='A/B 至少一侧开发失败',updated_at=? WHERE id=?", (now_iso(), pair_id))
                 return
-            if statuses != {"completed"}:
-                return
             pair = self._pair(pair_id)
             task = self.db.one("SELECT prompt FROM tasks WHERE id=?", (pair["task_id"],)) or {}
             prompt = str(task.get("prompt") or "")
             invalid = []
             issues = []
-            for arm in arms:
+            completed = [arm for arm in arms if arm["status"] == "completed"]
+            for arm in completed:
                 _, _, arm_issues = self._inspect_trace(arm, prompt)
                 if arm_issues:
                     invalid.append(arm)
@@ -2000,25 +2003,89 @@ class PairwiseService:
             if invalid:
                 self._restart_trace_invalid_arms(pair_id, invalid, prompt, issues)
                 return
-            self.db.execute("UPDATE pairs SET status='running',stage='artifact_validation',updated_at=? WHERE id=?", (now_iso(), pair_id))
-            self._submit("artifacts-" + pair_id, self._validate_pair_artifacts, pair_id)
+            stage = "artifact_validation" if statuses == {"completed"} else "development"
+            self.db.execute(
+                "UPDATE pairs SET status='running',stage=?,updated_at=? WHERE id=?",
+                (stage, now_iso(), pair_id),
+            )
+            self._schedule_completed_arm_validations(pair_id)
 
-    def _validate_pair_artifacts(self, pair_id: str) -> Dict[str, Any]:
+    @staticmethod
+    def _artifact_retry_key(pair_id: str, arm: str) -> str:
+        return pair_id + ":" + arm
+
+    def _schedule_completed_arm_validations(self, pair_id: str) -> None:
+        """Validate each delivered Arm immediately and reuse checks by commit."""
+        for arm in self.db.all(
+            "SELECT * FROM arm_runs WHERE pair_id=? AND status='completed' ORDER BY arm",
+            (pair_id,),
+        ):
+            commit_sha = str(arm.get("commit_sha") or "")
+            if not commit_sha:
+                continue
+            passed = self.db.one(
+                """SELECT id FROM artifact_checks
+                   WHERE pair_id=? AND arm=? AND commit_sha=? AND status='passed'""",
+                (pair_id, arm["arm"], commit_sha),
+            )
+            if passed:
+                continue
+            retry_key = self._artifact_retry_key(pair_id, str(arm["arm"]))
+            if time.monotonic() < self._artifact_retry_after.get(retry_key, 0.0):
+                continue
+            operation = "artifact-%s-%s-%s" % (pair_id, arm["arm"], commit_sha[:12])
+            self._submit_auto(
+                operation, self._validate_completed_arm, pair_id, str(arm["arm"]),
+            )
+
+    def _validate_completed_arm(self, pair_id: str, arm_name: str) -> Dict[str, Any]:
+        """Check the exact first prompt and artifact for one completed Arm."""
+        arm = self.db.one(
+            "SELECT * FROM arm_runs WHERE pair_id=? AND arm=?",
+            (pair_id, arm_name),
+        )
+        if not arm or arm["status"] != "completed":
+            return {"pairId": pair_id, "arm": arm_name, "skipped": True}
+        pair = self._pair(pair_id)
+        task = self.db.one("SELECT prompt FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        prompt = str(task.get("prompt") or "")
+        _, _, issues = self._inspect_trace(arm, prompt)
+        if issues:
+            return self._restart_trace_invalid_arms(pair_id, [arm], prompt, issues)
+        return self._validate_pair_artifacts(pair_id, [arm_name])
+
+    def _validate_pair_artifacts(self, pair_id: str,
+                                 arm_names: Optional[List[str]] = None) -> Dict[str, Any]:
         arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
+        selected = [arm for arm in arms if arm["status"] == "completed"
+                    and (arm_names is None or arm["arm"] in arm_names)]
         results = []
-        for arm in arms:
-            results.append(self.artifacts.validate(pair_id, arm["arm"], Path(arm["workspace_path"]), arm["commit_sha"]))
+        reused_by_arm: Dict[str, bool] = {}
+        for arm in selected:
+            current = self.db.one(
+                """SELECT * FROM artifact_checks
+                   WHERE pair_id=? AND arm=? AND commit_sha=? AND status='passed'""",
+                (pair_id, arm["arm"], arm["commit_sha"]),
+            )
+            reused_by_arm[str(arm["arm"])] = bool(current)
+            results.append(current or self.artifacts.validate(
+                pair_id, arm["arm"], Path(arm["workspace_path"]), arm["commit_sha"],
+            ))
         failed = [item for item in results if item.get("status") != "passed"]
         if failed:
             environment_failures = [item for item in failed if self._artifact_environment_failure(item)]
             product_failures = [item for item in failed if item not in environment_failures]
+            for item in environment_failures:
+                retry_key = self._artifact_retry_key(pair_id, str(item.get("arm") or ""))
+                self._artifact_retry_after[retry_key] = time.monotonic() + 30
             if environment_failures and not product_failures:
                 names = [str(item.get("arm") or "") for item in environment_failures]
-                self._artifact_retry_after[pair_id] = time.monotonic() + 30
+                all_completed = len(arms) == 2 and all(arm["status"] == "completed" for arm in arms)
                 self.db.execute(
-                    """UPDATE pairs SET status='running',stage='artifact_validation',error=?,updated_at=?
+                    """UPDATE pairs SET status='running',stage=?,error=?,updated_at=?
                        WHERE id=?""",
-                    ("Docker 验收环境冲突，已保留 A/B 提交并将在 30 秒后重验：" + "、".join(names),
+                    ("artifact_validation" if all_completed else "development",
+                     "Docker 验收环境冲突，已保留已完成提交并将在 30 秒后重验：" + "、".join(names),
                      now_iso(), pair_id),
                 )
                 self.db.audit("artifact.environment_retry_scheduled", "pair", pair_id, {
@@ -2030,18 +2097,18 @@ class PairwiseService:
                 (pair_id,),
             ) or {}
             prompt = str(task.get("prompt") or "")
-            by_arm = {arm["arm"]: arm for arm in arms}
+            by_arm = {arm["arm"]: arm for arm in selected}
             names = [str(item.get("arm") or "") for item in product_failures]
             self.db.execute(
                 """UPDATE pairs SET status='running',stage='development',error=?,updated_at=? WHERE id=?""",
-                ("Docker 产物验收未通过，正在从共同基线用新会话重跑：" + "、".join(names), now_iso(), pair_id),
+                ("Docker 产物验收未通过，正在从失败侧已交付提交用新会话返工：" + "、".join(names), now_iso(), pair_id),
             )
             for item in product_failures:
                 arm = by_arm.get(str(item.get("arm") or ""))
                 if arm:
                     self.db.execute(
                         "UPDATE arm_runs SET status='waiting_retry',error=?,updated_at=? WHERE id=?",
-                        ("Docker 产物验收失败，等待从共同基线重跑", now_iso(), arm["id"]),
+                        ("Docker 产物验收失败，等待从该侧已交付提交返工", now_iso(), arm["id"]),
                     )
             restarted = []
             for item in product_failures:
@@ -2064,11 +2131,43 @@ class PairwiseService:
                 "arms": restarted, "rule": "fresh_session_from_delivered_commit",
             })
             return {"pairId": pair_id, "checks": results, "restarted": restarted}
-        self.db.execute(
-            "UPDATE pairs SET status='running',stage='recording',error='',updated_at=? WHERE id=?",
-            (now_iso(), pair_id),
-        )
-        self._artifact_retry_after.pop(pair_id, None)
+        for arm in selected:
+            self._artifact_retry_after.pop(
+                self._artifact_retry_key(pair_id, str(arm["arm"])), None,
+            )
+            self.db.audit("artifact.arm_passed", "arm_run", arm["id"], {
+                "pair_id": pair_id, "arm": arm["arm"], "commit_sha": arm["commit_sha"],
+                "reused": reused_by_arm.get(str(arm["arm"]), False),
+            })
+        current_arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
+        passed_count = 0
+        for arm in current_arms:
+            if arm["status"] != "completed":
+                continue
+            if self.db.one(
+                """SELECT id FROM artifact_checks WHERE pair_id=? AND arm=?
+                   AND commit_sha=? AND status='passed'""",
+                (pair_id, arm["arm"], arm["commit_sha"]),
+            ):
+                passed_count += 1
+        if len(current_arms) == 2 and all(arm["status"] == "completed" for arm in current_arms) and passed_count == 2:
+            self.db.execute(
+                "UPDATE pairs SET status='running',stage='recording',error='',updated_at=? WHERE id=?",
+                (now_iso(), pair_id),
+            )
+            self.db.audit("artifact.pair_passed", "pair", pair_id, {
+                "rule": "both_current_commits_passed",
+            })
+        else:
+            all_completed = len(current_arms) == 2 and all(
+                arm["status"] == "completed" for arm in current_arms
+            )
+            self.db.execute(
+                "UPDATE pairs SET status='running',stage=?,error='',updated_at=? WHERE id=?",
+                ("artifact_validation" if all_completed else "development", now_iso(), pair_id),
+            )
+            if all_completed:
+                self._schedule_completed_arm_validations(pair_id)
         return {"pairId": pair_id, "checks": results}
 
     @staticmethod

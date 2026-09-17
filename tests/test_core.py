@@ -57,6 +57,74 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("codex_default_effort"), "medium")
         self.assertEqual(self.db.setting("codex_bug_effort"), "high")
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
+        self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 40)
+
+    def test_completed_arm_is_scheduled_for_validation_before_peer_finishes(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
+        for arm, status, sha in (("A", "completed", "a" * 40), ("B", "developing", "")):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,trace_path,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("arm-early-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image", status,
+                 str(self.root / "traces" / arm), sha, stamp, stamp),
+            )
+        with patch.object(self.service, "_inspect_trace", return_value=(Path("A.jsonl"), "2.1.269", [])), \
+             patch.object(self.service, "_submit_auto", return_value=True) as submit:
+            self.service._refresh_pair_after_arm(pair["id"])
+        submit.assert_called_once_with(
+            "artifact-%s-A-%s" % (pair["id"], "a" * 12),
+            self.service._validate_completed_arm, pair["id"], "A",
+        )
+        self.assertEqual(
+            self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))["stage"],
+            "development",
+        )
+
+    def test_pair_records_only_after_both_current_commits_pass(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm, status, sha in (("A", "completed", "a" * 40), ("B", "developing", "")):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("arm-gate-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image", status,
+                 sha, stamp, stamp),
+            )
+
+        def passed_check(pair_id, arm, workspace, commit_sha):
+            check_id = "check-gate-" + arm
+            self.db.execute(
+                """INSERT OR REPLACE INTO artifact_checks
+                   (id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""",
+                (check_id, pair_id, arm, commit_sha, stamp, stamp),
+            )
+            return self.db.one("SELECT * FROM artifact_checks WHERE id=?", (check_id,))
+
+        with patch.object(self.service.artifacts, "validate", side_effect=passed_check):
+            self.service._validate_pair_artifacts(pair["id"], ["A"])
+        self.assertEqual(
+            self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))["stage"],
+            "development",
+        )
+        self.db.execute(
+            "UPDATE arm_runs SET status='completed',commit_sha=? WHERE pair_id=? AND arm='B'",
+            ("b" * 40, pair["id"]),
+        )
+        with patch.object(self.service.artifacts, "validate", side_effect=passed_check):
+            self.service._validate_pair_artifacts(pair["id"], ["B"])
+        self.assertEqual(
+            self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))["stage"],
+            "recording",
+        )
 
     def test_full_monitor_capacity_does_not_starve_user_operations(self):
         release = threading.Event()

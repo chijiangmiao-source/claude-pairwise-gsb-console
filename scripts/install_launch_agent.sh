@@ -21,13 +21,37 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     printf "PAIRWISE_GIT_AUTHOR_NAME='%s'\n" "刘昱"
     printf "PAIRWISE_GIT_AUTHOR_EMAIL='%s'\n" "$git_author_email"
     printf "PAIRWISE_GITHUB_VISIBILITY='%s'\n" "private"
-    printf "PAIRWISE_CLAUDE_IMAGE='%s'\n" "claude-eval-runtime:claude-2.1.269"
+    printf "PAIRWISE_CLAUDE_BASE_IMAGE='%s'\n" "claude-eval-runtime:claude-2.1.269"
+    printf "PAIRWISE_CLAUDE_IMAGE='%s'\n" "claude-eval-runtime:prepared-2.1.269"
     printf "PAIRWISE_MAX_PARALLEL='%s'\n" "3"
     printf "PAIRWISE_TASK_GENERATION_PARALLEL='%s'\n" "6"
   } > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
   echo "Created $CONFIG_FILE"
 fi
+if grep -Eq "^PAIRWISE_CLAUDE_IMAGE=['\"]?claude-eval-runtime:claude-2\.1\.269['\"]?$" "$CONFIG_FILE"; then
+  /usr/bin/python3 - "$CONFIG_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+line = "PAIRWISE_CLAUDE_BASE_IMAGE='claude-eval-runtime:claude-2.1.269'\n"
+if "PAIRWISE_CLAUDE_BASE_IMAGE=" not in text:
+    text += ("" if text.endswith("\n") else "\n") + line
+text = text.replace("PAIRWISE_CLAUDE_IMAGE='claude-eval-runtime:claude-2.1.269'",
+                    "PAIRWISE_CLAUDE_IMAGE='claude-eval-runtime:prepared-2.1.269'")
+text = text.replace('PAIRWISE_CLAUDE_IMAGE="claude-eval-runtime:claude-2.1.269"',
+                    'PAIRWISE_CLAUDE_IMAGE="claude-eval-runtime:prepared-2.1.269"')
+text = text.replace("PAIRWISE_CLAUDE_IMAGE=claude-eval-runtime:claude-2.1.269",
+                    "PAIRWISE_CLAUDE_IMAGE=claude-eval-runtime:prepared-2.1.269")
+path.write_text(text, encoding="utf-8")
+PY
+fi
+set -a
+source "$CONFIG_FILE"
+set +a
+"$ROOT/scripts/build_claude_runtime.sh"
 PAIRWISE_CONFIG_FILE="$CONFIG_FILE" "$ROOT/scripts/preflight.sh"
 if [[ -f "$DATA_DIR/pairwise.db" ]]; then
   backup="$DATA_DIR/backups/pairwise-before-upgrade-$(date +%Y%m%d-%H%M%S).db"

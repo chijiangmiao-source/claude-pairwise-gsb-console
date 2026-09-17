@@ -83,7 +83,7 @@ class RecordingManager:
         if not check:
             raise ValueError("最终提交尚未执行 Docker 产物验收")
         if check.get("status") != "passed":
-            raise ValueError("Docker 产物验收未通过，不能录制或生成 GSB；请先从共同基线重跑该 Arm")
+            raise ValueError("Docker 产物验收未通过，不能录制或生成 GSB；请先从该侧已交付提交返工")
         compose_value = str(check.get("compose_file") or "")
         compose = Path(compose_value) if compose_value else None
         if not compose or not compose.is_file():
