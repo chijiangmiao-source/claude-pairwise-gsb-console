@@ -575,6 +575,65 @@ class CoreTests(unittest.TestCase):
         updated = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(updated["stage"], "gsb_ready")
 
+    def test_rerecording_same_commits_preserves_confirmed_gsb(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            sha = (arm.lower() * 40)[:40]
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-rerecord-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO recordings(id,pair_id,arm,path,commit_sha,sha256,width,height,duration_seconds,
+                   attempt_id,commit_match,review_status,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,1280,720,30,?,1,'confirmed','passed',?,?)""",
+                ("rec-old-" + arm, pair["id"], arm, str(self.root / (arm + "-old.mp4")), sha,
+                 arm * 64, "attempt-old-" + arm, stamp, stamp),
+            )
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,a_reason,b_reason,status,confirmed_by,
+               confirmed_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'confirmed','刘昱',?,?,?)""",
+            ("gsb-rerecord", pair["id"], "Same", "A：A 完成要求。 B：B 完成要求。",
+             "A 完成要求。", "B 完成要求。", stamp, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO gsb_rechecks(id,pair_id,evidence_version,input_verdict,input_reason,result_status,
+               model,reasoning_effort,created_at) VALUES(?,?,?,?,?,'passed','gpt-6-astra','high',?)""",
+            ("recheck-rerecord", pair["id"], "old-version", "Same", "原评价", stamp),
+        )
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
+               VALUES(?,?,'submitted',?,?)""",
+            ("delivery-rerecord", pair["id"], stamp, stamp),
+        )
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',winner='Same',completed_at=? WHERE id=?",
+            (stamp, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,capture_mode,entry_url,
+               width,height,duration_seconds,sha256,status,started_at,finished_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,'browser','http://127.0.0.1:9000',1280,720,42,?,'passed',?,?,?,?)""",
+            ("attempt-new-A", pair["id"], "A", "a" * 40, str(self.root / "A-new.mp4"),
+             "n" * 64, stamp, stamp, stamp, stamp),
+        )
+
+        self.service.recordings._promote("attempt-new-A")
+
+        review = self.db.one("SELECT status,confirmed_by FROM gsb_reviews WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(review, {"status": "confirmed", "confirmed_by": "刘昱"})
+        self.assertIsNotNone(self.db.one("SELECT id FROM gsb_rechecks WHERE id='recheck-rerecord'"))
+        current = self.db.one("SELECT status,stage,winner FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {"status": "completed", "stage": "completed", "winner": "Same"})
+        delivery = self.db.one("SELECT status FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(delivery["status"], "needs_review")
+
     def test_recording_stop_immediately_enters_saving_state(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
