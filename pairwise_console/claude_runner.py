@@ -513,6 +513,20 @@ exit "$code"
         if status.returncode != 0:
             return False
         extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".cpp", ".c", ".h", ".vue", ".svelte", ".html", ".css", ".sql", ".sh"}
+        ignored_parts = {
+            ".venv", "venv", "env", "node_modules", ".pnpm-store",
+            "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache",
+            "dist", "build", "coverage", ".next", ".nuxt", ".turbo",
+            "playwright-report", "test-results",
+        }
+
+        def ignored(item: Path) -> bool:
+            try:
+                parts = item.relative_to(workspace).parts
+            except ValueError:
+                parts = item.parts
+            return any(part.casefold() in ignored_parts for part in parts)
+
         paths = [line[3:].split(" -> ")[-1].strip() for line in status.stdout.splitlines()]
         if baseline_sha:
             committed = run_command(
@@ -523,11 +537,13 @@ exit "$code"
                 paths.extend(line.strip() for line in committed.stdout.splitlines() if line.strip())
         for path in paths:
             item = workspace / path
+            if ignored(item):
+                continue
             if item.name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml") or item.suffix.casefold() in extensions:
                 return True
             if item.is_dir():
                 for child in item.rglob("*"):
-                    if child.is_file() and (
+                    if child.is_file() and not ignored(child) and (
                         child.name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml")
                         or child.suffix.casefold() in extensions
                     ):

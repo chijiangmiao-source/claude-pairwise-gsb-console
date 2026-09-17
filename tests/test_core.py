@@ -1176,6 +1176,33 @@ class CoreTests(unittest.TestCase):
         (nested / "worker.py").write_text("print('work')\n", encoding="utf-8")
         self.assertTrue(self.service.claude.has_business_code(destination, expected_sha))
 
+    def test_dependency_and_build_directories_do_not_count_as_business_code(self):
+        workspace = self.root / "dependency-only"
+        workspace.mkdir()
+        run_command(["git", "init", "-b", "A"], cwd=workspace)
+        run_command(["git", "config", "user.name", "Test"], cwd=workspace)
+        run_command(["git", "config", "user.email", "test@example.com"], cwd=workspace)
+        (workspace / "README.md").write_text("baseline\n", encoding="utf-8")
+        run_command(["git", "add", "README.md"], cwd=workspace)
+        run_command(["git", "commit", "-m", "baseline"], cwd=workspace)
+        baseline = run_command(["git", "rev-parse", "HEAD"], cwd=workspace).stdout.strip()
+
+        for relative in (
+            "backend/.venv/lib/python3.11/site-packages/helper.py",
+            "frontend/node_modules/example/index.js",
+            "backend/__pycache__/main.py",
+            "frontend/dist/assets/app.js",
+        ):
+            target = workspace / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("generated\n", encoding="utf-8")
+        self.assertFalse(self.service.claude.has_business_code(workspace, baseline))
+
+        source = workspace / "backend" / "app" / "main.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("print('business code')\n", encoding="utf-8")
+        self.assertTrue(self.service.claude.has_business_code(workspace, baseline))
+
 
 if __name__ == "__main__":
     unittest.main()
