@@ -56,7 +56,7 @@ def task_generation_prompt(existing: str, task_type: str = "zero_to_one") -> str
 {DIFFICULTY_RULES}
 {BANNED_TASKS}
 
-直接生成困难或地狱任务，不先生成低难度再升级。projectCategory 必须明确选择纯后端、纯前端或全栈；纯后端不得创建前端，纯前端不得创建业务后端，全栈必须通过真实 API 联调。题面要给出明确业务背景、复杂状态或异常链路、技术约束、边界条件与验收条件；必须要求 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，并保证克隆后只依赖 Docker 即可运行。避免复述实现方案，给开发者保留关键设计取舍。
+直接生成困难或地狱任务，不先生成低难度再升级。projectCategory 必须明确选择纯后端、纯前端或全栈；纯后端不得创建前端，纯前端不得创建业务后端，全栈必须通过真实 API 联调。stack 只写语言、运行时、框架、测试框架和容器技术名称，用英文逗号加空格分隔，例如 Python 3.13, FastAPI, Pydantic, TypeScript, React, Vite, pytest, Vitest, Playwright, Docker；不得写用途、架构、算法、业务能力、约束或说明性句子，Docker Compose 统一写 Docker。题面要给出明确业务背景、复杂状态或异常链路、技术约束、边界条件与验收条件；必须要求 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，并保证克隆后只依赖 Docker 即可运行。避免复述实现方案，给开发者保留关键设计取舍。
 
 已有题目标题与摘要，必须避免雷同：
 {existing or '无'}
@@ -70,7 +70,7 @@ def feature_generation_prompt(original_task: str, artifact_summary: str, existin
 {DIFFICULTY_RULES}
 {BANNED_TASKS}
 
-必须在现有产品和代码结构上增加真实的新能力，保留现有功能、接口与 Docker Compose 验收链路。projectCategory 必须保持为 {project_category or '原项目类别'}，不得把纯后端擅自改成全栈或给纯前端增加业务后端。直接生成困难或地狱任务，复杂度必须来自跨模块状态、性能、并发、异常恢复或兼容性等真实约束，不能靠堆字段或扩大文字。题面要明确新行为、边界条件与可执行验收，但给开发者保留实现取舍。taskType 必须为 feature。
+必须在现有产品和代码结构上增加真实的新能力，保留现有功能、接口与 Docker Compose 验收链路。projectCategory 必须保持为 {project_category or '原项目类别'}，不得把纯后端擅自改成全栈或给纯前端增加业务后端。stack 只写语言、运行时、框架、测试框架和容器技术名称，用英文逗号加空格分隔，例如 Python 3.13, FastAPI, Pydantic, TypeScript, React, Vite, pytest, Vitest, Playwright, Docker；不得写用途、架构、算法、业务能力、约束或说明性句子，Docker Compose 统一写 Docker。直接生成困难或地狱任务，复杂度必须来自跨模块状态、性能、并发、异常恢复或兼容性等真实约束，不能靠堆字段或扩大文字。题面要明确新行为、边界条件与可执行验收，但给开发者保留实现取舍。taskType 必须为 feature。
 
 原始任务：
 {original_task}

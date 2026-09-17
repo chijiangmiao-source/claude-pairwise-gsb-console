@@ -47,11 +47,12 @@ class Database:
             task_columns = {row[1] for row in c.execute("PRAGMA table_info(tasks)")}
             if "project_category" not in task_columns:
                 c.execute("ALTER TABLE tasks ADD COLUMN project_category TEXT NOT NULL DEFAULT '未记录'")
-            from .classification import normalize_project_category
+            from .classification import normalize_project_category, normalize_stack
             for row in c.execute("SELECT id,project_category,title,prompt,stack FROM tasks").fetchall():
                 category = normalize_project_category(row[1], row[2], row[3], row[4])
-                if row[1] != category:
-                    c.execute("UPDATE tasks SET project_category=? WHERE id=?", (category, row[0]))
+                stack = normalize_stack(row[4])
+                if row[1] != category or row[4] != stack:
+                    c.execute("UPDATE tasks SET project_category=?,stack=? WHERE id=?", (category, stack, row[0]))
             columns = {row[1] for row in c.execute("PRAGMA table_info(arm_runs)")}
             for name, definition in (
                 ("result", "TEXT NOT NULL DEFAULT ''"),

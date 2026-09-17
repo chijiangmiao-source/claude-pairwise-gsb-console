@@ -491,7 +491,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _delivery_select(self) -> Tuple[str, str]:
         select = """SELECT p.id pair_id,p.chain_id project_number,p.status pair_status,p.stage,p.completed_at,
-          t.title,t.task_type,t.difficulty,t.project_category,t.source,t.prompt,repo.remote_url,repo.main_sha,
+          t.title,t.task_type,t.difficulty,t.project_category,t.stack,t.source,t.prompt,repo.remote_url,repo.main_sha,
           dr.original_difficulty,dr.a_difficulty,dr.b_difficulty,dr.assessed_difficulty,
           dr.reason difficulty_reason,dr.status difficulty_review_status,
           aa.session_id a_session_id,aa.prompt_id a_prompt_id,aa.commit_sha a_commit,

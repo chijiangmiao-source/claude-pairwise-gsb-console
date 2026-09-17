@@ -1,7 +1,41 @@
+import re
 from typing import Any
 
 
 PROJECT_CATEGORIES = ("纯后端", "纯前端", "全栈")
+
+
+def normalize_stack(value: Any = "") -> str:
+    """Return a compact, comma-separated list of technology names.
+
+    The submission field is not a project description. Generated and legacy
+    rows sometimes append architecture decisions or Chinese explanations;
+    those are removed while language, framework, test and container labels
+    are retained. Docker Compose is represented once as Docker.
+    """
+    raw = str(value or "").strip()
+    parts = re.split(r"[,，、;；\n|]+|\s+\+\s+", raw)
+    names = []
+    seen = set()
+    for part in parts:
+        token = part.strip().strip(".。:：-—•· ")
+        if not token or re.search(r"[\u3400-\u9fff]", token):
+            continue
+        # A slash commonly joins two library names in generated metadata.
+        candidates = re.split(r"\s*/\s*", token) if re.fullmatch(
+            r"[A-Za-z0-9_.+#() -]+\s*/\s*[A-Za-z0-9_.+#() -]+", token
+        ) else [token]
+        for candidate in candidates:
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            if not candidate or len(candidate) > 48 or ":" in candidate:
+                continue
+            if candidate.casefold() in ("docker compose", "docker-compose"):
+                candidate = "Docker"
+            key = candidate.casefold()
+            if key not in seen:
+                seen.add(key)
+                names.append(candidate)
+    return ", ".join(names)[:255]
 
 
 def normalize_project_category(value: Any = "", *context: Any) -> str:

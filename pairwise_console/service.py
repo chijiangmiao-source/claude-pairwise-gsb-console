@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from .analytics import dashboard
 from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
-from .classification import normalize_project_category
+from .classification import normalize_project_category, normalize_stack
 from .codex_runner import (
     ACTUAL_DIFFICULTY_SCHEMA, BUG_DISCOVERY_SCHEMA, CodexRunner,
     GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA,
@@ -641,7 +641,7 @@ class PairwiseService:
                     """INSERT INTO tasks(id,source,task_type,title,prompt,stack,project_category,acceptance_json,difficulty,
                        difficulty_evidence_json,fingerprint,status,created_at,updated_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (task_id, "generated", result["taskType"], result["title"], result["prompt"], result["stack"],
+                    (task_id, "generated", result["taskType"], result["title"], result["prompt"], normalize_stack(result["stack"]),
                      normalize_project_category(result.get("projectCategory"), result["stack"], result["prompt"]),
                      json.dumps(result["acceptance"], ensure_ascii=False), result["difficulty"],
                      json.dumps(result["difficultyEvidence"], ensure_ascii=False), key, "candidate", stamp, stamp),
@@ -713,7 +713,7 @@ class PairwiseService:
                 """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,acceptance_json,difficulty,
                    difficulty_evidence_json,baseline_path,baseline_repo_url,baseline_sha,parent_pair_id,fingerprint,
                    status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (task_id, "generated_followup", pair_id, "feature", result["title"], result["prompt"], result["stack"],
+                (task_id, "generated_followup", pair_id, "feature", result["title"], result["prompt"], normalize_stack(result["stack"]),
                  normalize_project_category(task.get("project_category"), result["stack"], result["prompt"]),
                  json.dumps(result["acceptance"], ensure_ascii=False), result["difficulty"],
                  json.dumps(result["difficultyEvidence"], ensure_ascii=False), str(workspace),
@@ -1971,7 +1971,7 @@ class PairwiseService:
             "user_prompt": prompt,
             "question_type": task_type,
             "difficulty": difficulty,
-            "languages": str(task.get("stack") or "")[:255],
+            "languages": normalize_stack(task.get("stack")),
             "harness": "Claude Code",
             "harness_version": versions.get("A") or versions.get("B") or "",
             "os_platform": "MacOS/Linux",

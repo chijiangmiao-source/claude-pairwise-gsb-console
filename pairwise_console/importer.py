@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .db import Database, now_iso
-from .classification import normalize_project_category
+from .classification import normalize_project_category, normalize_stack
 
 
 TASK_TYPES = {
@@ -68,7 +68,7 @@ def import_historical_tasks(db: Database, old_db_path: Path, limit: int = 500) -
                    rejection_reason,created_at,updated_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (task_id, "legacy", row["id"], kind, row["repo_name"], prompt,
-                 str(row["language_framework"] or ""), category, row["task_difficulty"],
+                 normalize_stack(row["language_framework"]), category, row["task_difficulty"],
                  '["来源记录已判定为困难或地狱","进入 Pair 前仍需完成禁题、去重和基线复核"]',
                  baseline_path, str(row["repo_url"] or ""), base_sha, key,
                  "candidate" if baseline_complete else "rejected",

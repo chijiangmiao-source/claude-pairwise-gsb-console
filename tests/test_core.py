@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from pairwise_console.commands import run_command
+from pairwise_console.classification import normalize_stack
 from pairwise_console.config import OLD_APP_DIR, load_config
 from pairwise_console.db import Database, now_iso
 from pairwise_console.gitops import GitOps
@@ -62,6 +63,23 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
         self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 40)
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
+
+    def test_language_framework_field_keeps_only_technology_names(self):
+        self.assertEqual(
+            normalize_stack(
+                "Python 3.13、FastAPI、Pydantic、SQLAlchemy/Alembic、持久化后台 worker；"
+                "TypeScript、React、Vite；pytest、Vitest、Playwright；Docker、Docker Compose"
+            ),
+            "Python 3.13, FastAPI, Pydantic, SQLAlchemy, Alembic, TypeScript, React, Vite, "
+            "pytest, Vitest, Playwright, Docker",
+        )
+        self.assertEqual(
+            normalize_stack(
+                "Python 3.13、FastAPI、Pydantic、pytest、Docker Compose；"
+                "沿用现有算法，不引入外部服务。"
+            ),
+            "Python 3.13, FastAPI, Pydantic, pytest, Docker",
+        )
 
     def test_original_prompts_are_staggered_between_a_and_b(self):
         self.insert_ready_task()
