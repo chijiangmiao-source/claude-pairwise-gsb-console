@@ -14,18 +14,26 @@ let stopping = false;
 
 async function demonstrateReadOnlyDocs(page) {
   if (!new URL(page.url()).pathname.startsWith("/docs")) return;
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(4000);
   const operations = page.locator(".opblock-summary");
-  const count = Math.min(3, await operations.count());
+  const count = Math.min(2, await operations.count());
   for (let index = 0; index < count && !stopping; index += 1) {
     const operation = operations.nth(index);
     await operation.scrollIntoViewIfNeeded();
     await operation.click({ timeout: 5000 });
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(5000);
+  }
+  if (count && !stopping) {
+    const first = operations.first();
+    await first.scrollIntoViewIfNeeded();
+    await first.click({ timeout: 5000 });
+    await page.waitForTimeout(5000);
+    await first.click({ timeout: 5000 });
+    await page.waitForTimeout(5000);
   }
   if (!stopping) {
     await page.locator("body").press("Home");
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(2000);
   }
 }
 
@@ -54,6 +62,19 @@ try {
     args: ["--no-first-run", "--no-default-browser-check", "--disable-session-crashed-bubble"],
   });
   await context.addInitScript(() => {
+    const hideOpenApiLink = () => {
+      document.querySelectorAll('.swagger-ui a[href*="openapi.json"]').forEach((link) => {
+        const wrapper = link.parentElement;
+        link.remove();
+        if (wrapper && !wrapper.textContent.trim()) wrapper.style.display = "none";
+      });
+    };
+    const observer = new MutationObserver(hideOpenApiLink);
+    const observeDocument = () => {
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      hideOpenApiLink();
+    };
+    document.documentElement ? observeDocument() : document.addEventListener("DOMContentLoaded", observeDocument, { once: true });
     document.addEventListener("pointerdown", (event) => {
       const dot = document.createElement("div");
       Object.assign(dot.style, {
