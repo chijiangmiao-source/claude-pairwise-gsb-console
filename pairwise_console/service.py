@@ -15,14 +15,17 @@ from .analytics import dashboard
 from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
 from .classification import normalize_project_category
-from .codex_runner import BUG_DISCOVERY_SCHEMA, CodexRunner, GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA
+from .codex_runner import (
+    ACTUAL_DIFFICULTY_SCHEMA, BUG_DISCOVERY_SCHEMA, CodexRunner,
+    GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA,
+)
 from .config import Config, MAX_PAIR_PROJECTS
 from .db import Database, now_iso
 from .gitops import GitOps
 from .importer import fingerprint, import_historical_tasks
 from .prompts import (
-    bug_discovery_prompt, feature_generation_prompt, gsb_prompt, gsb_recheck_prompt,
-    task_generation_prompt, task_validation_prompt,
+    actual_difficulty_review_prompt, bug_discovery_prompt, feature_generation_prompt,
+    gsb_prompt, gsb_recheck_prompt, task_generation_prompt, task_validation_prompt,
 )
 from .recording import RecordingManager
 from .commands import redact, run_command
@@ -358,6 +361,12 @@ class PairwiseService:
                     self._submit_auto("start-" + pair_id, self.start_pair, pair_id)
                 elif stage in ("development", "artifact_validation"):
                     self._schedule_completed_arm_validations(pair_id)
+                elif stage == "difficulty_review":
+                    self._submit_auto(
+                        "difficulty-" + pair_id,
+                        self.reassess_actual_difficulty,
+                        pair_id,
+                    )
                 elif stage == "recording":
                     recording_pairs.append(pair)
                 elif stage == "gsb_ready":
@@ -803,6 +812,11 @@ class PairwiseService:
         self._submit(operation, self.generate_gsb, pair_id)
         return operation
 
+    def reassess_actual_difficulty_async(self, pair_id: str) -> str:
+        operation = "difficulty-" + pair_id
+        self._submit(operation, self.reassess_actual_difficulty, pair_id)
+        return operation
+
     def repair_trace_prompt_async(self, pair_id: str, arm: str) -> str:
         operation = "trace-repair-%s-%s" % (pair_id, arm.lower())
         self._submit(operation, self.repair_trace_prompt, pair_id, arm)
@@ -974,7 +988,9 @@ class PairwiseService:
         return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
 
     def start_recording(self, pair_id: str, arm: str, x: int = 0, y: int = 0, manual: bool = False) -> Dict[str, Any]:
-        self._pair(pair_id)
+        pair = self._pair(pair_id)
+        if pair.get("stage") in ("difficulty_review", "difficulty_rejected"):
+            raise ValueError("实际难度复评通过后才能录制")
         return self.recordings.start(pair_id, arm, x, y, manual=manual)
 
     def stop_recording(self, pair_id: str, arm: str) -> Dict[str, Any]:
@@ -1014,6 +1030,161 @@ class PairwiseService:
         if failed:
             raise ValueError("A/B 必须先通过 Docker 产物验收；未通过：" + "、".join(failed))
         return checks
+
+    def _difficulty_arm_evidence(self, pair: Dict[str, Any], arm: Dict[str, Any],
+                                 check: Dict[str, Any]) -> Dict[str, Any]:
+        workspace = Path(str(arm.get("workspace_path") or ""))
+        baseline = str(pair.get("baseline_sha") or "")
+        commit = str(arm.get("commit_sha") or "")
+        diff_range = "%s..%s" % (baseline, commit) if baseline and commit else commit
+        code: Dict[str, Any] = {"range": diff_range, "stat": "", "files": []}
+        if workspace.is_dir() and diff_range:
+            stat = run_command(
+                ["git", "diff", "--stat", "--find-renames", diff_range],
+                cwd=workspace, timeout=60, check=False,
+            )
+            names = run_command(
+                ["git", "diff", "--name-status", "--find-renames", diff_range],
+                cwd=workspace, timeout=60, check=False,
+            )
+            code["stat"] = self._trace_value_text(stat.stdout or stat.stderr, 1800)
+            code["files"] = [line[:300] for line in (names.stdout or "").splitlines()[:120]]
+            if stat.returncode or names.returncode:
+                code["error"] = self._trace_value_text(stat.stderr or names.stderr, 500)
+        try:
+            check_items = json.loads(str(check.get("checks_json") or "[]"))
+        except ValueError:
+            check_items = []
+        compact_checks = []
+        for item in check_items[:20]:
+            compact_checks.append({
+                "name": str(item.get("name") or ""),
+                "passed": bool(item.get("passed")),
+                "detail": self._trace_value_text(item.get("detail"), 500),
+            })
+        trace = self._trace_action_evidence(arm)
+        trace_events = list(trace.get("events") or [])
+        if len(trace_events) > 100:
+            trace["events"] = trace_events[:30] + trace_events[-70:]
+            trace["omittedForDifficultyReview"] = len(trace_events) - 100
+        return {
+            "arm": arm.get("arm"),
+            "commit": commit,
+            "developmentResult": self._trace_value_text(arm.get("result"), 1600),
+            "codeChange": code,
+            "docker": {
+                "status": check.get("status"),
+                "checks": compact_checks,
+                "error": self._trace_value_text(check.get("error"), 600),
+            },
+            "traceEvidence": trace,
+        }
+
+    def reassess_actual_difficulty(self, pair_id: str) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        if pair.get("status") == "completed" or pair.get("stage") == "completed":
+            raise ValueError("已完成或已质检的数据不执行开发后难度回写")
+        if pair.get("stage") != "difficulty_review":
+            raise ValueError("只有 A/B 开发和 Docker 验收完成后才能复评实际难度")
+        task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
+        if len(arms) != 2 or any(arm.get("status") != "completed" or not arm.get("commit_sha") for arm in arms):
+            raise ValueError("A/B 两侧必须都已完成并形成提交")
+        checks = self._require_passed_artifacts(pair_id)
+        arm_by_name = {str(arm["arm"]): arm for arm in arms}
+        check_by_name = {str(check["arm"]): check for check in checks}
+        commits = {name: str(arm_by_name[name].get("commit_sha") or "") for name in ("A", "B")}
+        existing = self.db.one("SELECT * FROM difficulty_reviews WHERE pair_id=?", (pair_id,))
+        if existing and existing.get("a_commit_sha") == commits["A"] and existing.get("b_commit_sha") == commits["B"]:
+            if existing.get("status") == "passed":
+                self.db.execute(
+                    "UPDATE pairs SET status='running',stage='recording',error='',updated_at=? WHERE id=?",
+                    (now_iso(), pair_id),
+                )
+                return existing
+            if existing.get("status") == "rejected":
+                return existing
+        review_id = str(existing.get("id") if existing else "") or "difficulty-" + uuid.uuid4().hex[:16]
+        original = str(existing.get("original_difficulty") if existing else task.get("difficulty") or "")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO difficulty_reviews(
+                 id,pair_id,original_difficulty,a_commit_sha,b_commit_sha,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'running',?,?)
+               ON CONFLICT(pair_id) DO UPDATE SET a_difficulty='',b_difficulty='',assessed_difficulty='',
+                 reason='',evidence_json='[]',a_commit_sha=excluded.a_commit_sha,
+                 b_commit_sha=excluded.b_commit_sha,status='running',error='',reviewed_at=NULL,
+                 updated_at=excluded.updated_at""",
+            (review_id, pair_id, original, commits["A"], commits["B"], stamp, stamp),
+        )
+        a_evidence = self._difficulty_arm_evidence(pair, arm_by_name["A"], check_by_name["A"])
+        b_evidence = self._difficulty_arm_evidence(pair, arm_by_name["B"], check_by_name["B"])
+        prompt = actual_difficulty_review_prompt(
+            str(task.get("prompt") or ""), original,
+            json.dumps(a_evidence, ensure_ascii=False),
+            json.dumps(b_evidence, ensure_ascii=False),
+        )
+        repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
+        cwd = Path(str(repo.get("local_root") or arm_by_name["A"].get("workspace_path") or self.config.data_dir))
+        try:
+            result = self.codex.run(
+                "difficulty_reassessment", prompt, ACTUAL_DIFFICULTY_SCHEMA,
+                cwd=cwd, pair_id=pair_id, task_id=pair["task_id"], timeout=1800,
+            )
+        except Exception as exc:
+            error = redact(str(exc))[-2000:]
+            self.db.execute(
+                "UPDATE difficulty_reviews SET status='failed',error=?,updated_at=? WHERE pair_id=?",
+                (error, now_iso(), pair_id),
+            )
+            self.db.execute(
+                "UPDATE pairs SET status='running',stage='difficulty_review',error=?,updated_at=? WHERE id=?",
+                ("实际难度复评失败，将自动重试：" + error, now_iso(), pair_id),
+            )
+            raise
+        assessed = str(result.get("difficulty") or "")
+        accepted = assessed in ("困难", "地狱")
+        status = "passed" if accepted else "rejected"
+        reason = str(result.get("reason") or "").strip()[:800]
+        evidence = [str(value)[:300] for value in list(result.get("evidence") or [])[:10]]
+        stamp = now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """UPDATE difficulty_reviews SET a_difficulty=?,b_difficulty=?,assessed_difficulty=?,
+                   reason=?,evidence_json=?,status=?,error='',reviewed_at=?,updated_at=? WHERE pair_id=?""",
+                (str(result.get("aDifficulty") or ""), str(result.get("bDifficulty") or ""),
+                 assessed, reason, json.dumps(evidence, ensure_ascii=False), status, stamp, stamp, pair_id),
+            )
+            if accepted:
+                conn.execute(
+                    "UPDATE tasks SET difficulty=?,difficulty_evidence_json=?,updated_at=? WHERE id=?",
+                    (assessed, json.dumps(evidence, ensure_ascii=False), stamp, pair["task_id"]),
+                )
+                conn.execute(
+                    "UPDATE pairs SET status='running',stage='recording',error='',updated_at=? WHERE id=?",
+                    (stamp, pair_id),
+                )
+            else:
+                message = "实际难度复评为%s，低于困难/地狱准入线，已停止当前 Pair 并等待自动补位：%s" % (
+                    assessed or "未知", reason,
+                )
+                conn.execute(
+                    "UPDATE pairs SET status='failed',stage='difficulty_rejected',error=?,updated_at=? WHERE id=?",
+                    (message[-3000:], stamp, pair_id),
+                )
+                conn.execute(
+                    """INSERT INTO delivery_submissions(id,pair_id,status,error,created_at,updated_at)
+                       VALUES(?,?,'discarded',?,?,?) ON CONFLICT(pair_id) DO UPDATE SET
+                         status='discarded',error=excluded.error,updated_at=excluded.updated_at""",
+                    ("delivery-" + uuid.uuid4().hex[:16], pair_id, message[-2000:], stamp, stamp),
+                )
+        self.db.audit(
+            "difficulty.passed" if accepted else "difficulty.rejected",
+            "pair", pair_id,
+            {"original": original, "assessed": assessed, "a": result.get("aDifficulty"),
+             "b": result.get("bDifficulty"), "commits": commits},
+        )
+        return self.db.one("SELECT * FROM difficulty_reviews WHERE pair_id=?", (pair_id,)) or {}
 
     def _current_process_events(self, pair_id: str) -> List[Dict[str, Any]]:
         arms = self.db.all(
@@ -1842,6 +2013,9 @@ class PairwiseService:
         pair["repository"] = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,))
         pair["arms"] = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
         pair["checks"] = self._current_artifact_checks(pair_id)
+        pair["difficulty_review"] = self.db.one(
+            "SELECT * FROM difficulty_reviews WHERE pair_id=?", (pair_id,)
+        )
         pair["recordings"] = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair_id,))
         pair["recording_attempts"] = self.db.all(
             "SELECT * FROM recording_attempts WHERE pair_id=? ORDER BY created_at DESC", (pair_id,)
@@ -2418,12 +2592,17 @@ class PairwiseService:
                 passed_count += 1
         if len(current_arms) == 2 and all(arm["status"] == "completed" for arm in current_arms) and passed_count == 2:
             self.db.execute(
-                "UPDATE pairs SET status='running',stage='recording',error='',updated_at=? WHERE id=?",
+                "UPDATE pairs SET status='running',stage='difficulty_review',error='',updated_at=? WHERE id=?",
                 (now_iso(), pair_id),
             )
             self.db.audit("artifact.pair_passed", "pair", pair_id, {
-                "rule": "both_current_commits_passed",
+                "rule": "both_current_commits_passed_then_actual_difficulty_review",
             })
+            self._submit_auto(
+                "difficulty-" + pair_id,
+                self.reassess_actual_difficulty,
+                pair_id,
+            )
         else:
             all_completed = len(current_arms) == 2 and all(
                 arm["status"] == "completed" for arm in current_arms

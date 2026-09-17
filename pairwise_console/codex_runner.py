@@ -24,10 +24,28 @@ JOB_EFFORTS = {
     "task_validation": "medium",
     "baseline_review": "medium",
     "artifact_comparison": "medium",
+    "difficulty_reassessment": "medium",
     "gsb_review": "medium",
     "gsb_language_check": "medium",
     "gsb_recheck": "high",
     "next_step": "medium",
+}
+
+
+ACTUAL_DIFFICULTY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["aDifficulty", "bDifficulty", "difficulty", "reason", "evidence"],
+    "properties": {
+        "aDifficulty": {"type": "string", "enum": ["简单", "中等", "困难", "地狱"]},
+        "bDifficulty": {"type": "string", "enum": ["简单", "中等", "困难", "地狱"]},
+        "difficulty": {"type": "string", "enum": ["简单", "中等", "困难", "地狱"]},
+        "reason": {"type": "string", "minLength": 20, "maxLength": 800},
+        "evidence": {
+            "type": "array", "minItems": 2, "maxItems": 10,
+            "items": {"type": "string", "maxLength": 300},
+        },
+    },
 }
 
 

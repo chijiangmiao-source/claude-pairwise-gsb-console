@@ -122,12 +122,78 @@ class CoreTests(unittest.TestCase):
             "UPDATE arm_runs SET status='completed',commit_sha=? WHERE pair_id=? AND arm='B'",
             ("b" * 40, pair["id"]),
         )
-        with patch.object(self.service.artifacts, "validate", side_effect=passed_check):
+        with patch.object(self.service.artifacts, "validate", side_effect=passed_check), \
+             patch.object(self.service, "_submit_auto", return_value=True):
             self.service._validate_pair_artifacts(pair["id"], ["B"])
         self.assertEqual(
             self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))["stage"],
-            "recording",
+            "difficulty_review",
         )
+
+    def _prepare_pair_for_difficulty_review(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='difficulty_review' WHERE id=?",
+            (pair["id"],),
+        )
+        for arm in ("A", "B"):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,result,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?,?)""",
+                ("arm-difficulty-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image", sha,
+                 "implemented and verified", stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?,?)""",
+                ("check-difficulty-" + arm, pair["id"], arm, sha,
+                 '[{"name":"verify_service","passed":true,"detail":"business scenarios passed"}]',
+                 stamp, stamp),
+            )
+        return pair
+
+    def test_actual_difficulty_review_passes_and_moves_to_recording(self):
+        pair = self._prepare_pair_for_difficulty_review()
+        result = {
+            "aDifficulty": "困难", "bDifficulty": "地狱", "difficulty": "困难",
+            "reason": "两侧都实现了跨模块状态恢复、并发一致性和异常链路，真实验收覆盖了关键边界。",
+            "evidence": ["state.py 的事务恢复", "Docker verify_service 覆盖并发冲突"],
+        }
+        with patch.object(self.service.codex, "run", return_value=result):
+            review = self.service.reassess_actual_difficulty(pair["id"])
+        self.assertEqual(review["status"], "passed")
+        self.assertEqual(review["assessed_difficulty"], "困难")
+        self.assertEqual(
+            self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
+            {"status": "running", "stage": "recording"},
+        )
+        self.assertEqual(
+            self.db.one("SELECT difficulty FROM tasks WHERE id='task-1'")["difficulty"],
+            "困难",
+        )
+
+    def test_actual_difficulty_review_rejects_medium_and_discards_pair(self):
+        pair = self._prepare_pair_for_difficulty_review()
+        result = {
+            "aDifficulty": "中等", "bDifficulty": "中等", "difficulty": "中等",
+            "reason": "实际交付只沿现有结构增加局部数据流和输入校验，没有架构取舍或复杂状态链路。",
+            "evidence": ["只改动局部处理函数", "Docker 验收仅覆盖常规输入校验"],
+        }
+        with patch.object(self.service.codex, "run", return_value=result):
+            review = self.service.reassess_actual_difficulty(pair["id"])
+        self.assertEqual(review["status"], "rejected")
+        self.assertEqual(
+            self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
+            {"status": "failed", "stage": "difficulty_rejected"},
+        )
+        delivery = self.db.one("SELECT status,error FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(delivery["status"], "discarded")
+        self.assertIn("低于困难/地狱", delivery["error"])
 
     def test_full_monitor_capacity_does_not_starve_user_operations(self):
         release = threading.Event()

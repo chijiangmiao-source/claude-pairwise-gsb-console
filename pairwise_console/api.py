@@ -128,6 +128,10 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 operation = self.app.service.start_pair_async(match.group(1))
                 return self._json(202, {"operationId": operation})
+            match = re.fullmatch(r"/api/pairs/([^/]+)/difficulty/review", path)
+            if match:
+                operation = self.app.service.reassess_actual_difficulty_async(match.group(1))
+                return self._json(202, {"operationId": operation})
             match = re.fullmatch(r"/api/pairs/([^/]+)/gsb", path)
             if match:
                 operation = self.app.service.generate_gsb_async(match.group(1))
@@ -385,12 +389,15 @@ class Handler(BaseHTTPRequestHandler):
                 clauses.append(column + "=?")
                 params.append(value)
         where = " AND ".join(clauses) or "1=1"
-        from_sql = "FROM pairs p JOIN tasks t ON t.id=p.task_id"
+        from_sql = "FROM pairs p JOIN tasks t ON t.id=p.task_id LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id"
         count = self.app.db.one("SELECT COUNT(*) count " + from_sql + " WHERE " + where, params) or {"count": 0}
         rows = self.app.db.all(
-            """SELECT p.*,t.title,t.task_type,t.difficulty,t.project_category,g.verdict,g.reason,g.status gsb_status
+            """SELECT p.*,t.title,t.task_type,t.difficulty,t.project_category,g.verdict,g.reason,g.status gsb_status,
+               dr.original_difficulty,dr.a_difficulty,dr.b_difficulty,dr.assessed_difficulty,
+               dr.reason difficulty_reason,dr.status difficulty_review_status
                FROM pairs p JOIN tasks t ON t.id=p.task_id
                LEFT JOIN gsb_reviews g ON g.pair_id=p.id
+               LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id
                WHERE %s ORDER BY p.created_at DESC LIMIT ? OFFSET ?""" % where,
             tuple(params) + (size, (page - 1) * size),
         )
@@ -430,6 +437,8 @@ class Handler(BaseHTTPRequestHandler):
             clauses.append("(c.status IS NULL OR c.status<>'passed' OR r.status IS NULL OR r.status<>'passed' OR r.commit_match<>1)")
         select = """SELECT p.id pair_id,p.chain_id project_number,p.status pair_status,p.stage pair_stage,p.error pair_error,
           t.title,t.task_type,t.difficulty,t.project_category,a.arm,
+          dr.original_difficulty,dr.a_difficulty,dr.b_difficulty,dr.assessed_difficulty,
+          dr.reason difficulty_reason,dr.status difficulty_review_status,
           a.branch,a.commit_sha,c.id check_id,c.status artifact_status,c.checks_json,c.error artifact_error,
           c.started_at check_started_at,c.finished_at check_finished_at,r.id recording_id,r.status recording_status,
           r.path,r.sha256,r.width,r.height,r.duration_seconds,r.commit_sha recording_commit_sha,
@@ -440,7 +449,8 @@ class Handler(BaseHTTPRequestHandler):
           LEFT JOIN artifact_checks c ON c.pair_id=a.pair_id AND c.arm=a.arm AND c.commit_sha=a.commit_sha
           LEFT JOIN recordings r ON r.pair_id=a.pair_id AND r.arm=a.arm
           LEFT JOIN recording_attempts latest ON latest.id=(SELECT id FROM recording_attempts x
-            WHERE x.pair_id=a.pair_id AND x.arm=a.arm ORDER BY x.created_at DESC LIMIT 1)"""
+            WHERE x.pair_id=a.pair_id AND x.arm=a.arm ORDER BY x.created_at DESC LIMIT 1)
+          LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id"""
         return self._joined_page(select, from_sql, clauses, params, "p.updated_at DESC,p.id,a.arm", query)
 
     def _reviews_page(self, query: Dict[str, list]) -> Dict[str, Any]:
@@ -464,17 +474,22 @@ class Handler(BaseHTTPRequestHandler):
         select = """SELECT g.id,g.pair_id,g.verdict,g.reason,g.evidence_json,g.draft_verdict,g.draft_reason,
           g.final_verdict,g.final_reason,g.evidence_version,g.a_reason,g.b_reason,g.status,g.confirmed_by,
           g.confirmed_at,g.created_at,g.updated_at,p.chain_id project_number,p.status pair_status,p.stage,t.title,t.task_type,t.difficulty,t.project_category,
+          dr.original_difficulty,dr.a_difficulty,dr.b_difficulty,dr.assessed_difficulty,
+          dr.reason difficulty_reason,dr.status difficulty_review_status,
           r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,
           r.suggested_a_reason,r.suggested_b_reason,r.issues_json,
           r.evidence_refs_json,r.model recheck_model,r.reasoning_effort recheck_effort,r.evidence_version recheck_evidence_version,
           r.applied_at recheck_applied_at,r.applied_by recheck_applied_by,r.created_at rechecked_at"""
         from_sql = """FROM gsb_reviews g JOIN pairs p ON p.id=g.pair_id JOIN tasks t ON t.id=p.task_id
+          LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id
           LEFT JOIN gsb_rechecks r ON r.id=(SELECT id FROM gsb_rechecks x WHERE x.pair_id=g.pair_id ORDER BY x.created_at DESC LIMIT 1)"""
         return self._joined_page(select, from_sql, clauses, params, "g.updated_at DESC,g.pair_id", query)
 
     def _delivery_select(self) -> Tuple[str, str]:
         select = """SELECT p.id pair_id,p.chain_id project_number,p.status pair_status,p.stage,p.completed_at,
           t.title,t.task_type,t.difficulty,t.project_category,t.source,t.prompt,repo.remote_url,repo.main_sha,
+          dr.original_difficulty,dr.a_difficulty,dr.b_difficulty,dr.assessed_difficulty,
+          dr.reason difficulty_reason,dr.status difficulty_review_status,
           aa.session_id a_session_id,aa.prompt_id a_prompt_id,aa.commit_sha a_commit,
           bb.session_id b_session_id,bb.prompt_id b_prompt_id,bb.commit_sha b_commit,
           ca.status a_check_status,cb.status b_check_status,ra.id a_recording_id,ra.status a_recording_status,
@@ -496,6 +511,7 @@ class Handler(BaseHTTPRequestHandler):
           LEFT JOIN recordings ra ON ra.pair_id=p.id AND ra.arm='A'
           LEFT JOIN recordings rb ON rb.pair_id=p.id AND rb.arm='B'
           LEFT JOIN gsb_reviews g ON g.pair_id=p.id
+          LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id
           LEFT JOIN gsb_rechecks r ON r.id=(SELECT id FROM gsb_rechecks x WHERE x.pair_id=p.id ORDER BY x.created_at DESC LIMIT 1)
           LEFT JOIN delivery_submissions d ON d.pair_id=p.id"""
         return select, from_sql
@@ -529,6 +545,8 @@ class Handler(BaseHTTPRequestHandler):
             issues.append("GSB 尚未确认" if gsb_status else "缺少 GSB")
         if row.get("recheck_status") == "fact_conflict":
             issues.append("复检发现公开理由存在事实冲突")
+        if row.get("difficulty_review_status") and row.get("difficulty_review_status") != "passed":
+            issues.append("实际难度复评未通过")
         row["readiness_issues"] = issues
         row["readiness"] = "blocked" if issues else "ready"
         return row
@@ -555,6 +573,7 @@ class Handler(BaseHTTPRequestHandler):
           ca.status='passed' AND cb.status='passed' AND ra.status='passed' AND rb.status='passed' AND
           COALESCE(ra.commit_match,0)=1 AND COALESCE(rb.commit_match,0)=1 AND
           ra.review_status='confirmed' AND rb.review_status='confirmed' AND g.status='confirmed' AND
+          (dr.id IS NULL OR dr.status='passed') AND
           COALESCE(r.result_status,'')<>'fact_conflict'
         )"""
         readiness = self._query(query, "readiness")

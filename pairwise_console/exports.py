@@ -6,7 +6,8 @@ from xml.sax.saxutils import escape
 
 
 DELIVERY_COLUMNS = (
-    "项目编号", "Pair ID", "题目", "任务类型", "系统类型", "难度", "题面", "main SHA",
+    "项目编号", "Pair ID", "题目", "任务类型", "系统类型", "出题难度", "实际复评难度",
+    "难度复评依据", "题面", "main SHA",
     "A SessionID", "A PromptID", "A 提交", "A 提交永久链接", "A Docker 验收",
     "A 录像状态", "A 录像 SHA256", "B SessionID", "B PromptID", "B 提交",
     "B 提交永久链接", "B Docker 验收", "B 录像状态", "B 录像 SHA256",
@@ -20,7 +21,9 @@ def delivery_row(item: Dict[str, Any]) -> List[Any]:
     link = lambda arm: "%s/commit/%s" % (remote, item.get(arm + "_commit")) if remote and item.get(arm + "_commit") else ""
     return [
         item.get("project_number"), item.get("pair_id"), item.get("title"), item.get("task_type"),
-        item.get("project_category"), item.get("difficulty"), item.get("prompt"), item.get("main_sha"), item.get("a_session_id"),
+        item.get("project_category"), item.get("original_difficulty") or item.get("difficulty"),
+        item.get("assessed_difficulty") or item.get("difficulty"), item.get("difficulty_reason") or "",
+        item.get("prompt"), item.get("main_sha"), item.get("a_session_id"),
         item.get("a_prompt_id"), item.get("a_commit"), link("a"), item.get("a_check_status"),
         item.get("a_recording_status"), item.get("a_recording_sha"), item.get("b_session_id"),
         item.get("b_prompt_id"), item.get("b_commit"), link("b"), item.get("b_check_status"),

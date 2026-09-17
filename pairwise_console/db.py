@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def now_iso() -> str:
@@ -207,7 +207,7 @@ class Database:
         allowed = {
             "tasks", "project_chains", "pairs", "codex_jobs", "bug_candidates",
             "artifact_checks", "recordings", "gsb_reviews", "gsb_rechecks",
-            "delivery_submissions", "audit_events", "git_repositories",
+            "difficulty_reviews", "delivery_submissions", "audit_events", "git_repositories",
         }
         if table not in allowed:
             raise ValueError("unknown table")
@@ -448,6 +448,24 @@ CREATE TABLE IF NOT EXISTS recording_attempts (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_recording_attempts_pair_arm ON recording_attempts(pair_id,arm,created_at DESC);
+CREATE TABLE IF NOT EXISTS difficulty_reviews (
+  id TEXT PRIMARY KEY,
+  pair_id TEXT NOT NULL UNIQUE REFERENCES pairs(id),
+  original_difficulty TEXT NOT NULL,
+  a_difficulty TEXT NOT NULL DEFAULT '',
+  b_difficulty TEXT NOT NULL DEFAULT '',
+  assessed_difficulty TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  a_commit_sha TEXT NOT NULL DEFAULT '',
+  b_commit_sha TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT NOT NULL DEFAULT '',
+  reviewed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_difficulty_reviews_status ON difficulty_reviews(status,updated_at);
 CREATE TABLE IF NOT EXISTS gsb_reviews (
   id TEXT PRIMARY KEY,
   pair_id TEXT NOT NULL UNIQUE REFERENCES pairs(id),
