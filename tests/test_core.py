@@ -472,6 +472,57 @@ class CoreTests(unittest.TestCase):
         self.assertIn("B 评价缺少可核对的触发节点", result["issues_json"])
         self.assertEqual(mocked_run.call_count, 2)
 
+    def test_gsb_recheck_rewrites_mechanical_case_lists_even_when_model_first_passes(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        mechanical_a = (
+            "A 在 rehearsal.spec.ts 第15、16、21、22项覆盖边界，"
+            "83个单测、23个端到端测试和38秒录像通过，未见已发生的功能缺陷。"
+        )
+        mechanical_b = (
+            "B 在 rehearsal.spec.ts 第15、17、19、21至24项覆盖边界，"
+            "82个单测、25个端到端测试和38秒录像通过。"
+        )
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,a_reason,b_reason,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'confirmed',?,?)""",
+            ("gsb-mechanical", pair["id"], "Same",
+             self.service._compose_gsb_reason(mechanical_a, mechanical_b),
+             mechanical_a, mechanical_b, stamp, stamp),
+        )
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?)""",
+                ("arm-mechanical-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", stamp, stamp),
+            )
+        first = {
+            "status": "passed", "suggestedVerdict": "Same",
+            "suggestedAReason": mechanical_a, "suggestedBReason": mechanical_b,
+            "issues": [], "evidenceRefs": ["arms[A]", "arms[B]"],
+        }
+        revised_a = (
+            "A 在 rehearsal.spec.ts 实际跑过边界两侧、写回和失效处理，"
+            "这些流程都通过，功能链路完整。"
+        )
+        revised_b = (
+            "B 在 rehearsal.spec.ts 也验证了平行边、非法输入和写回后重新考证，"
+            "现有结果与 A 没有明显差距。"
+        )
+        second = {
+            "status": "passed", "suggestedVerdict": "Same",
+            "suggestedAReason": revised_a, "suggestedBReason": revised_b,
+            "issues": [], "evidenceRefs": ["arms[A]", "arms[B]"],
+        }
+        with patch.object(self.service.codex, "run", side_effect=[first, second]) as mocked_run:
+            result = self.service._recheck_gsb(pair["id"])
+        self.assertEqual(mocked_run.call_count, 2)
+        self.assertEqual(result["result_status"], "suggested_revision")
+        self.assertEqual(result["suggested_a_reason"], revised_a)
+        self.assertIn("机械罗列测试编号", result["issues_json"])
+
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
         self.assertTrue({"commit_sha", "commit_match", "steps_json", "direct_url", "attempt_id", "capture_mode", "entry_url",
@@ -953,6 +1004,17 @@ class CoreTests(unittest.TestCase):
         self.assertIn("不要因为理由较长或证据较多就要求精简", prompt)
         self.assertIn("必须保留原评价中所有会影响结论的有效证据", prompt)
         self.assertIn("不得仅因篇幅、数字数量或代码细节较多判为需要修改", prompt)
+
+    def test_gsb_style_check_targets_mechanical_numbers_without_rejecting_real_evidence(self):
+        issues = self.service._gsb_conversational_issues(
+            "rehearsal.spec.ts 第15、16、21、22项通过，83个单测、23个端到端测试和38秒录像也通过，未见已发生的功能缺陷。",
+            "B 在第43步运行接口测试，先因测试库冲突失败，换成独立数据库后通过。",
+        )
+        self.assertTrue(any("机械罗列测试编号" in issue for issue in issues))
+        self.assertTrue(any("堆叠测试数量" in issue for issue in issues))
+        self.assertTrue(any("录像时长" in issue for issue in issues))
+        self.assertTrue(any("生硬的无缺陷套话" in issue for issue in issues))
+        self.assertFalse(any(issue.startswith("B ") for issue in issues))
 
     def test_completed_pair_with_current_failed_artifact_is_quarantined(self):
         self.insert_ready_task()

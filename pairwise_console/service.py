@@ -1118,6 +1118,31 @@ class PairwiseService:
             issues.append("B 评价缺少可核对的触发节点（步骤、文件/函数、命令或报错）")
         return issues
 
+    @staticmethod
+    def _gsb_conversational_issues(a_reason: str, b_reason: str) -> List[str]:
+        """Flag narrow, mechanical patterns without penalizing useful detail."""
+        issues: List[str] = []
+        numbered_cases = re.compile(
+            r"第\s*\d+\s*(?:[、，,]\s*\d+){2,}(?:\s*(?:至|到|-)\s*\d+)?\s*(?:项|条|步|次)?"
+        )
+        test_count_pile = re.compile(
+            r"\d+\s*个(?:单元测试|单测|端到端测试|e2e)[^。；]{0,80}"
+            r"\d+\s*个(?:单元测试|单测|端到端测试|e2e)",
+            flags=re.IGNORECASE,
+        )
+        recording_seconds = re.compile(r"\d+(?:\.\d+)?\s*秒(?:钟)?(?:的)?录像")
+        for label, value in (("A", a_reason), ("B", b_reason)):
+            text = str(value or "")
+            if numbered_cases.search(text):
+                issues.append(label + " 评价机械罗列测试编号，应改写为实际验证的业务场景")
+            if test_count_pile.search(text):
+                issues.append(label + " 评价堆叠测试数量，应说明这些测试验证了什么")
+            if recording_seconds.search(text):
+                issues.append(label + " 评价使用录像时长支撑功能判断，录像时长只能说明文件合规")
+            if "未见已发生的功能缺陷" in text:
+                issues.append(label + " 评价使用生硬的无缺陷套话，应改成有证据支撑的自然判断")
+        return issues
+
     def generate_gsb(self, pair_id: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)
         self.refresh_recording_stage(pair_id)
@@ -1155,11 +1180,12 @@ class PairwiseService:
         a_reason = self._clean_gsb_part(result["aReason"], 300)
         b_reason = self._clean_gsb_part(result["bReason"], 300)
         locator_issues = self._gsb_locator_issues(a_reason, b_reason)
-        if locator_issues:
+        style_issues = self._gsb_conversational_issues(a_reason, b_reason)
+        if locator_issues or style_issues:
             correction = (
-                review_prompt + "\n\n上一次输出未通过具体定位校验：" + "；".join(locator_issues)
+                review_prompt + "\n\n上一次输出需要修正：" + "；".join(locator_issues + style_issues)
                 + "\n上一次 A 理由：" + a_reason + "\n上一次 B 理由：" + b_reason
-                + "\n请只依据上面的真实证据重新生成；每段补充至少一个步骤、文件/函数、命令或报错定位。"
+                + "\n请只依据上面的真实证据重新生成。保留能支撑结论的证据，把机械编号和数字改写成业务场景；每段仍要有真实步骤、文件/函数、命令或报错定位。"
             )
             result = self.codex.run(
                 "gsb_review", correction, GSB_SCHEMA,
@@ -1302,12 +1328,15 @@ class PairwiseService:
         )
         suggested_a = self._clean_gsb_part(result["suggestedAReason"], 300)
         suggested_b = self._clean_gsb_part(result["suggestedBReason"], 300)
+        source_style_issues = self._gsb_conversational_issues(a_reason, b_reason)
         locator_issues = self._gsb_locator_issues(suggested_a, suggested_b)
-        if locator_issues:
+        suggestion_style_issues = self._gsb_conversational_issues(suggested_a, suggested_b)
+        if locator_issues or source_style_issues or suggestion_style_issues:
             correction = (
-                recheck_prompt + "\n\n上一次建议文本未通过具体定位校验：" + "；".join(locator_issues)
+                recheck_prompt + "\n\n当前原评价或上一次建议需要修正："
+                + "；".join(source_style_issues + locator_issues + suggestion_style_issues)
                 + "\n上一次建议 A 理由：" + suggested_a + "\n上一次建议 B 理由：" + suggested_b
-                + "\n请重新复检，并确保 suggestedAReason 与 suggestedBReason 各自包含真实可核对的位置。"
+                + "\n请重新复检。保留所有影响结论的证据，把机械编号和无意义数字改写成业务场景，并确保两段各自包含真实可核对的位置。"
             )
             result = self.codex.run(
                 "gsb_recheck", correction, GSB_RECHECK_SCHEMA,
@@ -1317,11 +1346,14 @@ class PairwiseService:
             suggested_a = self._clean_gsb_part(result["suggestedAReason"], 300)
             suggested_b = self._clean_gsb_part(result["suggestedBReason"], 300)
             locator_issues = self._gsb_locator_issues(suggested_a, suggested_b)
+            suggestion_style_issues = self._gsb_conversational_issues(suggested_a, suggested_b)
         result_status = str(result["status"])
         result_issues = [str(item) for item in result.get("issues", [])]
-        if locator_issues:
+        if result_status != "fact_conflict" and (source_style_issues or locator_issues or suggestion_style_issues):
             result_status = "suggested_revision"
-            result_issues.extend(issue for issue in locator_issues if issue not in result_issues)
+        for issue in source_style_issues + locator_issues + suggestion_style_issues:
+            if issue not in result_issues:
+                result_issues.append(issue)
         suggested_reason = self._compose_gsb_reason(suggested_a, suggested_b)
         latest_job = self.db.one(
             "SELECT id FROM codex_jobs WHERE pair_id=? AND job_type='gsb_recheck' ORDER BY created_at DESC LIMIT 1",
