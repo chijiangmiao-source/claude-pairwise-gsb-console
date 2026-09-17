@@ -54,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows = self.app.db.all("SELECT key,value_json,updated_at FROM settings ORDER BY key")
                 return self._json(200, {row["key"]: json.loads(row["value_json"]) for row in rows})
             if path == "/api/tasks":
-                return self._json(200, self._page("tasks", query, self._filter(query, ("status", "task_type", "difficulty"))))
+                return self._json(200, self._tasks_page(query))
             if path == "/api/pairs":
                 return self._json(200, self._pairs_page(query))
             match = re.fullmatch(r"/api/pairs/([^/]+)", path)
@@ -346,16 +346,41 @@ class Handler(BaseHTTPRequestHandler):
                 params.append(value)
         return " AND ".join(clauses) or "1=1", tuple(params)
 
+    def _tasks_page(self, query: Dict[str, list]) -> Dict[str, Any]:
+        clauses, params = [], []
+        q = self._query(query, "q")
+        if q:
+            clauses.append("(t.id LIKE ? OR t.title LIKE ? OR t.prompt LIKE ?)")
+            params += ["%" + q + "%"] * 3
+        for key in ("status", "task_type", "difficulty", "project_category"):
+            value = self._query(query, key)
+            if value:
+                clauses.append("t.%s=?" % key)
+                params.append(value)
+        usage = self._query(query, "usage")
+        if usage == "used":
+            clauses.append("t.status='used'")
+        elif usage == "unused":
+            clauses.append("t.status<>'used'")
+        return self._joined_page("SELECT t.*", "FROM tasks t", clauses, params, "t.created_at DESC,t.id", query)
+
     def _pairs_page(self, query: Dict[str, list]) -> Dict[str, Any]:
         page = max(1, int((query.get("page") or ["1"])[0]))
         size = min(100, max(1, int((query.get("size") or ["20"])[0])))
         clauses, params = [], []
-        status = (query.get("status") or [""])[0].strip()
-        if status:
-            clauses.append("p.status=?")
-            params.append(status)
+        q = self._query(query, "q")
+        if q:
+            clauses.append("(p.id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ?)")
+            params += ["%" + q + "%"] * 3
+        for key, column in (("status", "p.status"), ("stage", "p.stage"), ("task_type", "t.task_type"),
+                            ("difficulty", "t.difficulty"), ("project_category", "t.project_category")):
+            value = self._query(query, key)
+            if value:
+                clauses.append(column + "=?")
+                params.append(value)
         where = " AND ".join(clauses) or "1=1"
-        count = self.app.db.one("SELECT COUNT(*) count FROM pairs p WHERE " + where, params) or {"count": 0}
+        from_sql = "FROM pairs p JOIN tasks t ON t.id=p.task_id"
+        count = self.app.db.one("SELECT COUNT(*) count " + from_sql + " WHERE " + where, params) or {"count": 0}
         rows = self.app.db.all(
             """SELECT p.*,t.title,t.task_type,t.difficulty,t.project_category,g.verdict,g.reason,g.status gsb_status
                FROM pairs p JOIN tasks t ON t.id=p.task_id

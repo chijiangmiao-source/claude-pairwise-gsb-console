@@ -4,7 +4,7 @@ const state = {
   page: "dashboard",
   pages: { tasks: 1, pairs: 1, reviews: 1, codex: 1, bugs: 1, evidence: 1, exports: 1 },
   sizes: { tasks: 20, pairs: 20, reviews: 20, codex: 20, bugs: 20, evidence: 20, exports: 20 },
-  filters: { reviews: {}, evidence: {}, exports: {} },
+  filters: { tasks: {}, pairs: {}, reviews: {}, evidence: {}, exports: {} },
   reviewSelection: new Set(), reviewItems: [],
   exportSelection: new Set(), exportItems: [], preflight: null,
   helperReady: false, helperVersion: "", helperRequests: new Map(),
@@ -99,15 +99,18 @@ const pages = {
       <div class="grid dashboard-three" style="margin-top:16px"><div class="card"><h2>Pair 状态</h2><p class="sub">按 Pair 统计，不拆分 A/B</p>${distribution(data.pairStatus)}</div><div class="card"><h2>系统类型统计</h2><p class="sub">纯后端、纯前端与全栈按 Pair 计数</p>${distribution(data.projectCategories)}</div><div class="card"><h2>任务类型统计</h2><p class="sub">0–1、Feature 迭代与 Bug 修复按 Pair 计数</p>${distribution(data.taskTypes)}</div></div>`;
   },
   tasks: async () => {
+    const filters = state.filters.tasks;
     const [data, automation] = await Promise.all([
-      api(`/api/tasks?page=${state.pages.tasks}&size=${state.sizes.tasks}`), api("/api/automation"),
+      api(`/api/tasks?${queryString("tasks")}`), api("/api/automation"),
     ]);
     const automationAction = automation.enabled
       ? `<span class="badge running">自动运行中</span><button class="danger" onclick="toggleAutomation(false)">停止自动运行</button>`
       : `<button class="primary" onclick="toggleAutomation(true)">一键自动运行完整流程</button>`;
     const stageText = (automation.stages || []).map((item) => `${statusLabels[item.stage] || item.stage} ${item.count}`).join(" · ") || "等待启动";
     $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>题目池</h2><p class="sub">困难与地狱题目进入 A/B</p></div><div class="toolbar-group"><button class="secondary" onclick="importTasks()">导入历史困难题</button>${automationAction}</div></div>
-      <div class="automation-strip ${automation.enabled ? "enabled" : ""}"><div><strong>${automation.enabled ? "完整流程持续运行" : "完整流程尚未启动"}</strong><small>${automation.enabled ? "现有合格题优先；空位自动补 Pair，题目不足自动出题" : "点击后自动完成仓库准备、A/B 开发、Docker 验收、录像和 GSB"}</small></div><div class="automation-metrics"><span>活动 Pair <b>${automation.activePairs}/${automation.targetPairs}</b></span><span>可用题目 <b>${automation.readyTasks}</b></span><span>${esc(stageText)}</span></div></div>${table(data.items, [
+      <div class="automation-strip ${automation.enabled ? "enabled" : ""}"><div><strong>${automation.enabled ? "完整流程持续运行" : "完整流程尚未启动"}</strong><small>${automation.enabled ? "现有合格题优先；空位自动补 Pair，题目不足自动出题" : "点击后自动完成仓库准备、A/B 开发、Docker 验收、录像和 GSB"}</small></div><div class="automation-metrics"><span>活动 Pair <b>${automation.activePairs}/${automation.targetPairs}</b></span><span>可用题目 <b>${automation.readyTasks}</b></span><span>${esc(stageText)}</span></div></div>
+      ${filterBar("tasks", [["usage", "select", "全部使用状态", filters.usage, [["used", "已使用"], ["unused", "未使用"]]]])}
+      ${table(data.items, [
       ["题目", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong><small>${esc(row.prompt)}</small></div>`],
       ["任务 / 系统类型", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)}</div>`], ["难度", (row) => `<span class="difficulty">${esc(row.difficulty)}</span>`],
       ["来源", (row) => esc(row.source)], ["状态", (row) => badge(row.status)],
@@ -115,8 +118,10 @@ const pages = {
     ])}${pager("tasks", data)}</div>`;
   },
   pairs: async () => {
-    const data = await api(`/api/pairs?page=${state.pages.pairs}&size=${state.sizes.pairs}`);
-    $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>A/B 项目</h2><p class="sub">同一 main 基线，大写 A/B 分支，两个独立 Claude 容器</p></div></div>${table(data.items, [
+    const filters = state.filters.pairs, data = await api(`/api/pairs?${queryString("pairs")}`);
+    $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>A/B 项目</h2><p class="sub">同一 main 基线，大写 A/B 分支，两个独立 Claude 容器</p></div></div>
+      ${filterBar("pairs", [["q", "search", "项目编号、Pair 或题目", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["difficulty", "select", "全部难度", filters.difficulty, ["困难", "地狱"]], ["stage", "select", "全部项目阶段", filters.stage, [["repository", "仓库准备"], ["ready_to_start", "等待启动"], ["development", "A/B 开发"], ["artifact_validation", "Docker 验收"], ["recording", "正在录制"], ["gsb_ready", "等待 GSB"], ["gsb_confirmation", "GSB 确认"], ["completed", "已完成"], ["artifact_failed", "Docker 验收失败"], ["development_failed", "开发失败"], ["recording_failed", "录像失败"], ["task_replacement", "正在自动换题"], ["replacement_failed", "自动换题失败"]]], ["status", "select", "全部项目状态", filters.status, [["queued", "排队中"], ["running", "运行中"], ["review", "待复核"], ["completed", "已完成"], ["failed", "失败"]]]])}
+      ${table(data.items, [
       ["项目", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong><small>${esc(row.id)}</small></div>`],
       ["类型 / 难度", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} <span class="difficulty">${esc(row.difficulty)}</span></div>`],
       ["阶段", (row) => badge(row.stage)], ["状态", (row) => badge(row.status)], ["GSB", (row) => row.verdict ? badge(row.verdict) : "—"],
@@ -159,7 +164,7 @@ const pages = {
 async function renderEvidence() {
   const filters = state.filters.evidence, data = await api(`/api/evidence?${queryString("evidence")}`);
   $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>Docker 产物验收与真实操作录像</h2><p class="sub">每行对应一个 Pair 的一个 Arm，可直接播放最终提交的真实演示</p></div></div>
-    ${filterBar("evidence", [["q", "search", "项目编号、Pair、题目或提交", filters.q], ["arm", "select", "全部 Arm", filters.arm, ["A", "B"]], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["artifact_status", "select", "全部验收状态", filters.artifact_status, ["queued", "running", "passed", "failed"]], ["recording_status", "select", "全部录像状态", filters.recording_status, ["queued", "recording", "passed", "failed"]], ["missing", "select", "全部资料", filters.missing, [["1", "只看缺失或失败"]]]])}
+    ${filterBar("evidence", [["q", "search", "项目编号、Pair、题目或提交", filters.q], ["arm", "select", "全部 Arm", filters.arm, ["A", "B"]], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["artifact_status", "select", "全部验收状态", filters.artifact_status, [["queued", "排队中"], ["running", "验收中"], ["passed", "验收通过"], ["failed", "验收失败"]]], ["recording_status", "select", "全部录像状态", filters.recording_status, [["queued", "排队中"], ["recording", "录制中"], ["passed", "录像通过"], ["failed", "录像失败"]]], ["missing", "select", "全部资料", filters.missing, [["1", "只看缺失或失败"]]]])}
     ${table(data.items, [["项目 / Arm", (row) => `<div class="title-cell"><strong>${esc(row.title)} · ${row.arm}</strong><small>${esc(row.project_number)} · ${esc(row.pair_id)}</small></div>`], ["类型 / 难度", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} <span class="difficulty">${esc(row.difficulty)}</span></div>`], ["最终提交", (row) => `<span class="code">${esc((row.commit_sha || "").slice(0, 12))}</span>`], ["Docker 验收", (row) => badge(row.artifact_status || "missing")], ["真实操作录像", (row) => `${badge(row.latest_attempt_status === "starting" ? "starting" : row.latest_attempt_status === "recording" ? "recording" : row.recording_status || "missing")}<small class="block">${[recordingFormat(row), row.latest_interaction_mode === "manual" ? "人工操作" : row.latest_attempt_id ? "自动操作" : "", row.capture_mode === "browser" ? "浏览器视口" : row.recording_id ? "历史屏幕录像" : ""].filter(Boolean).join(" · ")} ${row.width || 0}×${row.height || 0} · ${row.duration_seconds || 0}s</small><small class="block">${row.review_status === "confirmed" ? `默认审核通过 · ${esc(row.reviewed_by || "刘昱")}` : "待审核"}</small>`], ["提交匹配", (row) => row.commit_match ? '<span class="ok">● 匹配</span>' : '<span class="bad">● 未匹配</span>'], ["操作", evidenceActions]])}${pager("evidence", data)}</div>`;
 }
 
