@@ -7,6 +7,7 @@ const state = {
   filters: { tasks: {}, pairs: {}, reviews: {}, evidence: {}, exports: {} },
   reviewSelection: new Set(), reviewItems: [],
   exportSelection: new Set(), exportItems: [], preflight: null,
+  recheckRunning: new Set(),
   helperReady: false, helperVersion: "", helperRequests: new Map(),
 };
 const titles = {
@@ -32,7 +33,7 @@ const statusLabels = {
   waiting_retry: "等待重试", checkpointing: "正在收尾", active: "进行中",
   used: "已使用", candidate: "待复核", converted: "已转任务", recording: "正在录制",
   reproducing: "正在复现", reproduction_failed: "复现失败", exported: "已导出", cancelled: "已取消",
-  applied: "已应用",
+  applied: "已应用", rechecking: "复检中",
 };
 const badge = (value) => `<span class="badge ${esc(value)}">${esc(statusLabels[value] || value || "—")}</span>`;
 const taskTypeLabels = { zero_to_one: "0–1", feature: "Feature 迭代", bugfix: "Bug 修复" };
@@ -40,9 +41,10 @@ const categoryTone = (value) => value === "纯前端" ? "frontend" : value === "
 const projectCategoryBadge = (value) => `<span class="category-badge ${categoryTone(value)}">${esc(value || "未记录")}</span>`;
 const taskTypeBadge = (value) => `<span class="task-type-badge ${esc(value || "unknown")}">${esc(taskTypeLabels[value] || value || "未记录")}</span>`;
 const date = (value) => value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "—";
+const recheckBadge = (row) => state.recheckRunning.has(row.pair_id) ? badge("rechecking") : row.recheck_applied_at ? badge("applied") : row.recheck_status ? badge(row.recheck_status) : badge("未复检");
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  const response = await fetch(path, { cache: "no-store", headers: { "Content-Type": "application/json" }, ...options });
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
@@ -204,7 +206,7 @@ async function renderReviews() {
   const rows = data.items.map((row) => `<article class="review-list-row">
     <label class="review-select"><input type="checkbox" aria-label="选择 ${esc(row.pair_id)}" ${state.reviewSelection.has(row.pair_id) ? "checked" : ""} onchange="toggleReview('${row.pair_id}',this.checked)"></label>
     <div class="review-summary"><strong>${esc(row.title)}</strong><small>${esc(row.project_number)} · ${esc(row.pair_id)}</small><div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} <span class="difficulty">${esc(row.difficulty)}</span></div><small>${date(row.confirmed_at || row.updated_at)}</small></div>
-    <div class="review-result"><span>${badge(row.verdict)}</span><span>${row.recheck_applied_at ? badge("applied") : row.recheck_status ? badge(row.recheck_status) : badge("未复检")}</span></div>
+    <div class="review-result"><span>${badge(row.verdict)}</span><span>${recheckBadge(row)}</span></div>
     <div class="review-reason"><span class="mobile-label">公开理由</span><p><b>A：</b>${esc(row.a_reason || "未填写")}</p><p><b>B：</b>${esc(row.b_reason || "未填写")}</p></div>
     <div class="review-confirm"><div>${badge(row.status)}<small>${esc(row.confirmed_by || "未确认")}</small></div><div class="review-row-actions"><button class="tiny" onclick="reviewGsb('${row.pair_id}')">查看/编辑</button><button class="tiny primary" onclick="recheckGsb('${row.pair_id}')">复检</button></div></div>
   </article>`).join("");
@@ -225,7 +227,7 @@ async function renderExports() {
   $("#content").innerHTML = `<div class="card"><div class="toolbar export-heading"><div><h2>完成 Pair 导出与正式提交</h2><p class="sub">本期 Pair-wise 表单：一道题、双轨迹、双产物、双录像和一份 GSB 对比理由</p><div class="helper-status">${helperStatus}</div></div><div class="toolbar-group"><b>已选 ${state.exportSelection.size} 项</b><button class="secondary" onclick="preflightSelected()" ${state.exportSelection.size ? "" : "disabled"}>提交前检查</button><button class="secondary" onclick="selectReady()">只选可提交项</button><button class="secondary" onclick="exportSelected()" ${state.exportSelection.size ? "" : "disabled"}>导出 Excel</button><button class="primary" onclick="submitSelected()" ${state.exportSelection.size && state.helperReady ? "" : "disabled"}>提交到 SOLO-QA</button><button class="danger" onclick="hideSelected()" ${state.exportSelection.size ? "" : "disabled"}>从列表隐藏</button></div></div>
     ${filterBar("exports", [["q", "search", "项目编号、Pair、题目或题面", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["difficulty", "select", "全部难度", filters.difficulty, ["困难", "地狱"]], ["readiness", "select", "全部资料状态", filters.readiness, [["ready", "可提交"], ["blocked", "待补资料"]]], ["submission_status", "select", "全部提交状态", filters.submission_status, [["ready_to_submit", "待提交"], ["submitting", "提交中"], ["qc_pending", "质检中"], ["qc_passed", "质检通过"], ["needs_fix", "待返修"], ["discarded", "已废弃"], ["failed", "提交失败"], ["needs_review", "待重新确认"]]], ["date_from", "date", "完成日期从", filters.date_from], ["date_to", "date", "完成日期到", filters.date_to], ["include_hidden", "select", "未隐藏记录", filters.include_hidden, [["1", "包含已隐藏"]]]])}
     <div class="selection-row"><label><input type="checkbox" onchange="toggleExportPage(this.checked)"> 选择本页</label><button class="tiny" onclick="recheckSelected()" ${state.exportSelection.size ? "" : "disabled"}>复检所选</button><button class="tiny" onclick="repairSelected()" ${state.exportSelection.size ? "" : "disabled"}>应用复检建议</button><button class="tiny" onclick="repairRemoteSelected()" ${state.exportSelection.size && state.helperReady ? "" : "disabled"}>返修到 SOLO-QA</button><button class="tiny" onclick="restoreSelected()" ${state.exportSelection.size ? "" : "disabled"}>恢复所选</button><button class="tiny" onclick="syncSoloQa()" ${state.helperReady ? "" : "disabled"}>同步质检状态</button></div>
-    ${table(data.items, [["", (row) => `<input type="checkbox" aria-label="选择 ${esc(row.pair_id)}" ${state.exportSelection.has(row.pair_id) ? "checked" : ""} onchange="toggleExport('${row.pair_id}',this.checked)">`], ["项目 / Pair", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong><small>${esc(row.project_number)} · ${esc(row.pair_id)}</small></div>`], ["类型 / 难度", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} <span class="difficulty">${esc(row.difficulty)}</span></div>`], ["A/B 资料", (row) => `<small class="block">A：${esc(row.a_session_id ? "Session ✓" : "缺 Session")} · ${esc(statusLabels[row.a_check_status] || row.a_check_status || "无验收")} · ${esc(statusLabels[row.a_recording_status] || row.a_recording_status || "无录像")}</small><small class="block">B：${esc(row.b_session_id ? "Session ✓" : "缺 Session")} · ${esc(statusLabels[row.b_check_status] || row.b_check_status || "无验收")} · ${esc(statusLabels[row.b_recording_status] || row.b_recording_status || "无录像")}</small>`], ["GSB / 复检", (row) => `${badge(row.verdict || "无结论")} ${badge(row.recheck_status || "未复检")}`], ["资料明细", (row) => readinessDetail(row)], ["提交", (row) => `${badge(row.submission_status || "not_submitted")}${row.submission_error ? `<small class="block bad">${esc(row.submission_error)}</small>` : ""}`], ["完成时间", (row) => date(row.completed_at)], ["操作", (row) => `<button class="tiny" onclick="showDelivery('${row.pair_id}')">展开</button>${row.a_recording_id ? ` <button class="tiny" onclick="playRecording('${row.a_recording_id}','A','${esc(row.title)}')">播放 A</button>` : ""}${row.b_recording_id ? ` <button class="tiny" onclick="playRecording('${row.b_recording_id}','B','${esc(row.title)}')">播放 B</button>` : ""}`]])}${pager("exports", data)}</div>`;
+    ${table(data.items, [["", (row) => `<input type="checkbox" aria-label="选择 ${esc(row.pair_id)}" ${state.exportSelection.has(row.pair_id) ? "checked" : ""} onchange="toggleExport('${row.pair_id}',this.checked)">`], ["项目 / Pair", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong><small>${esc(row.project_number)} · ${esc(row.pair_id)}</small></div>`], ["类型 / 难度", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} <span class="difficulty">${esc(row.difficulty)}</span></div>`], ["A/B 资料", (row) => `<small class="block">A：${esc(row.a_session_id ? "Session ✓" : "缺 Session")} · ${esc(statusLabels[row.a_check_status] || row.a_check_status || "无验收")} · ${esc(statusLabels[row.a_recording_status] || row.a_recording_status || "无录像")}</small><small class="block">B：${esc(row.b_session_id ? "Session ✓" : "缺 Session")} · ${esc(statusLabels[row.b_check_status] || row.b_check_status || "无验收")} · ${esc(statusLabels[row.b_recording_status] || row.b_recording_status || "无录像")}</small>`], ["GSB / 复检", (row) => `${badge(row.verdict || "无结论")} ${recheckBadge(row)}`], ["资料明细", (row) => readinessDetail(row)], ["提交", (row) => `${badge(row.submission_status || "not_submitted")}${row.submission_error ? `<small class="block bad">${esc(row.submission_error)}</small>` : ""}`], ["完成时间", (row) => date(row.completed_at)], ["操作", (row) => `<button class="tiny" onclick="showDelivery('${row.pair_id}')">展开</button>${row.a_recording_id ? ` <button class="tiny" onclick="playRecording('${row.a_recording_id}','A','${esc(row.title)}')">播放 A</button>` : ""}${row.b_recording_id ? ` <button class="tiny" onclick="playRecording('${row.b_recording_id}','B','${esc(row.title)}')">播放 B</button>` : ""}`]])}${pager("exports", data)}</div>`;
 }
 
 function filterBar(name, fields) {
@@ -266,7 +268,7 @@ async function reviewGsb(id) {
   } catch (error) { notify(error.message, true); }
 }
 async function confirmGsb(id) { const verdict = $('input[name="verdict"]:checked')?.value, aReason = $("#gsb-a-reason").value, bReason = $("#gsb-b-reason").value, confirmedBy = $("#confirmed-by").value; try { await api(`/api/pairs/${id}/gsb/confirm`, { method: "POST", body: JSON.stringify({ verdict, aReason, bReason, confirmedBy }) }); $("#dialog").close(); notify("GSB 已人工确认，记录进入待正式提交状态"); render(); } catch (error) { notify(error.message, true); } }
-async function recheckGsb(id) { try { if ($("#dialog")?.open) $("#dialog").close(); const data = await api(`/api/pairs/${id}/gsb/recheck`, { method: "POST", body: "{}" }); notify("GSB 高强度复检已启动"); poll(data.operationId, () => reviewGsb(id)); } catch (error) { notify(error.message, true); } }
+async function recheckGsb(id) { try { if ($("#dialog")?.open) $("#dialog").close(); const data = await api(`/api/pairs/${id}/gsb/recheck`, { method: "POST", body: "{}" }); state.recheckRunning.add(id); if (state.page === "reviews") await renderReviews(); else if (state.page === "exports") await renderExports(); notify("GSB 高强度复检已启动"); monitorReviewBatch([data.operationId], [id], state.page, () => reviewGsb(id)); } catch (error) { state.recheckRunning.delete(id); notify(error.message, true); } }
 async function applyRecheck(pairId, recheckId) { try { await api(`/api/pairs/${pairId}/gsb/recheck/${recheckId}/apply`, { method: "POST", body: "{}" }); if (state.page === "reviews") await renderReviews(); else if (state.page === "exports") await renderExports(); notify("复检建议已应用并按授权默认确认"); await reviewGsb(pairId); } catch (error) { notify(error.message, true); } }
 
 function toggleReview(pairId, checked) { checked ? state.reviewSelection.add(pairId) : state.reviewSelection.delete(pairId); renderReviews(); }
@@ -276,10 +278,11 @@ async function recheckReviewsSelected() {
   if (!pairIds.length) return;
   try {
     const data = await api("/api/gsb-reviews/recheck", { method: "POST", body: JSON.stringify({ pairIds }) });
+    pairIds.forEach((id) => state.recheckRunning.add(id));
     notify(`已启动 ${data.count} 条 GSB 批量复检，完成后会自动刷新`);
     state.reviewSelection.clear();
-    renderReviews();
-    monitorReviewBatch(data.operationIds || []);
+    await renderReviews();
+    monitorReviewBatch(data.operationIds || [], pairIds, "reviews");
   } catch (error) { notify(error.message, true); }
 }
 async function applyReviewSuggestionsSelected() {
@@ -292,15 +295,25 @@ async function applyReviewSuggestionsSelected() {
     notify(data.failed ? `已应用 ${data.applied} 条，${data.failed} 条失败，${data.skipped} 条跳过` : `已批量应用 ${data.applied} 条复检建议，${data.skipped} 条无需处理`, Boolean(data.failed));
   } catch (error) { notify(error.message, true); }
 }
-async function monitorReviewBatch(operationIds) {
-  let failed = 0;
+async function monitorReviewBatch(operationIds, pairIds = [], refreshPage = "reviews", onCompleted = null) {
+  let previous = "";
   for (let attempt = 0; attempt < 900 && operationIds.length; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
     const results = await Promise.all(operationIds.map((id) => api(`/api/operations/${id}`)));
+    const signature = results.map((item) => item.status).join("|");
+    let changed = signature !== previous;
+    previous = signature;
+    results.forEach((item, index) => {
+      if (["completed", "failed"].includes(item.status) && pairIds[index] && state.recheckRunning.delete(pairIds[index])) changed = true;
+    });
+    if (changed && state.page === refreshPage) {
+      if (refreshPage === "exports") await renderExports();
+      else if (refreshPage === "reviews") await renderReviews();
+    }
     if (results.every((item) => ["completed", "failed"].includes(item.status))) {
-      failed = results.filter((item) => item.status === "failed").length;
-      notify(failed ? `批量复检完成，${failed} 条失败` : `批量复检完成，共 ${results.length} 条`, Boolean(failed));
-      if (state.page === "reviews") renderReviews();
+      const failed = results.filter((item) => item.status === "failed").length;
+      notify(failed ? `复检完成，${failed} 条失败` : results.length === 1 ? "GSB 复检完成，页面已更新" : `批量复检完成，共 ${results.length} 条`, Boolean(failed));
+      if (onCompleted) await onCompleted(results);
       return;
     }
   }
@@ -317,7 +330,7 @@ async function repairRemoteSelected() { const ids = [...state.exportSelection]; 
 async function syncSoloQa() { try { notify("正在读取 SOLO-QA 最新质检状态…"); const data = await helperCall("PAIRWISE_GSB_SYNC"); notify(data.failed ? `同步完成，${data.failed} 条读取失败` : `已同步 ${data.results?.length || 0} 条记录`, Boolean(data.failed)); renderExports(); } catch (error) { notify(error.message, true); } }
 async function hideSelected() { if (!window.confirm("从导出列表隐藏所选记录？项目、代码、轨迹、录像和审计记录都会保留。")) return; try { await api("/api/deliveries/hide", { method: "POST", body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); notify("所选记录已从导出列表隐藏"); state.exportSelection.clear(); render(); } catch (error) { notify(error.message, true); } }
 async function restoreSelected() { try { await api("/api/deliveries/restore", { method: "POST", body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); notify("所选记录已恢复"); state.exportSelection.clear(); render(); } catch (error) { notify(error.message, true); } }
-async function recheckSelected() { const ids = [...state.exportSelection]; try { for (const id of ids) await api(`/api/pairs/${id}/gsb/recheck`, { method: "POST", body: "{}" }); notify(`已启动 ${ids.length} 个 GSB 复检作业`); } catch (error) { notify(error.message, true); } }
+async function recheckSelected() { const ids = [...state.exportSelection]; if (!ids.length) return; try { const data = await api("/api/gsb-reviews/recheck", { method: "POST", body: JSON.stringify({ pairIds: ids }) }); ids.forEach((id) => state.recheckRunning.add(id)); state.exportSelection.clear(); await renderExports(); notify(`已启动 ${data.count} 个 GSB 复检作业，状态将自动更新`); monitorReviewBatch(data.operationIds || [], ids, "exports"); } catch (error) { ids.forEach((id) => state.recheckRunning.delete(id)); notify(error.message, true); } }
 async function repairSelected() { try { const data = await api("/api/gsb-reviews/recheck/apply", { method: "POST", body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); state.exportSelection.clear(); await renderExports(); notify(data.failed ? `已应用 ${data.applied} 条，${data.failed} 条失败` : data.applied ? `已对 ${data.applied} 条记录应用复检建议并按授权默认确认` : "所选记录没有可应用的复检建议", Boolean(data.failed)); } catch (error) { notify(error.message, true); } }
 async function showDelivery(id) {
   try {
