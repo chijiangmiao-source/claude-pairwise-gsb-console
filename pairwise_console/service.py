@@ -1558,23 +1558,35 @@ class PairwiseService:
         return pair
 
     @staticmethod
-    def _is_transient_claude_api_error(error: str) -> bool:
+    def _transient_claude_api_error_kind(error: str) -> str:
         text = str(error or "").casefold()
         api_context = "api error" in text or "litellm" in text
         rate_limited = any(token in text for token in (
             "rate limit", "rate_limit", "ratelimiterror", "too many requests",
             "max_parallel_requests",
-        ))
+        )) or bool(re.search(r"(?:^|\D)429(?:\D|$)", text))
         gateway_timeout = "gateway timeout" in text or "gateway_timeout" in text
-        status_code = bool(re.search(r"(?:^|\D)(?:429|504)(?:\D|$)", text))
-        return api_context and (rate_limited or gateway_timeout or status_code)
+        gateway_timeout = gateway_timeout or bool(re.search(r"(?:^|\D)504(?:\D|$)", text))
+        if not api_context:
+            return ""
+        if rate_limited:
+            return "rate_limit"
+        if gateway_timeout:
+            return "gateway_timeout"
+        return ""
+
+    @classmethod
+    def _is_transient_claude_api_error(cls, error: str) -> bool:
+        return bool(cls._transient_claude_api_error_kind(error))
 
     def _restart_arm_from_baseline(self, pair_id: str, arm: Dict[str, Any], prompt: str,
-                                   error: str, count_development_failure: bool = True) -> Dict[str, Any]:
+                                   error: str, count_development_failure: bool = True,
+                                   count_error_retry: bool = True) -> Dict[str, Any]:
         pair = self._pair(pair_id)
         restarted = self.claude.archive_failed_attempt(
             arm, error, prepare_retry=True,
             count_development_failure=count_development_failure,
+            count_error_retry=count_error_retry,
         )
         canonical = self.git.reset_arm_to_baseline(pair_id, str(arm["arm"]))
         lowered = error.casefold()
@@ -1596,6 +1608,7 @@ class PairwiseService:
             "attempt": int(restarted.get("attempt_no") or 1), "baseline_sha": pair["baseline_sha"],
             "reason": redact(error)[-1000:], "prompt_mode": "same_original_prompt_once",
             "counts_toward_development_attempts": count_development_failure,
+            "counts_toward_error_retries": count_error_retry,
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
 
@@ -1609,12 +1622,15 @@ class PairwiseService:
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
         attempt = max(1, int(arm.get("attempt_no") or 1))
         maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
-        transient_api_error = self._is_transient_claude_api_error(error)
+        transient_api_error_kind = self._transient_claude_api_error_kind(error)
+        transient_api_error = bool(transient_api_error_kind)
+        count_error_retry = transient_api_error_kind != "rate_limit"
         self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
             "attempt": attempt, "maximum": maximum, "error": redact(error)[-1000:],
             "action": "fresh_session_from_baseline_without_failure_count" if transient_api_error
                       else ("replace_task" if attempt >= maximum else "fresh_session_from_baseline"),
             "counts_toward_development_attempts": not transient_api_error,
+            "counts_toward_error_retries": count_error_retry,
         })
         if not transient_api_error and attempt >= maximum:
             archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
@@ -1624,6 +1640,7 @@ class PairwiseService:
             return self._restart_arm_from_baseline(
                 pair_id, arm, prompt, error,
                 count_development_failure=not transient_api_error,
+                count_error_retry=count_error_retry,
             )
         except Exception as exc:
             current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm

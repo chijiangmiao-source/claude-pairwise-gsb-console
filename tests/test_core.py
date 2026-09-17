@@ -778,9 +778,10 @@ class CoreTests(unittest.TestCase):
             updated = self.service.claude.archive_failed_attempt(
                 self.db.one("SELECT * FROM arm_runs WHERE id='arm-copy-fail'"), "API Error: 429", True,
                 count_development_failure=False,
+                count_error_retry=False,
             )
         self.assertEqual(updated["attempt_no"], 1)
-        self.assertEqual(updated["error_retry_count"], 1)
+        self.assertEqual(updated["error_retry_count"], 0)
         self.assertEqual(updated["status"], "queued")
         self.assertNotEqual(updated["container_name"], "old-container")
         self.assertNotEqual(updated["workspace_path"], str(workspace))
@@ -844,10 +845,10 @@ class CoreTests(unittest.TestCase):
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
         arm = {"id": "arm-transient-api", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
         errors = (
-            "API Error: Request rejected (429) · litellm.RateLimitError: max_parallel_requests",
-            "API Error: 504 Gateway Timeout",
+            ("API Error: Request rejected (429) · litellm.RateLimitError: max_parallel_requests", False),
+            ("API Error: 504 Gateway Timeout", True),
         )
-        for error in errors:
+        for error, count_error_retry in errors:
             with self.subTest(error=error), \
                  patch.object(self.service, "_restart_arm_from_baseline",
                               return_value={**arm, "status": "developing"}) as restart, \
@@ -857,6 +858,7 @@ class CoreTests(unittest.TestCase):
             restart.assert_called_once_with(
                 pair["id"], arm, "same prompt", error,
                 count_development_failure=False,
+                count_error_retry=count_error_retry,
             )
             replace.assert_not_called()
 

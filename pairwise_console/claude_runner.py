@@ -99,7 +99,8 @@ class ClaudeRunner:
 
     def archive_failed_attempt(self, arm_run: Dict[str, Any], error: str,
                                prepare_retry: bool = True,
-                               count_development_failure: bool = True) -> Dict[str, Any]:
+                               count_development_failure: bool = True,
+                               count_error_retry: bool = True) -> Dict[str, Any]:
         """Preserve one failed attempt and optionally prepare a fresh session.
 
         The old container is removed only after its trace copy has been checked.
@@ -178,13 +179,14 @@ class ClaudeRunner:
             next_screen = "%s-%s" % (base, suffix)
         status = "queued" if prepare_retry else "failed"
         finished_at = None if prepare_retry else now_iso()
+        error_retry_increment = 1 if count_error_retry else 0
         self.db.execute(
             """UPDATE arm_runs SET status=?,workspace_path=?,container_name=?,screen_name=?,
                image_id='',session_id='',prompt_id='',trace_path='',
                commit_sha='',result='',warning_at=NULL,error='',prompt_sent_at=NULL,finished_at=NULL,
-               attempt_no=?,error_retry_count=error_retry_count+1,updated_at=? WHERE id=?""",
+               attempt_no=?,error_retry_count=error_retry_count+?,updated_at=? WHERE id=?""",
             (status, str(next_workspace), next_container, next_screen,
-             next_attempt if prepare_retry else attempt_no, now_iso(), arm_run["id"]),
+             next_attempt if prepare_retry else attempt_no, error_retry_increment, now_iso(), arm_run["id"]),
         )
         if not prepare_retry:
             self.db.execute(
@@ -197,6 +199,7 @@ class ClaudeRunner:
             "container_retained": bool(container_exists and self._container_exists(container)),
             "workspace_archived": workspace_archived, "retry_prepared": prepare_retry,
             "counts_toward_development_attempts": count_development_failure,
+            "counts_toward_error_retries": count_error_retry,
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_run["id"],)) or {}
 
