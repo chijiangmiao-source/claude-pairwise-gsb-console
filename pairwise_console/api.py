@@ -46,6 +46,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "name": APP_NAME, "time": now_iso()})
             if path == "/api/preflight":
                 return self._json(200, self.app.service.preflight())
+            if path == "/api/automation":
+                return self._json(200, self.app.service.automation_status())
             if path == "/api/dashboard":
                 return self._json(200, dashboard(self.app.db))
             if path == "/api/settings":
@@ -103,6 +105,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path, _ = self._path_query()
             body = self._body()
+            if path == "/api/automation/start":
+                return self._json(200, self.app.service.set_auto_pipeline(True))
+            if path == "/api/automation/stop":
+                return self._json(200, self.app.service.set_auto_pipeline(False))
             if path == "/api/tasks/import-historical":
                 return self._json(200, self.app.service.import_historical(int(body.get("limit", 500))))
             if path == "/api/tasks/generate":

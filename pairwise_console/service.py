@@ -55,6 +55,8 @@ class PairwiseService:
         self._future_lock = threading.Lock()
         self._futures: Dict[str, Any] = {}
         self._scheduler_started = False
+        self._automation_lock = threading.Lock()
+        self._auto_retry_after: Dict[str, float] = {}
         self._seed_settings()
         self.db.execute(
             """UPDATE codex_jobs SET status='failed',error='服务重启时作业仍处于运行态，已安全释放以便重新排队',
@@ -77,6 +79,7 @@ class PairwiseService:
             "task_pool_target_ready": 12,
             "auto_refill_enabled": True,
             "auto_refill_interval_seconds": 60,
+            "auto_pipeline_enabled": False,
             "git_author_name": self.config.git_author_name,
             "git_author_email": self.config.git_author_email,
             "github_owner": self.config.github_owner,
@@ -168,17 +171,184 @@ class PairwiseService:
             return self._handle_attempt_failure(pair_id, current, prompt, failure)
 
     def _scheduler_loop(self) -> None:
-        # Let HTTP start first, then maintain the pool independently of A/B
-        # development capacity.
+        # Let HTTP start first. Task-pool refill has its own slower cadence;
+        # the full-pipeline driver reacts quickly when a Pair finishes.
         time.sleep(3)
+        next_refill = 0.0
         while True:
             try:
-                if bool(self.db.setting("auto_refill_enabled", True)):
+                current = time.monotonic()
+                if bool(self.db.setting("auto_refill_enabled", True)) and current >= next_refill:
                     self._schedule_refill_once()
+                    interval = max(30, int(self.db.setting("auto_refill_interval_seconds", 60)))
+                    next_refill = current + interval
+                if bool(self.db.setting("auto_pipeline_enabled", False)):
+                    self._schedule_auto_pipeline_once()
             except Exception as exc:
-                self.db.audit("task.refill_scheduler_error", "scheduler", "task-pool", {"error": str(exc)[-2000:]})
-            interval = max(30, int(self.db.setting("auto_refill_interval_seconds", 60)))
-            time.sleep(interval)
+                self.db.audit("automation.scheduler_error", "scheduler", "full-pipeline", {"error": str(exc)[-2000:]})
+            time.sleep(5)
+
+    def automation_status(self) -> Dict[str, Any]:
+        target = MAX_PAIR_PROJECTS
+        active = int((self.db.one(
+            "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
+        ) or {"count": 0})["count"])
+        ready = int((self.db.one(
+            "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')"
+        ) or {"count": 0})["count"])
+        generating = int((self.db.one(
+            "SELECT COUNT(*) count FROM generation_batches WHERE status='running'"
+        ) or {"count": 0})["count"])
+        stages = self.db.all(
+            """SELECT stage,COUNT(*) count FROM pairs
+               WHERE status IN ('queued','running','review') GROUP BY stage ORDER BY stage"""
+        )
+        return {
+            "enabled": bool(self.db.setting("auto_pipeline_enabled", False)),
+            "targetPairs": target,
+            "activePairs": active,
+            "readyTasks": ready,
+            "generatingBatches": generating,
+            "stages": stages,
+        }
+
+    def set_auto_pipeline(self, enabled: bool) -> Dict[str, Any]:
+        self.db.set_setting("auto_pipeline_enabled", bool(enabled))
+        if enabled:
+            # The one-click mode has a fixed capacity: three Pair projects,
+            # each using two independent Claude terminals.
+            self.db.set_setting("max_pairs_parallel", MAX_PAIR_PROJECTS)
+        self.db.audit(
+            "automation.started" if enabled else "automation.stopped",
+            "scheduler", "full-pipeline", {"targetPairs": MAX_PAIR_PROJECTS},
+        )
+        if enabled:
+            self._schedule_auto_pipeline_once()
+        return self.automation_status()
+
+    def _submit_auto(self, operation: str, fn, *args) -> bool:
+        """Submit an idempotent pipeline action with a small failure backoff."""
+        with self._future_lock:
+            existing = self._futures.get(operation)
+            if existing and not existing.done():
+                return False
+            if time.monotonic() < self._auto_retry_after.get(operation, 0.0):
+                return False
+
+            def run_action():
+                try:
+                    result = fn(*args)
+                    with self._future_lock:
+                        self._auto_retry_after.pop(operation, None)
+                    return result
+                except Exception as exc:
+                    with self._future_lock:
+                        self._auto_retry_after[operation] = time.monotonic() + 30
+                    self.db.audit("automation.action_failed", "operation", operation, {
+                        "error": redact(str(exc))[-2000:],
+                    })
+                    raise
+
+            self._futures[operation] = self.executor.submit(run_action)
+            return True
+
+    def _schedule_auto_pipeline_once(self) -> Dict[str, Any]:
+        """Advance every active Pair and refill empty Pair slots up to three."""
+        if not self._automation_lock.acquire(blocking=False):
+            return self.automation_status()
+        try:
+            active_pairs = self.db.all(
+                """SELECT * FROM pairs WHERE status IN ('queued','running','review')
+                   ORDER BY created_at,id"""
+            )
+            recording_pairs: List[Dict[str, Any]] = []
+            for pair in active_pairs:
+                pair_id, stage = pair["id"], pair["stage"]
+                if stage == "repository":
+                    self._submit_auto("repo-" + pair_id, self.prepare_pair_repository, pair_id)
+                elif stage == "ready_to_start":
+                    self._submit_auto("start-" + pair_id, self.start_pair, pair_id)
+                elif stage == "artifact_validation":
+                    arms = self.db.all("SELECT status FROM arm_runs WHERE pair_id=?", (pair_id,))
+                    if len(arms) == 2 and all(item["status"] == "completed" for item in arms):
+                        self._submit_auto("artifacts-" + pair_id, self._validate_pair_artifacts, pair_id)
+                elif stage == "recording":
+                    recording_pairs.append(pair)
+                elif stage == "gsb_ready":
+                    self._submit_auto("gsb-" + pair_id, self.generate_gsb, pair_id)
+                elif stage == "gsb_confirmation":
+                    review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,)) or {}
+                    if review.get("status") == "draft" and review.get("a_reason") and review.get("b_reason"):
+                        reviewer = str(self.db.setting("git_author_name", "刘昱") or "刘昱").strip() + "（按授权默认确认）"
+                        self._submit_auto(
+                            "confirm-gsb-" + pair_id, self.confirm_gsb, pair_id,
+                            review.get("verdict", ""), review.get("a_reason", ""),
+                            review.get("b_reason", ""), reviewer,
+                        )
+
+            self._schedule_next_automatic_recording(recording_pairs)
+
+            active_count = int((self.db.one(
+                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
+            ) or {"count": 0})["count"])
+            while active_count < MAX_PAIR_PROJECTS:
+                task = self.db.one(
+                    """SELECT * FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')
+                       ORDER BY created_at,id LIMIT 1"""
+                )
+                if not task:
+                    break
+                pair = self.create_pair(task["id"])
+                self._submit_auto("repo-" + pair["id"], self.prepare_pair_repository, pair["id"])
+                active_count += 1
+
+            # Existing approved questions are consumed first. Refill begins
+            # only when no additional approved question can fill the target.
+            if active_count < MAX_PAIR_PROJECTS:
+                self._schedule_refill_once()
+            return self.automation_status()
+        finally:
+            self._automation_lock.release()
+
+    def _schedule_next_automatic_recording(self, pairs: List[Dict[str, Any]]) -> None:
+        if self.db.one(
+            "SELECT id FROM recording_attempts WHERE status IN ('starting','recording') LIMIT 1"
+        ):
+            return
+        for pair in pairs:
+            pair_id = pair["id"]
+            for arm in ("A", "B"):
+                run = self.db.one("SELECT commit_sha FROM arm_runs WHERE pair_id=? AND arm=?", (pair_id, arm)) or {}
+                commit_sha = str(run.get("commit_sha") or "")
+                if not commit_sha:
+                    continue
+                recording = self.db.one(
+                    """SELECT id FROM recordings WHERE pair_id=? AND arm=? AND status='passed'
+                       AND commit_match=1 AND commit_sha=?""", (pair_id, arm, commit_sha),
+                )
+                if recording:
+                    continue
+                failures = int((self.db.one(
+                    """SELECT COUNT(*) count FROM recording_attempts WHERE pair_id=? AND arm=?
+                       AND commit_sha=? AND interaction_mode<>'manual' AND status='failed'""",
+                    (pair_id, arm, commit_sha),
+                ) or {"count": 0})["count"])
+                if failures >= 3:
+                    stamp = now_iso()
+                    self.db.execute(
+                        """UPDATE pairs SET status='failed',stage='recording_failed',
+                           error=?,updated_at=? WHERE id=?""",
+                        ("自动录像连续 3 次失败，请人工检查后重新录制", stamp, pair_id),
+                    )
+                    self.db.audit("automation.recording_exhausted", "pair", pair_id, {"arm": arm})
+                    break
+                try:
+                    self.start_recording(pair_id, arm, manual=False)
+                except Exception as exc:
+                    self.db.audit("automation.recording_start_failed", "pair", pair_id, {
+                        "arm": arm, "error": redact(str(exc))[-2000:],
+                    })
+                return
 
     def _schedule_refill_once(self) -> None:
         ready = (self.db.one("SELECT COUNT(*) count FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')") or {"count": 0})["count"]
@@ -358,7 +528,7 @@ class PairwiseService:
             raise KeyError("任务不存在")
         if task["status"] != "ready" or task["difficulty"] not in ("困难", "地狱"):
             raise ValueError("只有已通过准入的困难或地狱任务才能创建 Pair")
-        active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running')") or {"count": 0})["count"]
+        active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')") or {"count": 0})["count"]
         configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
         if active_count >= pair_limit:

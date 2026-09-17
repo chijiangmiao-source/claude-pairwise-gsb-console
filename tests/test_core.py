@@ -87,6 +87,61 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "最多 3 个 Pair"):
             self.service.create_pair("task-limit-3")
 
+    def test_one_click_automation_is_persistent_and_forces_three_pair_target(self):
+        self.db.set_setting("max_pairs_parallel", 1)
+        with patch.object(self.service, "_schedule_auto_pipeline_once") as schedule:
+            status = self.service.set_auto_pipeline(True)
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["targetPairs"], 3)
+        self.assertEqual(self.db.setting("max_pairs_parallel"), 3)
+        schedule.assert_called_once_with()
+        stopped = self.service.set_auto_pipeline(False)
+        self.assertFalse(stopped["enabled"])
+
+    def test_automation_consumes_existing_ready_tasks_before_refill(self):
+        stamp = now_iso()
+        for index in range(3):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+                   fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"task-auto-{index}", "test", "zero_to_one", f"hard-auto-{index}",
+                 "Build a hard project with Docker Compose", "困难", '["跨模块状态"]',
+                 f"fingerprint-auto-{index}", "ready", stamp, stamp),
+            )
+        submitted = []
+        with patch.object(self.service, "_submit_auto", side_effect=lambda operation, fn, *args: submitted.append(operation) or True), \
+             patch.object(self.service, "_schedule_refill_once") as refill:
+            status = self.service._schedule_auto_pipeline_once()
+        self.assertEqual(status["activePairs"], 3)
+        self.assertEqual(status["readyTasks"], 0)
+        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 3)
+        self.assertEqual(len([item for item in submitted if item.startswith("repo-pair-")]), 3)
+        refill.assert_not_called()
+
+    def test_automation_refills_when_a_completed_pair_releases_a_slot(self):
+        stamp = now_iso()
+        for index in range(4):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+                   fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"task-cycle-{index}", "test", "zero_to_one", f"hard-cycle-{index}",
+                 "Build a hard project with Docker Compose", "困难", '["跨模块状态"]',
+                 f"fingerprint-cycle-{index}", "ready", stamp, stamp),
+            )
+        with patch.object(self.service, "_submit_auto", return_value=True), \
+             patch.object(self.service, "_schedule_refill_once"):
+            self.service._schedule_auto_pipeline_once()
+        first = self.db.one("SELECT id FROM pairs ORDER BY created_at,id LIMIT 1")
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',completed_at=?,updated_at=? WHERE id=?",
+            (stamp, stamp, first["id"]),
+        )
+        with patch.object(self.service, "_submit_auto", return_value=True), \
+             patch.object(self.service, "_schedule_refill_once"):
+            status = self.service._schedule_auto_pipeline_once()
+        self.assertEqual(status["activePairs"], 3)
+        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 4)
+
     def test_gsb_confirmation_strips_backticks_and_completes_pair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

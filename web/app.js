@@ -22,7 +22,9 @@ const statusLabels = {
   blocked: "待补资料", not_submitted: "待提交", ready_to_submit: "待提交",
   submitting: "提交中", qc_pending: "质检中", qc_passed: "质检通过",
   submitted: "已提交", needs_fix: "待返修", discarded: "已废弃", needs_review: "待重新确认", missing: "缺失",
-  starting: "正在启动项目", recording: "正在录制",
+  repository: "仓库准备", ready_to_start: "等待启动", development: "A/B 开发",
+  artifact_validation: "Docker 验收", starting: "正在启动项目", recording: "正在录制",
+  gsb_ready: "等待 GSB", gsb_confirmation: "GSB 确认",
 };
 const badge = (value) => `<span class="badge ${esc(value)}">${esc(statusLabels[value] || value || "—")}</span>`;
 const taskTypeLabels = { zero_to_one: "0–1", feature: "Feature 迭代", bugfix: "Bug 修复" };
@@ -91,8 +93,15 @@ const pages = {
       <div class="card" style="margin-top:16px"><div class="toolbar"><div><h2>Pair 数据概览</h2><p class="sub">每张卡片对应一个 Pair，A/B 交付进度合并展示</p></div><small class="sub">24 小时活跃 ${summary.activeHours24h} 个时段 · 每小时平均 ${summary.hourlyAverage24h}</small></div><div class="pair-overview-grid">${data.recentPairs.map(pairOverviewCard).join("") || '<div class="empty">暂无 Pair</div>'}</div></div>`;
   },
   tasks: async () => {
-    const data = await api(`/api/tasks?page=${state.pages.tasks}&size=${state.sizes.tasks}`);
-    $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>题目池</h2><p class="sub">困难与地狱题目进入 A/B</p></div><div class="toolbar-group"><button class="secondary" onclick="importTasks()">导入历史困难题</button><button class="primary" onclick="generateTask()">自动补题</button></div></div>${table(data.items, [
+    const [data, automation] = await Promise.all([
+      api(`/api/tasks?page=${state.pages.tasks}&size=${state.sizes.tasks}`), api("/api/automation"),
+    ]);
+    const automationAction = automation.enabled
+      ? `<span class="badge running">自动运行中</span><button class="danger" onclick="toggleAutomation(false)">停止自动运行</button>`
+      : `<button class="primary" onclick="toggleAutomation(true)">一键自动运行完整流程</button>`;
+    const stageText = (automation.stages || []).map((item) => `${statusLabels[item.stage] || item.stage} ${item.count}`).join(" · ") || "等待启动";
+    $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>题目池</h2><p class="sub">困难与地狱题目进入 A/B</p></div><div class="toolbar-group"><button class="secondary" onclick="importTasks()">导入历史困难题</button>${automationAction}</div></div>
+      <div class="automation-strip ${automation.enabled ? "enabled" : ""}"><div><strong>${automation.enabled ? "完整流程持续运行" : "完整流程尚未启动"}</strong><small>${automation.enabled ? "现有合格题优先；空位自动补 Pair，题目不足自动出题" : "点击后自动完成仓库准备、A/B 开发、Docker 验收、录像和 GSB"}</small></div><div class="automation-metrics"><span>活动 Pair <b>${automation.activePairs}/${automation.targetPairs}</b></span><span>可用题目 <b>${automation.readyTasks}</b></span><span>${esc(stageText)}</span></div></div>${table(data.items, [
       ["题目", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong><small>${esc(row.prompt)}</small></div>`],
       ["任务 / 系统类型", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)}</div>`], ["难度", (row) => `<span class="difficulty">${esc(row.difficulty)}</span>`],
       ["来源", (row) => esc(row.source)], ["状态", (row) => badge(row.status)],
@@ -219,6 +228,7 @@ function setting(key, label, value, help, attributes = "") { return `<div class=
 
 async function importTasks() { try { const data = await api("/api/tasks/import-historical", { method: "POST", body: JSON.stringify({ limit: 1000 }) }); notify(`导入 ${data.imported} 条，跳过 ${data.skipped} 条`); render(); } catch (error) { notify(error.message, true); } }
 async function generateTask() { try { const data = await api("/api/tasks/generate", { method: "POST", body: JSON.stringify({ count: 1, taskType: "zero_to_one" }) }); notify(`补题作业已启动：${data.operationId}`); poll(data.operationId); } catch (error) { notify(error.message, true); } }
+async function toggleAutomation(enabled) { try { const data = await api(`/api/automation/${enabled ? "start" : "stop"}`, { method: "POST", body: "{}" }); notify(enabled ? `完整自动流程已启动，将持续保持 ${data.targetPairs} 个活动 Pair` : "已停止自动补位，正在执行的项目不会被强制中断"); render(); } catch (error) { notify(error.message, true); } }
 async function validateTask(id) { try { const data = await api(`/api/tasks/${id}/validate`, { method: "POST", body: "{}" }); notify("难度、禁题、查重和基线复核已启动"); poll(data.operationId); } catch (error) { notify(error.message, true); } }
 async function createPair(id) { try { const data = await api("/api/pairs", { method: "POST", body: JSON.stringify({ taskId: id }) }); notify(`已创建 ${data.id}`); state.page = "pairs"; render(); } catch (error) { notify(error.message, true); } }
 async function showTask(id) { try { const data = await api("/api/tasks?page=1&size=100"), task = data.items.find((item) => item.id === id); showDialog(`<h2>${esc(task?.title || id)}</h2><div class="kv"><b>任务类型</b><span>${taskTypeBadge(task?.task_type)}</span></div><div class="kv"><b>系统类型</b><span>${projectCategoryBadge(task?.project_category)}</span></div><div class="kv"><b>难度</b><span>${esc(task?.difficulty)}</span></div><div class="kv"><b>状态</b><span>${badge(task?.status)}</span></div><div class="kv"><b>题面</b><div class="wrap">${esc(task?.prompt)}</div></div><div class="kv"><b>未通过原因</b><span>${esc(task?.rejection_reason || "—")}</span></div>`); } catch (error) { notify(error.message, true); } }
