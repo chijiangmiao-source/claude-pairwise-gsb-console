@@ -140,6 +140,8 @@ class Handler(BaseHTTPRequestHandler):
                 pair_ids = self._pair_ids(body)
                 operations = [self.app.service.recheck_gsb_async(pair_id) for pair_id in pair_ids]
                 return self._json(202, {"count": len(operations), "operationIds": operations})
+            if path == "/api/gsb-reviews/recheck/apply":
+                return self._json(200, self.app.service.apply_latest_gsb_rechecks(self._pair_ids(body)))
             match = re.fullmatch(r"/api/pairs/([^/]+)/gsb/recheck/([^/]+)/apply", path)
             if match:
                 return self._json(200, self.app.service.apply_gsb_recheck(match.group(1), match.group(2)))
@@ -459,7 +461,7 @@ class Handler(BaseHTTPRequestHandler):
           r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,
           r.suggested_a_reason,r.suggested_b_reason,r.issues_json,
           r.evidence_refs_json,r.model recheck_model,r.reasoning_effort recheck_effort,r.evidence_version recheck_evidence_version,
-          r.created_at rechecked_at"""
+          r.applied_at recheck_applied_at,r.applied_by recheck_applied_by,r.created_at rechecked_at"""
         from_sql = """FROM gsb_reviews g JOIN pairs p ON p.id=g.pair_id JOIN tasks t ON t.id=p.task_id
           LEFT JOIN gsb_rechecks r ON r.id=(SELECT id FROM gsb_rechecks x WHERE x.pair_id=g.pair_id ORDER BY x.created_at DESC LIMIT 1)"""
         return self._joined_page(select, from_sql, clauses, params, "g.updated_at DESC,g.pair_id", query)
@@ -476,6 +478,7 @@ class Handler(BaseHTTPRequestHandler):
           g.verdict,g.reason,g.a_reason,g.b_reason,g.status gsb_status,
           g.confirmed_by,g.confirmed_at,g.evidence_version,
           r.id recheck_id,r.result_status recheck_status,r.evidence_version recheck_evidence_version,
+          r.applied_at recheck_applied_at,r.applied_by recheck_applied_by,
           d.status submission_status,d.remote_id,d.remote_url submission_url,d.error submission_error,d.hidden_at,d.submitted_at"""
         from_sql = """FROM pairs p JOIN tasks t ON t.id=p.task_id
           LEFT JOIN git_repositories repo ON repo.pair_id=p.id

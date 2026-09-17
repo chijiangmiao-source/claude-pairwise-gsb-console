@@ -134,6 +134,8 @@ class Database:
                 ("suggested_a_reason", "TEXT NOT NULL DEFAULT ''"),
                 ("suggested_b_reason", "TEXT NOT NULL DEFAULT ''"),
                 ("suggested_preference_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("applied_at", "TEXT"),
+                ("applied_by", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in recheck_columns:
                     c.execute("ALTER TABLE gsb_rechecks ADD COLUMN %s %s" % (name, definition))
@@ -483,6 +485,8 @@ CREATE TABLE IF NOT EXISTS gsb_rechecks (
   model TEXT NOT NULL,
   reasoning_effort TEXT NOT NULL,
   codex_job_id TEXT NOT NULL DEFAULT '',
+  applied_at TEXT,
+  applied_by TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gsb_rechecks_pair ON gsb_rechecks(pair_id,created_at DESC);

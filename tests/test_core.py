@@ -258,6 +258,20 @@ class CoreTests(unittest.TestCase):
             ("gsb-recheck-source", pair["id"], "A better", "A：原 A 评价 B：原 B 评价",
              "原 A 评价有足够的具体事实与验收依据。", "原 B 评价说明了真实存在的交付差异。", stamp, stamp),
         )
+        for arm in ("A", "B"):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-recheck-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""",
+                ("check-recheck-" + arm, pair["id"], arm, sha, stamp, stamp),
+            )
         payload = {
             "status": "suggested_revision",
             "suggestedVerdict": "A better",
@@ -272,6 +286,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["suggested_a_reason"], payload["suggestedAReason"])
         self.assertEqual(result["suggested_b_reason"], payload["suggestedBReason"])
         self.assertEqual(self.db.one("SELECT COUNT(*) count FROM gsb_rechecks")["count"], 1)
+        batch = self.service.apply_latest_gsb_rechecks([pair["id"]])
+        self.assertEqual(batch["applied"], 1)
+        applied = self.db.one("SELECT * FROM gsb_rechecks WHERE id=?", (result["id"],))
+        self.assertTrue(applied["applied_at"])
+        review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(review["a_reason"], payload["suggestedAReason"])
+        self.assertEqual(review["b_reason"], payload["suggestedBReason"])
+        self.assertEqual(review["status"], "confirmed")
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
@@ -283,6 +305,8 @@ class CoreTests(unittest.TestCase):
         self.assertIn("interaction_mode", attempt_columns)
         gsb_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_reviews)")}
         self.assertTrue({"draft_verdict", "final_verdict", "evidence_version", "a_reason", "b_reason", "preference_reason"} <= gsb_columns)
+        recheck_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_rechecks)")}
+        self.assertTrue({"applied_at", "applied_by"} <= recheck_columns)
         arm_columns = {row["name"] for row in self.db.all("PRAGMA table_info(arm_runs)")}
         self.assertTrue({"attempt_no", "error_retry_count"} <= arm_columns)
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='gsb_rechecks'"))

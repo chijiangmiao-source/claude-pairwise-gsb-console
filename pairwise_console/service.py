@@ -981,7 +981,7 @@ class PairwiseService:
         pair = self._pair(pair_id)
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         return {
-            "pair": {key: pair.get(key) for key in ("id", "task_id", "chain_id", "baseline_sha", "stage", "status")},
+            "pair": {key: pair.get(key) for key in ("id", "task_id", "chain_id", "baseline_sha")},
             "task": {key: task.get(key) for key in ("title", "task_type", "difficulty", "prompt", "acceptance_json")},
             "arms": self.db.all(
                 """SELECT arm,model,image_id,status,session_id,prompt_id,trace_path,commit_sha,result,
@@ -1000,7 +1000,9 @@ class PairwiseService:
             ),
             "processEvents": self.db.all(
                 """SELECT event_type,entity_id,detail_json,created_at FROM audit_events
-                   WHERE entity_id=? OR entity_id LIKE ? OR detail_json LIKE ? ORDER BY id""",
+                   WHERE (entity_id=? OR entity_id LIKE ? OR detail_json LIKE ?)
+                     AND (event_type LIKE 'claude.%' OR event_type LIKE 'artifact.%' OR event_type LIKE 'recording.%')
+                   ORDER BY id""",
                 (pair_id, pair_id + "-%", "%" + pair_id + "%"),
             ),
         }
@@ -1071,24 +1073,80 @@ class PairwiseService:
         if not row:
             raise KeyError("复检记录不存在")
         review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,)) or {}
-        current_version = self.gsb_evidence_version(pair_id, str(review.get("verdict") or ""), str(review.get("reason") or ""))
+        current_reason = self._compose_gsb_reason(
+            str(review.get("a_reason") or ""), str(review.get("b_reason") or "")
+        )
+        current_version = self.gsb_evidence_version(
+            pair_id, str(review.get("verdict") or ""), current_reason
+        )
         if row["evidence_version"] != current_version:
-            raise ValueError("公开理由或证据已经变化，请重新复检")
-        stamp = now_iso()
+            same_input = (
+                str(row.get("input_verdict") or "") == str(review.get("verdict") or "")
+                and str(row.get("input_reason") or "") == current_reason
+            )
+            if not same_input or self._recheck_source_changed_since(row):
+                raise ValueError("公开理由或证据已经变化，请重新复检")
         verdict = row["suggested_verdict"]
         a_reason = row.get("suggested_a_reason") or ""
         b_reason = row.get("suggested_b_reason") or ""
-        reason = self._compose_gsb_reason(a_reason, b_reason)
-        self.db.execute(
-            """UPDATE gsb_reviews SET verdict=?,reason=?,a_reason=?,b_reason=?,preference_reason=?,
-               final_verdict='',final_reason='',status='draft',
-               confirmed_by='',confirmed_at=NULL,evidence_version=?,updated_at=? WHERE pair_id=?""",
-            (verdict, reason, a_reason, b_reason, "",
-             self.gsb_evidence_version(pair_id, verdict, reason), stamp, pair_id),
-        )
-        self.db.audit("gsb.recheck_applied", "pair", pair_id, {"recheck_id": recheck_id})
         reviewer = str(self.db.setting("git_author_name", "刘昱") or "刘昱").strip() + "（按授权默认确认）"
-        return self.confirm_gsb(pair_id, verdict, a_reason, b_reason, reviewer)
+        self.confirm_gsb(pair_id, verdict, a_reason, b_reason, reviewer)
+        stamp = now_iso()
+        applied_reason = self._compose_gsb_reason(a_reason, b_reason)
+        self.db.execute(
+            """UPDATE gsb_rechecks SET evidence_version=?,applied_at=?,applied_by=? WHERE id=?""",
+            (self.gsb_evidence_version(pair_id, verdict, applied_reason), stamp, reviewer, recheck_id),
+        )
+        self.db.audit("gsb.recheck_applied", "pair", pair_id, {
+            "recheck_id": recheck_id, "applied_by": reviewer,
+        })
+        return self.pair_detail(pair_id)
+
+    def _recheck_source_changed_since(self, recheck: Dict[str, Any]) -> bool:
+        """Support pre-fix rechecks without accepting genuinely stale evidence."""
+        job = self.db.one("SELECT created_at FROM codex_jobs WHERE id=?", (recheck.get("codex_job_id") or "",)) or {}
+        since = str(job.get("created_at") or recheck.get("created_at") or "")
+        if not since:
+            return True
+        pair_id = str(recheck.get("pair_id") or "")
+        source_queries = (
+            ("SELECT 1 FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=? AND t.updated_at>? LIMIT 1", (pair_id, since)),
+            ("SELECT 1 FROM arm_runs WHERE pair_id=? AND updated_at>? LIMIT 1", (pair_id, since)),
+            ("SELECT 1 FROM artifact_checks WHERE pair_id=? AND updated_at>? LIMIT 1", (pair_id, since)),
+            ("SELECT 1 FROM recordings WHERE pair_id=? AND updated_at>? LIMIT 1", (pair_id, since)),
+            ("""SELECT 1 FROM audit_events WHERE created_at>?
+                  AND (entity_id=? OR entity_id LIKE ? OR detail_json LIKE ?)
+                  AND (event_type LIKE 'claude.%' OR event_type LIKE 'artifact.%' OR event_type LIKE 'recording.%')
+                  LIMIT 1""", (since, pair_id, pair_id + "-%", "%" + pair_id + "%")),
+        )
+        return any(self.db.one(sql, params) is not None for sql, params in source_queries)
+
+    def apply_latest_gsb_rechecks(self, pair_ids: List[str]) -> Dict[str, Any]:
+        results = []
+        for pair_id in dict.fromkeys(pair_ids):
+            latest = self.db.one(
+                "SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC LIMIT 1", (pair_id,)
+            )
+            if not latest:
+                results.append({"pair_id": pair_id, "outcome": "skipped", "reason": "尚未完成复检"})
+                continue
+            if latest.get("applied_at"):
+                results.append({"pair_id": pair_id, "outcome": "skipped", "reason": "最新建议已经应用"})
+                continue
+            if latest.get("result_status") == "passed":
+                results.append({"pair_id": pair_id, "outcome": "skipped", "reason": "复检已通过，无需应用"})
+                continue
+            try:
+                self.apply_gsb_recheck(pair_id, latest["id"])
+                results.append({"pair_id": pair_id, "outcome": "applied", "recheck_id": latest["id"]})
+            except Exception as exc:
+                results.append({"pair_id": pair_id, "outcome": "failed", "error": redact(str(exc))})
+        return {
+            "results": results,
+            "applied": sum(item["outcome"] == "applied" for item in results),
+            "skipped": sum(item["outcome"] == "skipped" for item in results),
+            "failed": sum(item["outcome"] == "failed" for item in results),
+        }
 
     def delivery_preflight(self, pair_id: str, include_platform: bool = False) -> Dict[str, Any]:
         detail = self.pair_detail(pair_id)
@@ -1115,9 +1173,9 @@ class PairwiseService:
         latest = self.db.one("SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC LIMIT 1", (pair_id,))
         if not latest or latest.get("evidence_version") != version:
             warnings.append("尚未基于当前公开理由完成模型复检")
-        elif latest.get("result_status") == "fact_conflict":
+        elif latest.get("result_status") == "fact_conflict" and not latest.get("applied_at"):
             blockers.append("模型复检发现公开理由存在事实冲突")
-        elif latest.get("result_status") == "suggested_revision":
+        elif latest.get("result_status") == "suggested_revision" and not latest.get("applied_at"):
             warnings.append("模型复检给出了措辞修改建议")
         if include_platform:
             _, _, platform_blockers = self._solo_qa_material(detail)
