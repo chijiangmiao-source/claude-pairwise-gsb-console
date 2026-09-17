@@ -78,6 +78,8 @@ class PairwiseService:
         self._pair_creation_lock = threading.Lock()
         self._repository_locks_lock = threading.Lock()
         self._repository_locks: Dict[str, threading.Lock] = {}
+        self._start_locks_lock = threading.Lock()
+        self._start_locks: Dict[str, threading.Lock] = {}
         self._prompt_locks_lock = threading.Lock()
         self._prompt_locks: Dict[str, threading.Lock] = {}
         self._pair_completion_lock = threading.RLock()
@@ -804,7 +806,17 @@ class PairwiseService:
         return operation
 
     def start_pair(self, pair_id: str) -> Dict[str, Any]:
+        # Replacement workers and the automatic scheduler can both observe a
+        # freshly prepared Pair. Only one of them may launch its two Arms.
+        with self._start_locks_lock:
+            start_lock = self._start_locks.setdefault(pair_id, threading.Lock())
+        with start_lock:
+            return self._start_pair_locked(pair_id)
+
+    def _start_pair_locked(self, pair_id: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)
+        if pair["status"] not in ("queued", "running", "review"):
+            raise ValueError("Pair 已停止，不能重新启动 A/B")
         if pair["stage"] != "ready_to_start":
             raise ValueError("Pair 尚未完成仓库与 A/B 工作区准备")
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}

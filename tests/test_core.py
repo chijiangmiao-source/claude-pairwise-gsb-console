@@ -85,6 +85,16 @@ class CoreTests(unittest.TestCase):
         self.assertGreaterEqual(waited, 30)
         self.assertLessEqual(waited, 31)
 
+    def test_failed_ready_pair_cannot_be_revived_by_a_queued_start(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.db.execute(
+            "UPDATE pairs SET status='failed',stage='ready_to_start' WHERE id=?",
+            (pair["id"],),
+        )
+        with self.assertRaisesRegex(ValueError, "Pair 已停止"):
+            self.service.start_pair(pair["id"])
+
     def test_completed_arm_is_scheduled_for_validation_before_peer_finishes(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
