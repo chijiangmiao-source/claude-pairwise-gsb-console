@@ -18,6 +18,7 @@ from pairwise_console.artifact import isolated_compose_environment
 from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
+from pairwise_console.prompts import gsb_prompt
 from pairwise_console.service import PairwiseService
 
 
@@ -904,6 +905,47 @@ class CoreTests(unittest.TestCase):
             )
         markers = [json.loads(row["detail_json"])["marker"] for row in self.service._current_process_events(pair["id"])]
         self.assertEqual(markers, ["A-current", "B-current", "pair-current"])
+
+    def test_gsb_trace_evidence_uses_real_jsonl_steps_and_visible_tool_results(self):
+        trace_dir = self.root / "trace-evidence"
+        trace_dir.mkdir()
+        rows = [
+            {"type": "system", "message": {"content": "start"}},
+            {"message": {"content": [{
+                "type": "tool_use", "name": "Write",
+                "input": {"file_path": "/workspace/app/dating.go", "content": "package app"},
+            }]}},
+            {"message": {"content": [{
+                "type": "tool_result", "content": "File written successfully",
+            }]}},
+            {"message": {"content": [{
+                "type": "tool_use", "name": "Bash",
+                "input": {"command": "go test ./..."},
+            }]}},
+            {"message": {"content": [{
+                "type": "tool_result", "is_error": True,
+                "content": "use of internal package not allowed",
+            }]}},
+        ]
+        (trace_dir / "session.jsonl").write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8",
+        )
+        evidence = self.service._trace_action_evidence({"trace_path": str(trace_dir)})
+        self.assertTrue(evidence["available"])
+        self.assertEqual([event["step"] for event in evidence["events"]], [2, 3, 4, 5])
+        self.assertEqual(evidence["events"][0]["tool"], "Write")
+        self.assertIn("dating.go", evidence["events"][0]["detail"])
+        self.assertEqual(evidence["events"][2]["detail"], "go test ./...")
+        self.assertTrue(evidence["events"][3]["isError"])
+
+    def test_gsb_prompt_requires_plain_language_trace_and_reproduced_bug_evidence(self):
+        prompt = gsb_prompt("开发送检单", "A evidence", "B evidence", "process events")
+        self.assertIn("traceEvidence", prompt)
+        self.assertIn("步骤号只能引用 traceEvidence 的 step", prompt)
+        self.assertIn("discoveredBugs 中有已复现问题", prompt)
+        self.assertIn("轨迹里没有跑接口业务测试", prompt)
+        self.assertIn("写得像给同事讲清楚这次开发", prompt)
+        self.assertIn("process events", prompt)
 
     def test_completed_pair_with_current_failed_artifact_is_quarantined(self):
         self.insert_ready_task()

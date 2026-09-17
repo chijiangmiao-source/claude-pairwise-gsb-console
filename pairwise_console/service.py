@@ -1005,6 +1005,89 @@ class PairwiseService:
         return current
 
     @staticmethod
+    def _trace_value_text(value: Any, limit: int = 700) -> str:
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                elif not isinstance(item, dict):
+                    parts.append(str(item))
+            text = " ".join(parts)
+        elif isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            text = str(value or "")
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) <= limit:
+            return text
+        head = max(120, limit // 3)
+        return text[:head] + " … " + text[-(limit - head - 3):]
+
+    def _trace_action_evidence(self, arm: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract visible actions/results without exposing assistant reasoning."""
+        trace_root = Path(str(arm.get("trace_path") or ""))
+        if not trace_root.is_dir():
+            return {"available": False, "events": []}
+        files = sorted(trace_root.rglob("*.jsonl"))
+        if len(files) != 1:
+            return {"available": False, "events": [], "error": "轨迹文件数量不是 1"}
+        events: List[Dict[str, Any]] = []
+        try:
+            lines = files[0].read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            return {"available": False, "events": [], "error": redact(str(exc))}
+        for step, line in enumerate(lines, 1):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            message = row.get("message") if isinstance(row.get("message"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "tool_use":
+                    name = str(item.get("name") or "")
+                    inputs = item.get("input") if isinstance(item.get("input"), dict) else {}
+                    if name == "Bash":
+                        detail = inputs.get("command") or ""
+                    elif name in ("Read", "Write", "Edit"):
+                        detail = inputs.get("file_path") or inputs.get("path") or ""
+                    elif name in ("Glob", "Grep"):
+                        detail = "%s %s" % (inputs.get("pattern") or "", inputs.get("path") or "")
+                    else:
+                        detail = inputs
+                    events.append({
+                        "step": step, "kind": "tool", "tool": name,
+                        "detail": self._trace_value_text(detail, 600),
+                    })
+                elif item.get("type") == "tool_result":
+                    result_text = self._trace_value_text(item.get("content"), 800)
+                    if result_text:
+                        events.append({
+                            "step": step, "kind": "tool_result",
+                            "isError": bool(item.get("is_error")), "detail": result_text,
+                        })
+        omitted = max(0, len(events) - 200)
+        if omitted:
+            events = events[:60] + events[-140:]
+        return {
+            "available": True, "traceFile": files[0].name,
+            "events": events, "omittedEvents": omitted,
+            "stepRule": "step 是 JSONL 中真实记录号，公开评价引用第几步时必须使用该值",
+        }
+
+    def _bug_evidence(self, pair_id: str, arm: str) -> List[Dict[str, Any]]:
+        return self.db.all(
+            """SELECT title,preconditions,reproduction_steps_json,reproduction_commands_json,
+                      reproduction_results_json,actual_result,expected_result,reproduce_count,
+                      difficulty,status,error
+                 FROM bug_candidates WHERE source_pair_id=? AND source_arm=? ORDER BY created_at""",
+            (pair_id, arm),
+        )
+
+    @staticmethod
     def _clean_gsb_part(value: Any, limit: int) -> str:
         return re.sub(r"[`\r\n]+", " ", str(value or "")).strip()[:limit]
 
@@ -1054,12 +1137,15 @@ class PairwiseService:
                 "development": by_arm.get(arm, {}),
                 "docker": check_by_arm.get(arm, {}),
                 "recording": rec_by_arm.get(arm, {}),
+                "traceEvidence": self._trace_action_evidence(by_arm.get(arm, {})),
+                "discoveredBugs": self._bug_evidence(pair_id, arm),
             }
         evidence["processEvents"] = self._current_process_events(pair_id)
         review_prompt = gsb_prompt(
             task.get("prompt", ""),
             json.dumps(evidence["A"], ensure_ascii=False),
             json.dumps(evidence["B"], ensure_ascii=False),
+            json.dumps(evidence["processEvents"], ensure_ascii=False),
         )
         result = self.codex.run(
             "gsb_review",
@@ -1150,14 +1236,18 @@ class PairwiseService:
     def _gsb_evidence_bundle(self, pair_id: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        arms = self.db.all(
+            """SELECT arm,model,image_id,status,session_id,prompt_id,trace_path,commit_sha,result,
+               warning_at,error,prompt_sent_at,finished_at FROM arm_runs WHERE pair_id=? ORDER BY arm""",
+            (pair_id,),
+        )
+        for arm in arms:
+            arm["traceEvidence"] = self._trace_action_evidence(arm)
+            arm["discoveredBugs"] = self._bug_evidence(pair_id, str(arm.get("arm") or ""))
         return {
             "pair": {key: pair.get(key) for key in ("id", "task_id", "chain_id", "baseline_sha")},
             "task": {key: task.get(key) for key in ("title", "task_type", "difficulty", "prompt", "acceptance_json")},
-            "arms": self.db.all(
-                """SELECT arm,model,image_id,status,session_id,prompt_id,trace_path,commit_sha,result,
-                   warning_at,error,prompt_sent_at,finished_at FROM arm_runs WHERE pair_id=? ORDER BY arm""",
-                (pair_id,),
-            ),
+            "arms": arms,
             "checks": self.db.all(
                 """SELECT arm,commit_sha,status,checks_json,error,started_at,finished_at
                    FROM artifact_checks WHERE pair_id=? ORDER BY arm""",
