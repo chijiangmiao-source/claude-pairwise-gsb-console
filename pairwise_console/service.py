@@ -156,6 +156,7 @@ class PairwiseService:
             "git": self.git.preflight(),
             "codex": self.codex.preflight(),
             "claude": self.claude.preflight(),
+            "browserRecording": self.recordings.preflight(),
             "oldDb": {"ok": self.config.old_db_path.exists(), "path": str(self.config.old_db_path)},
         }
 
@@ -557,9 +558,7 @@ class PairwiseService:
         return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
 
     def start_recording(self, pair_id: str, arm: str, x: int = 0, y: int = 0) -> Dict[str, Any]:
-        pair = self._pair(pair_id)
-        if pair["stage"] not in ("recording", "gsb_ready"):
-            raise ValueError("Pair 尚未通过 Docker 产物验收")
+        self._pair(pair_id)
         return self.recordings.start(pair_id, arm, x, y)
 
     def stop_recording(self, pair_id: str, arm: str) -> Dict[str, Any]:
@@ -831,6 +830,9 @@ class PairwiseService:
         pair["arms"] = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
         pair["checks"] = self.db.all("SELECT * FROM artifact_checks WHERE pair_id=? ORDER BY arm", (pair_id,))
         pair["recordings"] = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair_id,))
+        pair["recording_attempts"] = self.db.all(
+            "SELECT * FROM recording_attempts WHERE pair_id=? ORDER BY created_at DESC", (pair_id,)
+        )
         pair["gsb"] = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,))
         pair["gsb_rechecks"] = self.db.all("SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC", (pair_id,))
         pair["delivery"] = self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,))

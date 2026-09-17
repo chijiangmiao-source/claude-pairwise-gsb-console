@@ -351,10 +351,14 @@ class Handler(BaseHTTPRequestHandler):
           a.branch,a.commit_sha,c.id check_id,c.status artifact_status,c.checks_json,c.error artifact_error,
           c.started_at check_started_at,c.finished_at check_finished_at,r.id recording_id,r.status recording_status,
           r.path,r.sha256,r.width,r.height,r.duration_seconds,r.commit_sha recording_commit_sha,
-          r.commit_match,r.error recording_error,r.updated_at"""
+          r.commit_match,r.error recording_error,r.capture_mode,r.entry_url,r.updated_at,
+          latest.id latest_attempt_id,latest.status latest_attempt_status,latest.error latest_attempt_error,
+          latest.entry_url latest_attempt_url,latest.created_at latest_attempt_at"""
         from_sql = """FROM arm_runs a JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
           LEFT JOIN artifact_checks c ON c.pair_id=a.pair_id AND c.arm=a.arm AND c.commit_sha=a.commit_sha
-          LEFT JOIN recordings r ON r.pair_id=a.pair_id AND r.arm=a.arm"""
+          LEFT JOIN recordings r ON r.pair_id=a.pair_id AND r.arm=a.arm
+          LEFT JOIN recording_attempts latest ON latest.id=(SELECT id FROM recording_attempts x
+            WHERE x.pair_id=a.pair_id AND x.arm=a.arm ORDER BY x.created_at DESC LIMIT 1)"""
         return self._joined_page(select, from_sql, clauses, params, "p.updated_at DESC,p.id,a.arm", query)
 
     def _reviews_page(self, query: Dict[str, list]) -> Dict[str, Any]:

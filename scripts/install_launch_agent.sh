@@ -9,8 +9,11 @@ mkdir -p "$(dirname "$PLIST")" "$LOG_DIR" "$APP_ROOT"
 # LaunchAgents cannot reliably traverse a user Documents folder when macOS
 # privacy controls are enabled. Install an isolated runtime copy under Library.
 /usr/bin/rsync -a --delete \
-  --exclude '.git' --exclude '.data' --exclude 'projects' --exclude '__pycache__' \
+  --exclude '.git' --exclude '.data' --exclude 'projects' --exclude '__pycache__' --exclude 'node_modules' \
   "$ROOT/" "$APP_ROOT/"
+cd "$APP_ROOT"
+npm ci --omit=dev
+npx playwright install ffmpeg
 chmod +x "$APP_ROOT/scripts/start.sh"
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

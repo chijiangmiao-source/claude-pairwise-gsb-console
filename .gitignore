@@ -4,4 +4,4 @@ __pycache__/
 .DS_Store
 projects/
 dist/
-
+node_modules/

@@ -1,0 +1,16 @@
+{
+  "name": "claude-pairwise-gsb-console",
+  "version": "1.0.0",
+  "description": "这是与旧 Claude Eval Console 完全分离的新系统。每个 Pair 从同一个 `main` 提交创建大写 `A`、`B` 分支，用两个独立目录、容器、Terminal 和 Session 并行开发；完成后分别做 Docker Compose 清洁验收、720p 真实操作录像和 GSB 人工确认。",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --check scripts/browser_recorder.mjs && node --check web/app.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}

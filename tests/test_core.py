@@ -86,13 +86,42 @@ class CoreTests(unittest.TestCase):
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
-        self.assertTrue({"commit_sha", "commit_match", "steps_json", "direct_url"} <= recording_columns)
+        self.assertTrue({"commit_sha", "commit_match", "steps_json", "direct_url", "attempt_id", "capture_mode", "entry_url"} <= recording_columns)
         gsb_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_reviews)")}
         self.assertTrue({"draft_verdict", "final_verdict", "evidence_version"} <= gsb_columns)
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='gsb_rechecks'"))
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_submissions'"))
+        self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='recording_attempts'"))
         self.assertEqual(self.db.setting("gsb_recheck_model"), "gpt-6-astra")
         self.assertEqual(self.db.setting("gsb_recheck_effort"), "high")
+
+    def test_browser_recording_attempt_is_promoted_only_after_it_passes(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            sha = (arm.lower() * 40)[:40]
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-browser-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            attempt_id = "attempt-browser-" + arm
+            self.db.execute(
+                """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,capture_mode,entry_url,
+                   width,height,duration_seconds,sha256,status,started_at,finished_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'browser','http://127.0.0.1:9000',1280,720,30,?,'passed',?,?,?,?)""",
+                (attempt_id, pair["id"], arm, sha, str(self.root / (arm + ".webm")), arm * 64,
+                 stamp, stamp, stamp, stamp),
+            )
+            self.service.recordings._promote(attempt_id)
+        rows = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair["id"],))
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["status"] == "passed" and row["capture_mode"] == "browser" for row in rows))
+        updated = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(updated["stage"], "gsb_ready")
 
     def test_delivery_preflight_allows_style_suggestion_but_blocks_fact_conflict(self):
         self.insert_ready_task()

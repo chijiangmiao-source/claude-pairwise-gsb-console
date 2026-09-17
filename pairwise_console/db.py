@@ -67,9 +67,22 @@ class Database:
                 ("upload_status", "TEXT NOT NULL DEFAULT 'local'"),
                 ("direct_url", "TEXT NOT NULL DEFAULT ''"),
                 ("commit_match", "INTEGER NOT NULL DEFAULT 0"),
+                ("attempt_id", "TEXT NOT NULL DEFAULT ''"),
+                ("capture_mode", "TEXT NOT NULL DEFAULT 'browser'"),
+                ("entry_url", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in recording_columns:
                     c.execute("ALTER TABLE recordings ADD COLUMN %s %s" % (name, definition))
+            c.execute("UPDATE recordings SET capture_mode='screen' WHERE attempt_id='' AND path LIKE '%.mov'")
+            c.execute(
+                """INSERT OR IGNORE INTO recording_attempts(
+                     id,pair_id,arm,commit_sha,path,capture_mode,entry_url,width,height,duration_seconds,
+                     sha256,status,error,started_at,finished_at,created_at,updated_at)
+                   SELECT CASE WHEN attempt_id<>'' THEN attempt_id ELSE 'legacy-'||id END,
+                     pair_id,arm,commit_sha,path,COALESCE(NULLIF(capture_mode,''),'screen'),entry_url,
+                     width,height,duration_seconds,sha256,status,error,started_at,finished_at,created_at,updated_at
+                   FROM recordings WHERE path<>''"""
+            )
             gsb_columns = {row[1] for row in c.execute("PRAGMA table_info(gsb_reviews)")}
             for name, definition in (
                 ("draft_verdict", "TEXT NOT NULL DEFAULT ''"),
@@ -348,12 +361,38 @@ CREATE TABLE IF NOT EXISTS recordings (
   upload_status TEXT NOT NULL DEFAULT 'local',
   direct_url TEXT NOT NULL DEFAULT '',
   commit_match INTEGER NOT NULL DEFAULT 0,
+  attempt_id TEXT NOT NULL DEFAULT '',
+  capture_mode TEXT NOT NULL DEFAULT 'browser',
+  entry_url TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'queued',
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(pair_id,arm)
 );
+CREATE TABLE IF NOT EXISTS recording_attempts (
+  id TEXT PRIMARY KEY,
+  pair_id TEXT NOT NULL REFERENCES pairs(id),
+  arm TEXT NOT NULL CHECK(arm IN ('A','B')),
+  commit_sha TEXT NOT NULL,
+  path TEXT NOT NULL,
+  capture_mode TEXT NOT NULL DEFAULT 'browser',
+  entry_url TEXT NOT NULL DEFAULT '',
+  runtime_port INTEGER NOT NULL DEFAULT 0,
+  runtime_project TEXT NOT NULL DEFAULT '',
+  compose_file TEXT NOT NULL DEFAULT '',
+  width INTEGER NOT NULL DEFAULT 0,
+  height INTEGER NOT NULL DEFAULT 0,
+  duration_seconds REAL NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'starting',
+  error TEXT NOT NULL DEFAULT '',
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recording_attempts_pair_arm ON recording_attempts(pair_id,arm,created_at DESC);
 CREATE TABLE IF NOT EXISTS gsb_reviews (
   id TEXT PRIMARY KEY,
   pair_id TEXT NOT NULL UNIQUE REFERENCES pairs(id),
