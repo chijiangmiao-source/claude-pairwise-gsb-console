@@ -730,6 +730,30 @@ class CoreTests(unittest.TestCase):
             attempt = self.service.start_recording(pair["id"], "A", manual=True)
         self.assertEqual(attempt["interaction_mode"], "manual")
 
+    def test_invalidating_current_recording_preserves_attempt_history(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO recording_attempts(id,pair_id,arm,commit_sha,path,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'passed',?,?)""",
+            ("attempt-old", pair["id"], "A", "a" * 40, str(self.root / "old.mp4"), stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO recordings(id,pair_id,arm,path,commit_sha,attempt_id,commit_match,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,1,'passed',?,?)""",
+            ("recording-old", pair["id"], "A", str(self.root / "old.mp4"),
+             "a" * 40, "attempt-old", stamp, stamp),
+        )
+
+        self.assertEqual(self.service._invalidate_recordings(pair["id"], ["A"], "Arm 已重新开发"), 1)
+        self.assertIsNone(self.db.one("SELECT id FROM recordings WHERE pair_id=?", (pair["id"],)))
+        self.assertIsNotNone(self.db.one("SELECT id FROM recording_attempts WHERE id='attempt-old'"))
+        event = self.db.one(
+            "SELECT event_type FROM audit_events WHERE entity_id=? ORDER BY id DESC LIMIT 1", (pair["id"],),
+        )
+        self.assertEqual(event["event_type"], "recording.current_invalidated")
+
     def test_failed_artifact_cannot_start_delivery_recording(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

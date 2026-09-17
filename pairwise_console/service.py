@@ -156,7 +156,28 @@ class PairwiseService:
                            updated_at=? WHERE id=?""",
                         (stamp, row["chain_id"]),
                     )
+            self._invalidate_recordings(row["id"], reason=error)
             self.db.audit("artifact.invalid_delivery_quarantined", "pair", row["id"], {"error": error})
+
+    def _invalidate_recordings(self, pair_id: str, arms=None, reason: str = "") -> int:
+        """Remove current-delivery pointers while preserving attempt history and files."""
+        selected = [str(arm) for arm in (arms or []) if str(arm) in ("A", "B")]
+        where = "pair_id=?"
+        params = [pair_id]
+        if selected:
+            where += " AND arm IN (%s)" % ",".join("?" for _ in selected)
+            params.extend(selected)
+        rows = self.db.all("SELECT id,arm,attempt_id FROM recordings WHERE " + where, tuple(params))
+        if not rows:
+            return 0
+        self.db.execute("DELETE FROM recordings WHERE " + where, tuple(params))
+        self.db.audit("recording.current_invalidated", "pair", pair_id, {
+            "arms": [row["arm"] for row in rows],
+            "attemptIds": [row.get("attempt_id", "") for row in rows],
+            "reason": redact(reason)[-1000:],
+            "historyPreserved": True,
+        })
+        return len(rows)
 
     def start_scheduler(self) -> None:
         if self._scheduler_started:
@@ -1797,6 +1818,7 @@ class PairwiseService:
                                    error: str, count_development_failure: bool = True,
                                    count_error_retry: bool = True) -> Dict[str, Any]:
         pair = self._pair(pair_id)
+        self._invalidate_recordings(pair_id, [arm.get("arm")], error)
         restarted = self.claude.archive_failed_attempt(
             arm, error, prepare_retry=True,
             count_development_failure=count_development_failure,
@@ -1839,6 +1861,7 @@ class PairwiseService:
         source_sha = str(arm.get("commit_sha") or "")
         if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
             raise RuntimeError("缺少可复用的 %s 已交付提交" % arm.get("arm", "Arm"))
+        self._invalidate_recordings(pair_id, [arm.get("arm")], error)
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
         canonical = Path(str(repo.get("local_root") or "")) / str(arm["arm"])
         restarted = self.claude.archive_failed_attempt(
@@ -1917,6 +1940,7 @@ class PairwiseService:
                 "UPDATE pairs SET status='failed',stage='task_replacement',error=?,updated_at=? WHERE id=?",
                 (("开发连续 3 次失败，正在自动换题：" + redact(error))[-3000:], stamp, pair_id),
             )
+        self._invalidate_recordings(pair_id, reason="当前 Pair 已连续失败并换题：" + error)
         for other in self.db.all("SELECT * FROM arm_runs WHERE pair_id=? AND id<>?", (pair_id, failed_arm_id)):
             if other["status"] in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
                 try:

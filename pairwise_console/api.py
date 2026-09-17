@@ -421,13 +421,15 @@ class Handler(BaseHTTPRequestHandler):
             clauses.append("(p.id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR a.commit_sha LIKE ?)")
             params += ["%" + q + "%"] * 4
         for key, column in (("arm", "a.arm"), ("task_type", "t.task_type"), ("project_category", "t.project_category"),
-                            ("artifact_status", "c.status"), ("recording_status", "r.status")):
+                            ("artifact_status", "c.status"), ("recording_status", "r.status"),
+                            ("pair_status", "p.status")):
             value = self._query(query, key)
             if value:
                 clauses.append(column + "=?"); params.append(value)
         if self._query(query, "missing") == "1":
             clauses.append("(c.status IS NULL OR c.status<>'passed' OR r.status IS NULL OR r.status<>'passed' OR r.commit_match<>1)")
-        select = """SELECT p.id pair_id,p.chain_id project_number,t.title,t.task_type,t.difficulty,t.project_category,a.arm,
+        select = """SELECT p.id pair_id,p.chain_id project_number,p.status pair_status,p.stage pair_stage,p.error pair_error,
+          t.title,t.task_type,t.difficulty,t.project_category,a.arm,
           a.branch,a.commit_sha,c.id check_id,c.status artifact_status,c.checks_json,c.error artifact_error,
           c.started_at check_started_at,c.finished_at check_finished_at,r.id recording_id,r.status recording_status,
           r.path,r.sha256,r.width,r.height,r.duration_seconds,r.commit_sha recording_commit_sha,
