@@ -8,8 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pairwise_console.commands import run_command
-from pairwise_console.config import load_config
+from pairwise_console.config import OLD_APP_DIR, load_config
 from pairwise_console.db import Database, now_iso
+from pairwise_console.gitops import GitOps
 from pairwise_console.analytics import dashboard
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
@@ -52,6 +53,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("codex_default_effort"), "medium")
         self.assertEqual(self.db.setting("codex_bug_effort"), "high")
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
+
+    def test_user_paths_and_github_credential_helper_are_portable(self):
+        self.assertEqual(OLD_APP_DIR, Path.home() / "Library/Application Support/Claude Eval Console")
+        with patch("pairwise_console.gitops.shutil.which", return_value="/usr/local/bin/gh"), \
+                patch("pairwise_console.gitops.run_command") as command:
+            GitOps._github_git(["ls-remote", "origin"])
+        args = command.call_args.args[0]
+        self.assertIn("credential.helper=!/usr/local/bin/gh auth git-credential", args)
+        self.assertEqual(command.call_args.kwargs["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
 
     def test_pair_requires_ready_hard_task_and_creates_chain(self):
         self.insert_ready_task()

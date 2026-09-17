@@ -10,7 +10,7 @@ DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CLAUDE_MODEL = "auto_model/urm"
 DEFAULT_CLAUDE_IMAGE = "claude-eval-runtime:claude-2.1.269"
 MAX_PAIR_PROJECTS = 3
-OLD_APP_DIR = Path("/Users/studio1/Library/Application Support/Claude Eval Console")
+OLD_APP_DIR = Path.home() / "Library/Application Support/Claude Eval Console"
 
 
 def _read_old_deployment() -> Dict[str, Any]:

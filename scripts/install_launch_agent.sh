@@ -4,8 +4,44 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LABEL="com.local.claude-pairwise-gsb-console"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/Claude A-B GSB Console"
-APP_ROOT="$HOME/Library/Application Support/Claude A-B GSB Console/app"
-mkdir -p "$(dirname "$PLIST")" "$LOG_DIR" "$APP_ROOT"
+APP_HOME="$HOME/Library/Application Support/Claude A-B GSB Console"
+APP_ROOT="$APP_HOME/app"
+CONFIG_FILE="$APP_HOME/config.env"
+DATA_DIR="$APP_HOME/.data"
+mkdir -p "$(dirname "$PLIST")" "$LOG_DIR" "$APP_ROOT" "$DATA_DIR/backups"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  github_owner="$(gh api user --jq .login 2>/dev/null || true)"
+  github_id="$(gh api user --jq .id 2>/dev/null || true)"
+  git_author_email=""
+  if [[ -n "$github_owner" && -n "$github_id" ]]; then
+    git_author_email="${github_id}+${github_owner}@users.noreply.github.com"
+  fi
+  {
+    printf "PAIRWISE_GITHUB_OWNER='%s'\n" "$github_owner"
+    printf "PAIRWISE_GIT_AUTHOR_NAME='%s'\n" "刘昱"
+    printf "PAIRWISE_GIT_AUTHOR_EMAIL='%s'\n" "$git_author_email"
+    printf "PAIRWISE_GITHUB_VISIBILITY='%s'\n" "private"
+    printf "PAIRWISE_CLAUDE_IMAGE='%s'\n" "claude-eval-runtime:claude-2.1.269"
+    printf "PAIRWISE_MAX_PARALLEL='%s'\n" "3"
+    printf "PAIRWISE_TASK_GENERATION_PARALLEL='%s'\n" "6"
+  } > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  echo "Created $CONFIG_FILE"
+fi
+PAIRWISE_CONFIG_FILE="$CONFIG_FILE" "$ROOT/scripts/preflight.sh"
+if [[ -f "$DATA_DIR/pairwise.db" ]]; then
+  backup="$DATA_DIR/backups/pairwise-before-upgrade-$(date +%Y%m%d-%H%M%S).db"
+  /usr/bin/python3 - "$DATA_DIR/pairwise.db" "$backup" <<'PY'
+import sqlite3, sys
+source = sqlite3.connect(sys.argv[1])
+target = sqlite3.connect(sys.argv[2])
+with target:
+    source.backup(target)
+source.close()
+target.close()
+PY
+  echo "Database backup: $backup"
+fi
 # LaunchAgents cannot reliably traverse a user Documents folder when macOS
 # privacy controls are enabled. Install an isolated runtime copy under Library.
 /usr/bin/rsync -a --delete \

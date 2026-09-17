@@ -2,6 +2,11 @@
 
 这是与旧 Claude Eval Console 完全分离的新系统。每个 Pair 从同一个 `main` 提交创建大写 `A`、`B` 分支，用两个独立目录、容器、Terminal 和 Session 并行开发；完成后分别做 Docker Compose 清洁验收、720p 真实操作录像和 GSB 评价。每个 Pair 占用两个终端，因此开发并发硬上限为 3 个 Pair。
 
+完整文档：
+
+- [需求说明](docs/REQUIREMENTS.md)
+- [部署与迁移说明](docs/DEPLOYMENT.md)
+
 模型职责固定如下：
 
 - A/B 开发：Claude 容器，默认模型 `auto_model/urm`，镜像从旧系统部署配置读取。
@@ -18,6 +23,13 @@
 
 ## 启动
 
+首次部署先运行依赖预检：
+
+```bash
+chmod +x scripts/*.sh
+./scripts/preflight.sh
+```
+
 ```bash
 ./scripts/start.sh
 ```
@@ -29,6 +41,8 @@
 ```bash
 ./scripts/install_launch_agent.sh
 ```
+
+安装脚本会创建并保留用户配置 `~/Library/Application Support/Claude A-B GSB Console/config.env`，且每次升级前自动备份 SQLite。其他电脑的从零安装、Docker 镜像迁移、Chrome 小助手、升级和回滚步骤见[部署与迁移说明](docs/DEPLOYMENT.md)。
 
 ## SOLO-QA 提交小助手
 
@@ -53,6 +67,7 @@
 
 ```bash
 python3 -m unittest discover -s tests -v
-node --check web/app.js
+npm test
 python3 -m py_compile pairwise_console/*.py
+./scripts/preflight.sh
 ```

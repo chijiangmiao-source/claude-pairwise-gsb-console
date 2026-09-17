@@ -475,7 +475,7 @@ class PairwiseService:
     def discover_bugs(self, pair_id: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)
         if pair["status"] != "completed":
-            raise ValueError("只有 GSB 已人工确认的 Pair 才能进入后续 Bug 搜索")
+            raise ValueError("只有 GSB 已确认的 Pair 才能进入后续 Bug 搜索")
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         selected = "B" if pair["winner"] == "B better" else "A"
         arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (pair_id, selected))
@@ -866,7 +866,7 @@ class PairwiseService:
             if not int(rec.get("commit_match") or 0): blockers.append(arm + " 录像与最终提交不匹配")
             if rec.get("review_status") != "confirmed": blockers.append(arm + " 录像尚未审核通过")
         review = detail.get("gsb") or {}
-        if review.get("status") != "confirmed": blockers.append("GSB 尚未人工确认")
+        if review.get("status") != "confirmed": blockers.append("GSB 尚未确认")
         verdict, reason = str(review.get("verdict") or ""), str(review.get("reason") or "")
         version = self.gsb_evidence_version(pair_id, verdict, reason) if review else ""
         latest = self.db.one("SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC LIMIT 1", (pair_id,))

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import uuid
 from pathlib import Path
@@ -61,11 +62,14 @@ class GitOps:
         rule. Background jobs must still use gh's credential helper against
         GitHub itself, without changing the user's global Git configuration.
         """
+        gh = shutil.which("gh")
+        if not gh:
+            raise RuntimeError("找不到 gh CLI，无法为 GitHub 网络操作提供凭据")
         env = os.environ.copy()
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         command = [
             "git", "-c", "credential.helper=",
-            "-c", "credential.helper=!/opt/homebrew/bin/gh auth git-credential",
+            "-c", "credential.helper=!%s auth git-credential" % shlex.quote(gh),
         ] + list(args)
         return run_command(command, cwd=cwd, timeout=timeout, check=check, env=env)
 
