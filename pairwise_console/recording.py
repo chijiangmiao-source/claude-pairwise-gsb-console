@@ -159,7 +159,13 @@ class RecordingManager:
             self._launch_failure_evidence(attempt_id, workspace, path, check)
             return
         env, assigned_ports = isolated_compose_environment(compose)
-        port = int(assigned_ports.get("API_PORT") or next(iter(assigned_ports.values())))
+        port = int(
+            assigned_ports.get("WEB_PORT")
+            or assigned_ports.get("HTTP_PORT")
+            or assigned_ports.get("APP_PORT")
+            or assigned_ports.get("API_PORT")
+            or next(iter(assigned_ports.values()))
+        )
         base = ["docker", "compose", "-p", project, "-f", str(compose)]
         try:
             run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=env)
@@ -354,6 +360,8 @@ h2{font-size:21px;margin:0 0 12px}pre{white-space:pre-wrap;word-break:break-word
             for line in result.stdout.splitlines():
                 try: rows.append(json.loads(line))
                 except ValueError: pass
+        preferred = {"web": 0, "frontend": 1, "ui": 2, "client": 3}
+        rows.sort(key=lambda row: preferred.get(str(row.get("Service") or "").casefold(), 100))
         for row in rows:
             for item in row.get("Publishers") or []:
                 value = int(item.get("PublishedPort") or 0)

@@ -462,28 +462,24 @@ class PairwiseService:
     def _resume_one_reusable_pair_locked(self) -> bool:
         """Prefer finished code over consuming another task-pool entry.
 
-        A recording or artifact failure does not erase either Git commit or
-        trace. Reopen one such Pair when capacity is available; recordings get
-        a fresh three-attempt window, while real artifact defects start a
-        targeted repair from the delivered commit.
+        An artifact failure does not erase either Git commit or trace, so it
+        can start a targeted repair from the delivered commit.  A recording
+        failure is deliberately excluded: after three failed automatic
+        attempts it must remain stopped until an operator starts a manual
+        re-recording.  Reopening it here would create endless three-attempt
+        retry windows.
         """
         row = self.db.one(
             """SELECT p.id,p.chain_id,p.stage FROM pairs p
-               WHERE p.status='failed' AND p.stage IN ('recording_failed','artifact_failed')
+               WHERE p.status='failed' AND p.stage='artifact_failed'
                  AND (SELECT COUNT(*) FROM arm_runs a
                       WHERE a.pair_id=p.id AND a.status='completed' AND a.commit_sha<>'')=2
-                 AND (p.stage='artifact_failed' OR
-                      (SELECT COUNT(*) FROM artifact_checks c
-                       JOIN arm_runs a ON a.pair_id=c.pair_id AND a.arm=c.arm
-                                      AND a.commit_sha=c.commit_sha
-                       WHERE c.pair_id=p.id AND c.status='passed')=2)
-               ORDER BY CASE p.stage WHEN 'recording_failed' THEN 0 ELSE 1 END,
-                        p.updated_at,p.created_at LIMIT 1"""
+               ORDER BY p.updated_at,p.created_at LIMIT 1"""
         )
         if not row:
             return False
         stamp = now_iso()
-        next_stage = "recording" if row["stage"] == "recording_failed" else "artifact_validation"
+        next_stage = "artifact_validation"
         with self.db.transaction() as conn:
             conn.execute(
                 """UPDATE pairs SET status='running',stage=?,error='',
@@ -500,16 +496,10 @@ class PairwiseService:
                        completed_at=NULL,updated_at=? WHERE id=?""",
                     (stamp, row["chain_id"]),
                 )
-        if next_stage == "recording":
-            self.db.audit("recording.retry_window_started", "pair", row["id"], {
-                "reason": "reuse_existing_commits_after_recorder_update",
-                "preserved": ["A_commit", "B_commit", "traces", "artifact_checks"],
-            })
-        else:
-            self.db.audit("artifact.revalidation_started", "pair", row["id"], {
-                "reason": "reuse_existing_commits_before_targeted_repair",
-                "preserved": ["A_commit", "B_commit", "traces"],
-            })
+        self.db.audit("artifact.revalidation_started", "pair", row["id"], {
+            "reason": "reuse_existing_commits_before_targeted_repair",
+            "preserved": ["A_commit", "B_commit", "traces"],
+        })
         return True
 
     def _schedule_refill_once(self) -> None:

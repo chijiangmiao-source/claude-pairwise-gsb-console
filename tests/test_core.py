@@ -951,7 +951,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([arm["status"] for arm in arms], ["completed", "completed"])
         self.assertEqual([arm["commit_sha"] for arm in arms], ["a" * 40, "b" * 40])
 
-    def test_recording_failure_pair_reopens_without_redeveloping(self):
+    def test_recording_failure_waits_for_manual_rerecording(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -972,16 +972,21 @@ class CoreTests(unittest.TestCase):
             "UPDATE pairs SET status='failed',stage='recording_failed',error='old failure' WHERE id=?",
             (pair["id"],),
         )
-        self.assertTrue(self.service._resume_one_reusable_pair())
+        self.assertFalse(self.service._resume_one_reusable_pair())
         current = self.db.one("SELECT status,stage,error FROM pairs WHERE id=?", (pair["id"],))
-        self.assertEqual(current, {"status": "running", "stage": "recording", "error": ""})
+        self.assertEqual(current, {"status": "failed", "stage": "recording_failed", "error": "old failure"})
         arms = self.db.all("SELECT status,commit_sha FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair["id"],))
         self.assertEqual([arm["status"] for arm in arms], ["completed", "completed"])
         self.assertEqual([arm["commit_sha"] for arm in arms], ["a" * 40, "b" * 40])
-        event = self.db.one(
-            "SELECT event_type FROM audit_events WHERE entity_id=? ORDER BY id DESC LIMIT 1", (pair["id"],),
-        )
-        self.assertEqual(event["event_type"], "recording.retry_window_started")
+
+    def test_recording_prefers_frontend_published_port(self):
+        compose_ps = json.dumps([
+            {"Service": "api", "Publishers": [{"PublishedPort": 51001}]},
+            {"Service": "web", "Publishers": [{"PublishedPort": 51002}]},
+        ])
+        with patch("pairwise_console.recording.run_command", return_value=MagicMock(stdout=compose_ps)):
+            port = RecordingManager._published_port(["docker", "compose"], self.root, {})
+        self.assertEqual(port, 51002)
 
     def test_artifact_failure_pair_reopens_for_commit_based_repair(self):
         self.insert_ready_task()
