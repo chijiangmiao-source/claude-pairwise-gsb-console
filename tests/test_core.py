@@ -878,6 +878,35 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(event["event_type"], "artifact.revalidation_started")
 
+    def test_reusable_pair_waits_when_all_pair_slots_are_occupied(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-capacity-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image",
+                 arm.lower() * 40, stamp, stamp),
+            )
+        self.db.execute(
+            "UPDATE pairs SET status='failed',stage='artifact_failed',error='missing Dockerfile' WHERE id=?",
+            (pair["id"],),
+        )
+        for index in range(3):
+            self.db.execute(
+                """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
+                   VALUES(?,?,?,'running','development',?,?)""",
+                ("pair-active-%d" % index, "task-1", pair["chain_id"], stamp, stamp),
+            )
+
+        self.assertFalse(self.service._resume_one_reusable_pair())
+        current = self.db.one("SELECT status,stage,error FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {
+            "status": "failed", "stage": "artifact_failed", "error": "missing Dockerfile",
+        })
+
     def test_completed_trace_prompt_mismatch_restarts_only_invalid_arm(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

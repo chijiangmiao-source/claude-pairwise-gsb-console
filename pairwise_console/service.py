@@ -419,6 +419,20 @@ class PairwiseService:
                 return
 
     def _resume_one_reusable_pair(self) -> bool:
+        # Reopening a preserved delivery consumes the same Pair slot as
+        # creating a new Pair. Serialize both paths so the scheduler and the
+        # replacement worker cannot claim the last free slot together.
+        with self._pair_creation_lock:
+            active_count = (self.db.one(
+                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
+            ) or {"count": 0})["count"]
+            configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
+            pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
+            if active_count >= pair_limit:
+                return False
+            return self._resume_one_reusable_pair_locked()
+
+    def _resume_one_reusable_pair_locked(self) -> bool:
         """Prefer finished code over consuming another task-pool entry.
 
         A recording or artifact failure does not erase either Git commit or
