@@ -7,7 +7,10 @@
 - A/B 开发：Claude 容器，默认模型 `auto_model/urm`，镜像从旧系统部署配置读取。
 - 找 Bug、根因分析与复现复核：Codex CLI，默认 `gpt-5.6-sol`，推理强度 `high`。
 - 出题、难度、禁题与查重、基线检查、产物差异、GSB 和下一步判断：Codex CLI，默认 `gpt-5.6-sol`，推理强度 `medium`。
+- GSB 公开理由复检：Codex CLI，默认 `gpt-6-astra`，推理强度 `high`；事实冲突会阻止提交，普通措辞建议保留给人工决定。
 - Git、Docker、SQLite、轨迹导出和录像由系统代码执行，不把实际操作结果交给模型虚构。
+
+页面中的“验收与录像”把 A/B Docker 验收和 720p 操作录像合并展示，可直接播放并核对录像提交与最终提交是否一致。“复核与人工确认”支持检索、分页、模型复检、应用建议及人工确认。“导出轮次”支持资料筛选、提交前检查、批量复检、Excel 复核副本、隐藏/恢复和提交状态登记。三个页面的筛选、页码和每页条数会保存在 URL 中。
 
 ## 启动
 
@@ -39,4 +42,3 @@ python3 -m unittest discover -s tests -v
 node --check web/app.js
 python3 -m py_compile pairwise_console/*.py
 ```
-

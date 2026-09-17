@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def now_iso() -> str:
@@ -58,8 +58,51 @@ class Database:
             ):
                 if name not in bug_columns:
                     c.execute("ALTER TABLE bug_candidates ADD COLUMN %s %s" % (name, definition))
+            recording_columns = {row[1] for row in c.execute("PRAGMA table_info(recordings)")}
+            for name, definition in (
+                ("commit_sha", "TEXT NOT NULL DEFAULT ''"),
+                ("started_at", "TEXT"),
+                ("finished_at", "TEXT"),
+                ("steps_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("upload_status", "TEXT NOT NULL DEFAULT 'local'"),
+                ("direct_url", "TEXT NOT NULL DEFAULT ''"),
+                ("commit_match", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in recording_columns:
+                    c.execute("ALTER TABLE recordings ADD COLUMN %s %s" % (name, definition))
+            gsb_columns = {row[1] for row in c.execute("PRAGMA table_info(gsb_reviews)")}
+            for name, definition in (
+                ("draft_verdict", "TEXT NOT NULL DEFAULT ''"),
+                ("draft_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("final_verdict", "TEXT NOT NULL DEFAULT ''"),
+                ("final_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("evidence_version", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in gsb_columns:
+                    c.execute("ALTER TABLE gsb_reviews ADD COLUMN %s %s" % (name, definition))
             c.execute(
-                "INSERT OR IGNORE INTO metadata(key,value) VALUES('schema_version',?)",
+                """UPDATE gsb_reviews SET
+                     draft_verdict=CASE WHEN draft_verdict='' THEN verdict ELSE draft_verdict END,
+                     draft_reason=CASE WHEN draft_reason='' THEN reason ELSE draft_reason END,
+                     final_verdict=CASE WHEN status='confirmed' AND final_verdict='' THEN verdict ELSE final_verdict END,
+                     final_reason=CASE WHEN status='confirmed' AND final_reason='' THEN reason ELSE final_reason END"""
+            )
+            c.execute(
+                """UPDATE recordings SET commit_sha=COALESCE((
+                     SELECT commit_sha FROM arm_runs a
+                      WHERE a.pair_id=recordings.pair_id AND a.arm=recordings.arm
+                   ),'') WHERE commit_sha=''"""
+            )
+            c.execute(
+                """UPDATE recordings SET commit_match=CASE WHEN EXISTS(
+                     SELECT 1 FROM arm_runs a WHERE a.pair_id=recordings.pair_id
+                      AND a.arm=recordings.arm AND a.commit_sha<>''
+                      AND a.commit_sha=recordings.commit_sha
+                   ) THEN 1 ELSE commit_match END
+                   WHERE commit_sha<>''"""
+            )
+            c.execute(
+                "INSERT INTO metadata(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(SCHEMA_VERSION),),
             )
 
@@ -102,7 +145,8 @@ class Database:
     def page(self, table: str, page: int, size: int, where: str = "1=1", params: Iterable[Any] = (), order: str = "created_at DESC") -> Dict[str, Any]:
         allowed = {
             "tasks", "project_chains", "pairs", "codex_jobs", "bug_candidates",
-            "artifact_checks", "recordings", "gsb_reviews", "audit_events", "git_repositories",
+            "artifact_checks", "recordings", "gsb_reviews", "gsb_rechecks",
+            "delivery_submissions", "audit_events", "git_repositories",
         }
         if table not in allowed:
             raise ValueError("unknown table")
@@ -297,6 +341,13 @@ CREATE TABLE IF NOT EXISTS recordings (
   width INTEGER NOT NULL DEFAULT 0,
   height INTEGER NOT NULL DEFAULT 0,
   duration_seconds REAL NOT NULL DEFAULT 0,
+  commit_sha TEXT NOT NULL DEFAULT '',
+  started_at TEXT,
+  finished_at TEXT,
+  steps_json TEXT NOT NULL DEFAULT '[]',
+  upload_status TEXT NOT NULL DEFAULT 'local',
+  direct_url TEXT NOT NULL DEFAULT '',
+  commit_match INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'queued',
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -309,9 +360,43 @@ CREATE TABLE IF NOT EXISTS gsb_reviews (
   verdict TEXT NOT NULL DEFAULT '',
   reason TEXT NOT NULL DEFAULT '',
   evidence_json TEXT NOT NULL DEFAULT '[]',
+  draft_verdict TEXT NOT NULL DEFAULT '',
+  draft_reason TEXT NOT NULL DEFAULT '',
+  final_verdict TEXT NOT NULL DEFAULT '',
+  final_reason TEXT NOT NULL DEFAULT '',
+  evidence_version TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'draft',
   confirmed_by TEXT NOT NULL DEFAULT '',
   confirmed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gsb_rechecks (
+  id TEXT PRIMARY KEY,
+  pair_id TEXT NOT NULL REFERENCES pairs(id),
+  evidence_version TEXT NOT NULL,
+  input_verdict TEXT NOT NULL,
+  input_reason TEXT NOT NULL,
+  result_status TEXT NOT NULL CHECK(result_status IN ('passed','suggested_revision','fact_conflict')),
+  suggested_verdict TEXT NOT NULL DEFAULT '',
+  suggested_reason TEXT NOT NULL DEFAULT '',
+  issues_json TEXT NOT NULL DEFAULT '[]',
+  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+  model TEXT NOT NULL,
+  reasoning_effort TEXT NOT NULL,
+  codex_job_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gsb_rechecks_pair ON gsb_rechecks(pair_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS delivery_submissions (
+  id TEXT PRIMARY KEY,
+  pair_id TEXT NOT NULL UNIQUE REFERENCES pairs(id),
+  status TEXT NOT NULL DEFAULT 'not_submitted',
+  remote_id TEXT NOT NULL DEFAULT '',
+  remote_url TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  hidden_at TEXT,
+  submitted_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

@@ -41,12 +41,21 @@ class RecordingManager:
         height = int(self.db.setting("recording_height", 720))
         maximum = min(89, int(self.db.setting("recording_max_seconds", 90)) - 2)
         stamp = now_iso()
+        arm_row = self.db.one(
+            "SELECT commit_sha FROM arm_runs WHERE pair_id=? AND arm=?", (pair_id, arm)
+        ) or {}
+        commit_sha = str(arm_row.get("commit_sha") or "")
         if current:
-            self.db.execute("UPDATE recordings SET path=?,status='recording',error='',updated_at=? WHERE id=?", (str(path), stamp, recording_id))
+            self.db.execute(
+                """UPDATE recordings SET path=?,commit_sha=?,started_at=?,finished_at=NULL,
+                   status='recording',error='',commit_match=0,updated_at=? WHERE id=?""",
+                (str(path), commit_sha, stamp, stamp, recording_id),
+            )
         else:
             self.db.execute(
-                "INSERT INTO recordings(id,pair_id,arm,path,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (recording_id, pair_id, arm, str(path), "recording", stamp, stamp),
+                """INSERT INTO recordings(id,pair_id,arm,path,commit_sha,started_at,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,'recording',?,?)""",
+                (recording_id, pair_id, arm, str(path), commit_sha, stamp, stamp, stamp),
             )
         command = [
             "/usr/sbin/screencapture", "-v", "-V%d" % maximum,
@@ -82,9 +91,12 @@ class RecordingManager:
         status = "passed" if process.returncode in (0, 130, -2) and result.get("ok") else "failed"
         error = "" if status == "passed" else (result.get("error") or redact((stderr or b"").decode("utf-8", "ignore")))
         self.db.execute(
-            """UPDATE recordings SET sha256=?,width=?,height=?,duration_seconds=?,status=?,error=?,updated_at=? WHERE id=?""",
+            """UPDATE recordings SET sha256=?,width=?,height=?,duration_seconds=?,status=?,error=?,
+               finished_at=?,commit_match=CASE WHEN commit_sha<>'' AND commit_sha=(
+                 SELECT commit_sha FROM arm_runs a WHERE a.pair_id=recordings.pair_id AND a.arm=recordings.arm
+               ) THEN 1 ELSE 0 END,updated_at=? WHERE id=?""",
             (result.get("sha256", ""), result.get("width", 0), result.get("height", 0),
-             result.get("duration_seconds", 0), status, error, now_iso(), recording_id),
+             result.get("duration_seconds", 0), status, error, now_iso(), now_iso(), recording_id),
         )
         self.db.audit("recording.finished", "recording", recording_id, {"status": status, "error": error})
 

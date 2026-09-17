@@ -73,6 +73,27 @@ B 证据：
 只按 Schema 返回。"""
 
 
+def gsb_recheck_prompt(task: str, verdict: str, reason: str, evidence: str) -> str:
+    return f"""复检一条 A/B 开发任务的公开 GSB 理由。只依据给出的可见证据检查，不修改代码，也不索取内部思维。
+
+重点检查结论与 A/B 事实是否一致，是否把后续独立验收写成开发过程事实，是否遗漏会改变结论的重试、追加提示或未验证范围，是否包含不存在的测试数字、文件、命令或结果。公开理由必须同时说明 A、B，使用单段自然中文，不含反引号、Markdown、JSON 或模型名称，长度不超过 600 个字符。
+
+轻微措辞、顺序或表达精简使用 suggested_revision；只有结论与证据相反、关键事实错误或引用不存在时使用 fact_conflict；事实与表达都可接受时使用 passed。无论状态如何，都返回一份可直接使用的 suggestedVerdict 与 suggestedReason。不要因为未提供内部思维而判错。
+
+任务：
+{task}
+
+当前结论：{verdict}
+
+当前公开理由：
+{reason}
+
+可见证据：
+{evidence}
+
+只按 Schema 返回。"""
+
+
 def bug_discovery_prompt(task: str, arm: str, commit_sha: str, docker_evidence: str) -> str:
     return f"""你负责在已经真实开发并通过 Docker 初步验收的产物中寻找 Bug。当前只做只读代码和证据分析，提出可由系统随后在清洁 Docker 环境中实际复现的候选；不能把静态猜测直接写成已复现事实。
 

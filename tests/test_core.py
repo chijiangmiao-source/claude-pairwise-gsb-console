@@ -2,12 +2,15 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 from pairwise_console.commands import run_command
 from pairwise_console.config import load_config
 from pairwise_console.db import Database, now_iso
+from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
 from pairwise_console.service import PairwiseService
 
@@ -77,6 +80,81 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["stage"], "completed")
         self.assertEqual(result["gsb"]["confirmed_by"], "刘昱")
+        self.assertEqual(result["gsb"]["draft_verdict"], "Same")
+        self.assertEqual(result["gsb"]["final_verdict"], "A better")
+        self.assertEqual(result["delivery"]["status"], "ready_to_submit")
+
+    def test_new_evidence_review_and_delivery_schema_is_available(self):
+        recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
+        self.assertTrue({"commit_sha", "commit_match", "steps_json", "direct_url"} <= recording_columns)
+        gsb_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_reviews)")}
+        self.assertTrue({"draft_verdict", "final_verdict", "evidence_version"} <= gsb_columns)
+        self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='gsb_rechecks'"))
+        self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_submissions'"))
+        self.assertEqual(self.db.setting("gsb_recheck_model"), "gpt-6-astra")
+        self.assertEqual(self.db.setting("gsb_recheck_effort"), "high")
+
+    def test_delivery_preflight_allows_style_suggestion_but_blocks_fact_conflict(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            sha = (arm.lower() * 40)[:40]
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,session_id,prompt_id,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?,?,?)""",
+                ("arm-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm, "screen-" + arm,
+                 "auto_model/urm", "image", "session-" + arm, "prompt-" + arm, sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""",
+                ("check-" + arm, pair["id"], arm, sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO recordings(id,pair_id,arm,path,commit_sha,sha256,width,height,duration_seconds,
+                   commit_match,status,created_at,updated_at) VALUES(?,?,?,?,?,?,1280,720,30,1,'passed',?,?)""",
+                ("rec-" + arm, pair["id"], arm, str(self.root / (arm + ".mov")), sha, arm * 64, stamp, stamp),
+            )
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,draft_verdict,draft_reason,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'draft',?,?)""",
+            ("gsb-complete", pair["id"], "Same", "A 和 B 均完成主要要求，验收结果一致，最终交付没有影响使用的差异。",
+             "Same", "A 和 B 均完成主要要求，验收结果一致，最终交付没有影响使用的差异。", stamp, stamp),
+        )
+        self.service.confirm_gsb(pair["id"], "Same", "A 和 B 均完成主要要求，验收结果一致，最终交付没有影响使用的差异。", "刘昱")
+        check = self.service.delivery_preflight(pair["id"])
+        self.assertTrue(check["eligible"])
+        self.assertTrue(check["warnings"])
+        review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair["id"],))
+        version = self.service.gsb_evidence_version(pair["id"], review["verdict"], review["reason"])
+        self.db.execute(
+            """INSERT INTO gsb_rechecks(id,pair_id,evidence_version,input_verdict,input_reason,result_status,
+               suggested_verdict,suggested_reason,model,reasoning_effort,created_at)
+               VALUES(?,?,?,?,?,'fact_conflict',?,?, 'gpt-6-astra','high',?)""",
+            ("recheck-1", pair["id"], version, review["verdict"], review["reason"], "A better",
+             "A 的验收更完整，B 存在会影响主要流程的问题，因此 A 更好。", stamp),
+        )
+        blocked = self.service.delivery_preflight(pair["id"])
+        self.assertFalse(blocked["eligible"])
+        self.assertIn("模型复检发现公开理由存在事实冲突", blocked["blockers"])
+
+    def test_delivery_xlsx_is_a_valid_workbook(self):
+        payload, filename = build_xlsx([{
+            "project_number": "chain-1", "pair_id": "pair-1", "title": "任务", "task_type": "feature",
+            "difficulty": "困难", "prompt": "实现复杂功能", "main_sha": "1" * 40,
+            "a_session_id": "sa", "a_prompt_id": "pa", "a_commit": "2" * 40,
+            "b_session_id": "sb", "b_prompt_id": "pb", "b_commit": "3" * 40,
+            "verdict": "A better", "reason": "A 的实际交付更完整，B 的主流程存在可复现问题。",
+            "readiness": "ready", "submission_status": "ready_to_submit",
+        }])
+        self.assertTrue(filename.endswith(".xlsx"))
+        with zipfile.ZipFile(BytesIO(payload)) as archive:
+            self.assertIn("xl/worksheets/sheet1.xml", archive.namelist())
+            sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertIn("项目编号", sheet)
+        self.assertIn("pair-1", sheet)
 
     def test_historical_import_excludes_bug_and_medium(self):
         source = sqlite3.connect(str(self.config.old_db_path))

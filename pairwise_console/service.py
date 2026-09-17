@@ -12,12 +12,15 @@ from typing import Any, Dict, List, Optional
 from .analytics import dashboard
 from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
-from .codex_runner import BUG_DISCOVERY_SCHEMA, CodexRunner, GSB_SCHEMA, TASK_SCHEMA
+from .codex_runner import BUG_DISCOVERY_SCHEMA, CodexRunner, GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA
 from .config import Config
 from .db import Database, now_iso
 from .gitops import GitOps
 from .importer import fingerprint, import_historical_tasks
-from .prompts import bug_discovery_prompt, feature_generation_prompt, gsb_prompt, task_generation_prompt, task_validation_prompt
+from .prompts import (
+    bug_discovery_prompt, feature_generation_prompt, gsb_prompt, gsb_recheck_prompt,
+    task_generation_prompt, task_validation_prompt,
+)
 from .recording import RecordingManager
 from .commands import redact, run_command
 
@@ -62,6 +65,8 @@ class PairwiseService:
             "codex_model": self.config.codex_model,
             "codex_default_effort": self.config.codex_default_effort,
             "codex_bug_effort": self.config.codex_bug_effort,
+            "gsb_recheck_model": "gpt-6-astra",
+            "gsb_recheck_effort": "high",
             "claude_model": self.config.claude_model,
             "claude_image": self.config.claude_image,
             "max_pairs_parallel": self.config.max_pairs_parallel,
@@ -591,6 +596,11 @@ class PairwiseService:
                 "docker": check_by_arm.get(arm, {}),
                 "recording": rec_by_arm.get(arm, {}),
             }
+        evidence["processEvents"] = self.db.all(
+            """SELECT event_type,entity_id,detail_json,created_at FROM audit_events
+               WHERE entity_id=? OR entity_id LIKE ? OR detail_json LIKE ? ORDER BY id""",
+            (pair_id, pair_id + "-%", "%" + pair_id + "%"),
+        )
         result = self.codex.run(
             "gsb_review",
             gsb_prompt(task.get("prompt", ""), json.dumps(evidence["A"], ensure_ascii=False), json.dumps(evidence["B"], ensure_ascii=False)),
@@ -599,12 +609,18 @@ class PairwiseService:
         reason = re.sub(r"[`\r\n]+", " ", str(result["reason"])).strip()[:600]
         review_id = "gsb-" + uuid.uuid4().hex[:16]
         stamp = now_iso()
+        evidence_version = self.gsb_evidence_version(pair_id, result["verdict"], reason)
         self.db.execute(
-            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,evidence_json,status,created_at,updated_at)
-               VALUES(?,?,?,?,?,'draft',?,?)
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,evidence_json,draft_verdict,draft_reason,
+               evidence_version,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,'draft',?,?)
                ON CONFLICT(pair_id) DO UPDATE SET verdict=excluded.verdict,reason=excluded.reason,
-                 evidence_json=excluded.evidence_json,status='draft',confirmed_by='',confirmed_at=NULL,updated_at=excluded.updated_at""",
-            (review_id, pair_id, result["verdict"], reason, json.dumps(result["evidence"], ensure_ascii=False), stamp, stamp),
+                 evidence_json=excluded.evidence_json,draft_verdict=excluded.draft_verdict,
+                 draft_reason=excluded.draft_reason,final_verdict='',final_reason='',
+                 evidence_version=excluded.evidence_version,status='draft',confirmed_by='',confirmed_at=NULL,
+                 updated_at=excluded.updated_at""",
+            (review_id, pair_id, result["verdict"], reason, json.dumps(result["evidence"], ensure_ascii=False),
+             result["verdict"], reason, evidence_version, stamp, stamp),
         )
         self.db.execute("UPDATE pairs SET status='review',stage='gsb_confirmation',updated_at=? WHERE id=?", (stamp, pair_id))
         return self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,)) or {}
@@ -616,18 +632,196 @@ class PairwiseService:
         if len(clean) < 20 or len(clean) > 600:
             raise ValueError("GSB 理由需为 20–600 个字符的单段文字")
         stamp = now_iso()
+        evidence_version = self.gsb_evidence_version(pair_id, verdict, clean)
         self.db.execute(
-            """UPDATE gsb_reviews SET verdict=?,reason=?,status='confirmed',confirmed_by=?,confirmed_at=?,updated_at=?
+            """UPDATE gsb_reviews SET draft_verdict=CASE WHEN draft_verdict='' THEN verdict ELSE draft_verdict END,
+               draft_reason=CASE WHEN draft_reason='' THEN reason ELSE draft_reason END,
+               verdict=?,reason=?,final_verdict=?,final_reason=?,evidence_version=?,
+               status='confirmed',confirmed_by=?,confirmed_at=?,updated_at=?
                WHERE pair_id=?""",
-            (verdict, clean, confirmed_by.strip() or "人工确认", stamp, stamp, pair_id),
+            (verdict, clean, verdict, clean, evidence_version,
+             confirmed_by.strip() or "人工确认", stamp, stamp, pair_id),
         )
         self.db.execute("UPDATE pairs SET status='completed',stage='completed',winner=?,completed_at=?,updated_at=? WHERE id=?", (verdict, stamp, stamp, pair_id))
         pair = self._pair(pair_id)
         task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         if task.get("task_type") in ("feature", "bugfix"):
             self.db.execute("UPDATE project_chains SET followup_completed=1,status='completed',completed_at=?,updated_at=? WHERE id=?", (stamp, stamp, pair["chain_id"]))
+        submission_id = "delivery-" + uuid.uuid4().hex[:16]
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
+               VALUES(?,?,'ready_to_submit',?,?)
+               ON CONFLICT(pair_id) DO UPDATE SET status='ready_to_submit',error='',updated_at=excluded.updated_at""",
+            (submission_id, pair_id, stamp, stamp),
+        )
         self.db.audit("gsb.confirmed", "pair", pair_id, {"verdict": verdict, "confirmed_by": confirmed_by})
         return self.pair_detail(pair_id)
+
+    def _gsb_evidence_bundle(self, pair_id: str) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        return {
+            "pair": {key: pair.get(key) for key in ("id", "task_id", "chain_id", "baseline_sha", "stage", "status")},
+            "task": {key: task.get(key) for key in ("title", "task_type", "difficulty", "prompt", "acceptance_json")},
+            "arms": self.db.all(
+                """SELECT arm,model,image_id,status,session_id,prompt_id,trace_path,commit_sha,result,
+                   warning_at,error,prompt_sent_at,finished_at FROM arm_runs WHERE pair_id=? ORDER BY arm""",
+                (pair_id,),
+            ),
+            "checks": self.db.all(
+                """SELECT arm,commit_sha,status,checks_json,error,started_at,finished_at
+                   FROM artifact_checks WHERE pair_id=? ORDER BY arm""",
+                (pair_id,),
+            ),
+            "recordings": self.db.all(
+                """SELECT id,arm,commit_sha,sha256,width,height,duration_seconds,status,commit_match,error,
+                   started_at,finished_at FROM recordings WHERE pair_id=? ORDER BY arm""",
+                (pair_id,),
+            ),
+            "processEvents": self.db.all(
+                """SELECT event_type,entity_id,detail_json,created_at FROM audit_events
+                   WHERE entity_id=? OR entity_id LIKE ? OR detail_json LIKE ? ORDER BY id""",
+                (pair_id, pair_id + "-%", "%" + pair_id + "%"),
+            ),
+        }
+
+    def gsb_evidence_version(self, pair_id: str, verdict: str = "", reason: str = "") -> str:
+        payload = self._gsb_evidence_bundle(pair_id)
+        payload["publicVerdict"] = verdict
+        payload["publicReason"] = reason
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def recheck_gsb_async(self, pair_id: str) -> str:
+        operation = "gsb-recheck-" + pair_id
+        self._submit(operation, self._recheck_gsb, pair_id)
+        return operation
+
+    def _recheck_gsb(self, pair_id: str) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,))
+        if not review:
+            raise ValueError("尚未生成 GSB 草稿")
+        verdict = str(review.get("verdict") or "")
+        reason = str(review.get("reason") or "")
+        evidence = self._gsb_evidence_bundle(pair_id)
+        version = self.gsb_evidence_version(pair_id, verdict, reason)
+        model = str(self.db.setting("gsb_recheck_model", "gpt-6-astra"))
+        effort = str(self.db.setting("gsb_recheck_effort", "high"))
+        result = self.codex.run(
+            "gsb_recheck",
+            gsb_recheck_prompt(str(evidence["task"].get("prompt") or ""), verdict, reason,
+                               json.dumps(evidence, ensure_ascii=False)),
+            GSB_RECHECK_SCHEMA,
+            pair_id=pair_id,
+            task_id=pair["task_id"],
+            timeout=1800,
+            model_override=model,
+            effort_override=effort,
+        )
+        suggested_reason = re.sub(r"[``\r\n]+", " ", str(result["suggestedReason"])).strip()[:600]
+        latest_job = self.db.one(
+            "SELECT id FROM codex_jobs WHERE pair_id=? AND job_type='gsb_recheck' ORDER BY created_at DESC LIMIT 1",
+            (pair_id,),
+        ) or {}
+        recheck_id = "recheck-" + uuid.uuid4().hex[:16]
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO gsb_rechecks(id,pair_id,evidence_version,input_verdict,input_reason,result_status,
+               suggested_verdict,suggested_reason,issues_json,evidence_refs_json,model,reasoning_effort,
+               codex_job_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (recheck_id, pair_id, version, verdict, reason, result["status"], result["suggestedVerdict"],
+             suggested_reason, json.dumps(result["issues"], ensure_ascii=False),
+             json.dumps(result["evidenceRefs"], ensure_ascii=False), model, effort,
+             str(latest_job.get("id") or ""), stamp),
+        )
+        self.db.audit("gsb.rechecked", "pair", pair_id, {"recheck_id": recheck_id, "status": result["status"], "model": model, "effort": effort})
+        return self.db.one("SELECT * FROM gsb_rechecks WHERE id=?", (recheck_id,)) or {}
+
+    def apply_gsb_recheck(self, pair_id: str, recheck_id: str) -> Dict[str, Any]:
+        row = self.db.one("SELECT * FROM gsb_rechecks WHERE id=? AND pair_id=?", (recheck_id, pair_id))
+        if not row:
+            raise KeyError("复检记录不存在")
+        review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,)) or {}
+        current_version = self.gsb_evidence_version(pair_id, str(review.get("verdict") or ""), str(review.get("reason") or ""))
+        if row["evidence_version"] != current_version:
+            raise ValueError("公开理由或证据已经变化，请重新复检")
+        stamp = now_iso()
+        verdict, reason = row["suggested_verdict"], row["suggested_reason"]
+        self.db.execute(
+            """UPDATE gsb_reviews SET verdict=?,reason=?,final_verdict='',final_reason='',status='draft',
+               confirmed_by='',confirmed_at=NULL,evidence_version=?,updated_at=? WHERE pair_id=?""",
+            (verdict, reason, self.gsb_evidence_version(pair_id, verdict, reason), stamp, pair_id),
+        )
+        self.db.execute("UPDATE pairs SET status='review',stage='gsb_confirmation',winner='',completed_at=NULL,updated_at=? WHERE id=?", (stamp, pair_id))
+        self.db.execute("UPDATE delivery_submissions SET status='needs_review',error='',updated_at=? WHERE pair_id=?", (stamp, pair_id))
+        pair = self._pair(pair_id)
+        task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        if task.get("task_type") in ("feature", "bugfix"):
+            self.db.execute(
+                "UPDATE project_chains SET status='active',followup_completed=0,completed_at=NULL,updated_at=? WHERE id=?",
+                (stamp, pair["chain_id"]),
+            )
+        self.db.audit("gsb.recheck_applied", "pair", pair_id, {"recheck_id": recheck_id})
+        return self.pair_detail(pair_id)
+
+    def delivery_preflight(self, pair_id: str) -> Dict[str, Any]:
+        detail = self.pair_detail(pair_id)
+        blockers: List[str] = []
+        warnings: List[str] = []
+        arms = {row["arm"]: row for row in detail.get("arms", [])}
+        checks = {row["arm"]: row for row in detail.get("checks", [])}
+        recs = {row["arm"]: row for row in detail.get("recordings", [])}
+        for arm in ("A", "B"):
+            item = arms.get(arm) or {}
+            if not item.get("session_id"): blockers.append(arm + " 缺少 SessionID")
+            if not item.get("prompt_id"): blockers.append(arm + " 缺少 PromptID")
+            if not item.get("commit_sha"): blockers.append(arm + " 缺少最终提交")
+            if (checks.get(arm) or {}).get("status") != "passed": blockers.append(arm + " Docker 验收未通过")
+            rec = recs.get(arm) or {}
+            if rec.get("status") != "passed": blockers.append(arm + " 录像未通过")
+            if not int(rec.get("commit_match") or 0): blockers.append(arm + " 录像与最终提交不匹配")
+        review = detail.get("gsb") or {}
+        if review.get("status") != "confirmed": blockers.append("GSB 尚未人工确认")
+        verdict, reason = str(review.get("verdict") or ""), str(review.get("reason") or "")
+        version = self.gsb_evidence_version(pair_id, verdict, reason) if review else ""
+        latest = self.db.one("SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC LIMIT 1", (pair_id,))
+        if not latest or latest.get("evidence_version") != version:
+            warnings.append("尚未基于当前公开理由完成模型复检")
+        elif latest.get("result_status") == "fact_conflict":
+            blockers.append("模型复检发现公开理由存在事实冲突")
+        elif latest.get("result_status") == "suggested_revision":
+            warnings.append("模型复检给出了措辞修改建议")
+        return {"pair_id": pair_id, "eligible": not blockers, "blockers": blockers, "warnings": warnings,
+                "evidence_version": version, "checked_at": now_iso()}
+
+    def set_delivery_hidden(self, pair_id: str, hidden: bool) -> Dict[str, Any]:
+        self._pair(pair_id)
+        stamp = now_iso()
+        submission_id = "delivery-" + uuid.uuid4().hex[:16]
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,hidden_at,created_at,updated_at)
+               VALUES(?,?,'not_submitted',?,?,?) ON CONFLICT(pair_id) DO UPDATE SET
+               hidden_at=excluded.hidden_at,updated_at=excluded.updated_at""",
+            (submission_id, pair_id, stamp if hidden else None, stamp, stamp),
+        )
+        self.db.audit("delivery.hidden" if hidden else "delivery.restored", "pair", pair_id, {})
+        return self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
+
+    def submit_delivery(self, pair_id: str) -> Dict[str, Any]:
+        check = self.delivery_preflight(pair_id)
+        if not check["eligible"]:
+            raise ValueError("提交前检查未通过：" + "；".join(check["blockers"]))
+        stamp = now_iso()
+        submission_id = "delivery-" + uuid.uuid4().hex[:16]
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,submitted_at,created_at,updated_at)
+               VALUES(?,?,'submitted',?,?,?) ON CONFLICT(pair_id) DO UPDATE SET
+               status='submitted',submitted_at=excluded.submitted_at,error='',updated_at=excluded.updated_at""",
+            (submission_id, pair_id, stamp, stamp, stamp),
+        )
+        self.db.audit("delivery.submitted", "pair", pair_id, {"evidence_version": check["evidence_version"]})
+        return self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
 
     def pair_detail(self, pair_id: str) -> Dict[str, Any]:
         self.refresh_recording_stage(pair_id)
@@ -638,6 +832,8 @@ class PairwiseService:
         pair["checks"] = self.db.all("SELECT * FROM artifact_checks WHERE pair_id=? ORDER BY arm", (pair_id,))
         pair["recordings"] = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair_id,))
         pair["gsb"] = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,))
+        pair["gsb_rechecks"] = self.db.all("SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC", (pair_id,))
+        pair["delivery"] = self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,))
         return pair
 
     def _monitor_arm(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:

@@ -26,6 +26,7 @@ JOB_EFFORTS = {
     "artifact_comparison": "medium",
     "gsb_review": "medium",
     "gsb_language_check": "medium",
+    "gsb_recheck": "high",
     "next_step": "medium",
 }
 
@@ -64,14 +65,18 @@ class CodexRunner:
         task_id: str = "",
         timeout: int = 1200,
         retries: int = 2,
+        model_override: str = "",
+        effort_override: str = "",
     ) -> Dict[str, Any]:
         job_id = "codex-" + uuid.uuid4().hex[:16]
-        model = str(self.db.setting("codex_model", self.config.codex_model))
+        model = model_override or str(self.db.setting("codex_model", self.config.codex_model))
         default_effort = str(self.db.setting("codex_default_effort", self.config.codex_default_effort))
         bug_effort = str(self.db.setting("codex_bug_effort", self.config.codex_bug_effort))
         effort = JOB_EFFORTS.get(job_type, default_effort)
         if job_type.startswith("bug_"):
             effort = bug_effort
+        if effort_override:
+            effort = effort_override
         job_dir = self.jobs_dir / job_id
         job_dir.mkdir(parents=True)
         schema_path = job_dir / "schema.json"
@@ -150,6 +155,19 @@ GSB_SCHEMA = {
         "verdict": {"type": "string", "enum": ["A better", "Same", "B better"]},
         "reason": {"type": "string", "minLength": 20, "maxLength": 600},
         "evidence": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+    },
+}
+
+GSB_RECHECK_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["status", "suggestedVerdict", "suggestedReason", "issues", "evidenceRefs"],
+    "properties": {
+        "status": {"type": "string", "enum": ["passed", "suggested_revision", "fact_conflict"]},
+        "suggestedVerdict": {"type": "string", "enum": ["A better", "Same", "B better"]},
+        "suggestedReason": {"type": "string", "minLength": 20, "maxLength": 600},
+        "issues": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 10},
+        "evidenceRefs": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 12},
     },
 }
 
