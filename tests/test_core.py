@@ -62,6 +62,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(chain["followup_required"], 1)
         self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-1'")["status"], "used")
 
+    def test_pair_parallelism_has_a_hard_ceiling_of_three(self):
+        self.db.set_setting("max_pairs_parallel", 9)
+        stamp = now_iso()
+        for index in range(4):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+                   fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"task-limit-{index}", "test", "zero_to_one", f"hard-{index}", "Build a hard project",
+                 "困难", '["跨模块状态"]', f"fingerprint-limit-{index}", "ready", stamp, stamp),
+            )
+        for index in range(3):
+            self.service.create_pair(f"task-limit-{index}")
+        with self.assertRaisesRegex(ValueError, "最多 3 个 Pair"):
+            self.service.create_pair("task-limit-3")
+
     def test_gsb_confirmation_strips_backticks_and_completes_pair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
@@ -90,7 +105,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["gsb"]["final_verdict"], "A better")
         self.assertEqual(result["delivery"]["status"], "ready_to_submit")
 
-    def test_gsb_draft_keeps_preference_inside_a_and_b_reviews(self):
+    def test_generated_gsb_is_default_confirmed_and_keeps_two_review_sections(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -124,10 +139,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(review["b_reason"], result_payload["bReason"])
         self.assertNotIn("preference_reason", review)
         self.assertNotIn("偏好依据：", review["reason"])
+        self.assertEqual(review["status"], "confirmed")
+        self.assertEqual(review["confirmed_by"], "刘昱（按授权默认确认）")
+        completed = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(completed, {"status": "completed", "stage": "completed"})
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
-        self.assertTrue({"commit_sha", "commit_match", "steps_json", "direct_url", "attempt_id", "capture_mode", "entry_url"} <= recording_columns)
+        self.assertTrue({"commit_sha", "commit_match", "steps_json", "direct_url", "attempt_id", "capture_mode", "entry_url",
+                         "review_status", "reviewed_by", "reviewed_at"} <= recording_columns)
         task_columns = {row["name"] for row in self.db.all("PRAGMA table_info(tasks)")}
         self.assertIn("project_category", task_columns)
         attempt_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recording_attempts)")}
@@ -169,6 +189,7 @@ class CoreTests(unittest.TestCase):
         rows = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair["id"],))
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(row["status"] == "passed" and row["capture_mode"] == "browser" for row in rows))
+        self.assertTrue(all(row["review_status"] == "confirmed" and row["reviewed_at"] for row in rows))
         updated = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(updated["stage"], "gsb_ready")
 

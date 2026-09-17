@@ -259,19 +259,22 @@ h2{font-size:21px;margin:0 0 12px}pre{white-space:pre-wrap;word-break:break-word
     def _promote(self, attempt_id: str) -> None:
         row = self.db.one("SELECT * FROM recording_attempts WHERE id=?", (attempt_id,)) or {}
         stamp = now_iso()
+        reviewer = str(self.db.setting("git_author_name", "刘昱") or "刘昱").strip() + "（按授权默认确认）"
         recording_id = "rec-" + str(row.get("pair_id", ""))[-8:] + str(row.get("arm", "")).lower()
         self.db.execute(
             """INSERT INTO recordings(id,pair_id,arm,path,sha256,width,height,duration_seconds,commit_sha,
-               started_at,finished_at,attempt_id,capture_mode,entry_url,commit_match,status,error,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'passed','',?,?)
+               started_at,finished_at,attempt_id,capture_mode,entry_url,commit_match,review_status,reviewed_by,
+               reviewed_at,status,error,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'confirmed',?,?,'passed','',?,?)
                ON CONFLICT(pair_id,arm) DO UPDATE SET path=excluded.path,sha256=excluded.sha256,
                width=excluded.width,height=excluded.height,duration_seconds=excluded.duration_seconds,
                commit_sha=excluded.commit_sha,started_at=excluded.started_at,finished_at=excluded.finished_at,
                attempt_id=excluded.attempt_id,capture_mode='browser',entry_url=excluded.entry_url,
-               commit_match=1,status='passed',error='',updated_at=excluded.updated_at""",
+               commit_match=1,review_status='confirmed',reviewed_by=excluded.reviewed_by,
+               reviewed_at=excluded.reviewed_at,status='passed',error='',updated_at=excluded.updated_at""",
             (recording_id, row["pair_id"], row["arm"], row["path"], row["sha256"], row["width"], row["height"],
              row["duration_seconds"], row["commit_sha"], row["started_at"], row["finished_at"], attempt_id,
-             "browser", row["entry_url"], stamp, stamp),
+             "browser", row["entry_url"], reviewer, stamp, stamp, stamp),
         )
         both = self.db.one("SELECT COUNT(*) count FROM recordings WHERE pair_id=? AND status='passed' AND commit_match=1", (row["pair_id"],))
         if int((both or {}).get("count") or 0) == 2:

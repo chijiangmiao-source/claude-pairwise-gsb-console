@@ -9,6 +9,7 @@ APP_NAME = "Claude A/B GSB Console"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CLAUDE_MODEL = "auto_model/urm"
 DEFAULT_CLAUDE_IMAGE = "claude-eval-runtime:claude-2.1.269"
+MAX_PAIR_PROJECTS = 3
 OLD_APP_DIR = Path("/Users/studio1/Library/Application Support/Claude Eval Console")
 
 
@@ -67,7 +68,7 @@ def load_config(base_dir: Path = None) -> Config:
         claude_image=str(image),
         codex_default_effort=os.environ.get("PAIRWISE_CODEX_EFFORT", "medium"),
         codex_bug_effort=os.environ.get("PAIRWISE_CODEX_BUG_EFFORT", "high"),
-        max_pairs_parallel=int(os.environ.get("PAIRWISE_MAX_PARALLEL", "3")),
+        max_pairs_parallel=max(1, min(MAX_PAIR_PROJECTS, int(os.environ.get("PAIRWISE_MAX_PARALLEL", "3")))),
         task_generation_max_parallel=int(os.environ.get("PAIRWISE_TASK_GENERATION_PARALLEL", "6")),
         github_owner=os.environ.get("PAIRWISE_GITHUB_OWNER", ""),
         github_visibility=os.environ.get("PAIRWISE_GITHUB_VISIBILITY", "private"),
@@ -75,4 +76,3 @@ def load_config(base_dir: Path = None) -> Config:
         git_author_name=os.environ.get("PAIRWISE_GIT_AUTHOR_NAME", "刘昱"),
         git_author_email=os.environ.get("PAIRWISE_GIT_AUTHOR_EMAIL", ""),
     )
-

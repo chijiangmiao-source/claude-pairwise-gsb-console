@@ -15,7 +15,7 @@ from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
 from .classification import normalize_project_category
 from .codex_runner import BUG_DISCOVERY_SCHEMA, CodexRunner, GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA
-from .config import Config
+from .config import Config, MAX_PAIR_PROJECTS
 from .db import Database, now_iso
 from .gitops import GitOps
 from .importer import fingerprint, import_historical_tasks
@@ -93,6 +93,9 @@ class PairwiseService:
         for key, value in defaults.items():
             if self.db.one("SELECT key FROM settings WHERE key=?", (key,)) is None:
                 self.db.set_setting(key, value)
+        configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
+        if configured > MAX_PAIR_PROJECTS or configured < 1:
+            self.db.set_setting("max_pairs_parallel", MAX_PAIR_PROJECTS)
 
     def start_scheduler(self) -> None:
         if self._scheduler_started:
@@ -356,8 +359,10 @@ class PairwiseService:
         if task["status"] != "ready" or task["difficulty"] not in ("困难", "地狱"):
             raise ValueError("只有已通过准入的困难或地狱任务才能创建 Pair")
         active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running')") or {"count": 0})["count"]
-        if active_count >= int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel)):
-            raise ValueError("已达到 Pair 并发上限")
+        configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
+        pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
+        if active_count >= pair_limit:
+            raise ValueError("已达到 Pair 并发上限：最多 3 个 Pair（6 个 A/B 终端）")
         pair_id = "pair-" + uuid.uuid4().hex[:16]
         if task["task_type"] == "zero_to_one":
             chain_id = "chain-" + uuid.uuid4().hex[:16]
@@ -689,9 +694,9 @@ class PairwiseService:
              evidence_version, stamp, stamp),
         )
         self.db.execute("UPDATE pairs SET status='review',stage='gsb_confirmation',updated_at=? WHERE id=?", (stamp, pair_id))
-        review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair_id,)) or {}
-        review.pop("preference_reason", None)
-        return review
+        reviewer = str(self.db.setting("git_author_name", "刘昱") or "刘昱").strip() + "（按授权默认确认）"
+        detail = self.confirm_gsb(pair_id, result["verdict"], a_reason, b_reason, reviewer)
+        return detail.get("gsb") or {}
 
     def confirm_gsb(self, pair_id: str, verdict: str, a_reason: str, b_reason: str,
                     confirmed_by: str) -> Dict[str, Any]:
@@ -838,17 +843,9 @@ class PairwiseService:
             (verdict, reason, a_reason, b_reason, "",
              self.gsb_evidence_version(pair_id, verdict, reason), stamp, pair_id),
         )
-        self.db.execute("UPDATE pairs SET status='review',stage='gsb_confirmation',winner='',completed_at=NULL,updated_at=? WHERE id=?", (stamp, pair_id))
-        self.db.execute("UPDATE delivery_submissions SET status='needs_review',error='',updated_at=? WHERE pair_id=?", (stamp, pair_id))
-        pair = self._pair(pair_id)
-        task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (pair["task_id"],)) or {}
-        if task.get("task_type") in ("feature", "bugfix"):
-            self.db.execute(
-                "UPDATE project_chains SET status='active',followup_completed=0,completed_at=NULL,updated_at=? WHERE id=?",
-                (stamp, pair["chain_id"]),
-            )
         self.db.audit("gsb.recheck_applied", "pair", pair_id, {"recheck_id": recheck_id})
-        return self.pair_detail(pair_id)
+        reviewer = str(self.db.setting("git_author_name", "刘昱") or "刘昱").strip() + "（按授权默认确认）"
+        return self.confirm_gsb(pair_id, verdict, a_reason, b_reason, reviewer)
 
     def delivery_preflight(self, pair_id: str, include_platform: bool = False) -> Dict[str, Any]:
         detail = self.pair_detail(pair_id)
@@ -867,6 +864,7 @@ class PairwiseService:
             rec = recs.get(arm) or {}
             if rec.get("status") != "passed": blockers.append(arm + " 录像未通过")
             if not int(rec.get("commit_match") or 0): blockers.append(arm + " 录像与最终提交不匹配")
+            if rec.get("review_status") != "confirmed": blockers.append(arm + " 录像尚未审核通过")
         review = detail.get("gsb") or {}
         if review.get("status") != "confirmed": blockers.append("GSB 尚未人工确认")
         verdict, reason = str(review.get("verdict") or ""), str(review.get("reason") or "")

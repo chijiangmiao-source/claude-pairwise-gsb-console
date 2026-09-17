@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def now_iso() -> str:
@@ -80,6 +80,9 @@ class Database:
                 ("attempt_id", "TEXT NOT NULL DEFAULT ''"),
                 ("capture_mode", "TEXT NOT NULL DEFAULT 'browser'"),
                 ("entry_url", "TEXT NOT NULL DEFAULT ''"),
+                ("review_status", "TEXT NOT NULL DEFAULT 'confirmed'"),
+                ("reviewed_by", "TEXT NOT NULL DEFAULT '刘昱（按授权默认确认）'"),
+                ("reviewed_at", "TEXT"),
             ):
                 if name not in recording_columns:
                     c.execute("ALTER TABLE recordings ADD COLUMN %s %s" % (name, definition))
@@ -87,6 +90,12 @@ class Database:
             if "interaction_mode" not in attempt_columns:
                 c.execute("ALTER TABLE recording_attempts ADD COLUMN interaction_mode TEXT NOT NULL DEFAULT 'auto'")
             c.execute("UPDATE recordings SET capture_mode='screen' WHERE attempt_id='' AND path LIKE '%.mov'")
+            c.execute(
+                """UPDATE recordings SET review_status='confirmed',
+                     reviewed_by=CASE WHEN reviewed_by='' THEN '刘昱（按授权默认确认）' ELSE reviewed_by END,
+                     reviewed_at=COALESCE(reviewed_at,updated_at)
+                   WHERE status='passed'"""
+            )
             c.execute(
                 """INSERT OR IGNORE INTO recording_attempts(
                      id,pair_id,arm,commit_sha,path,capture_mode,entry_url,width,height,duration_seconds,
@@ -404,6 +413,9 @@ CREATE TABLE IF NOT EXISTS recordings (
   attempt_id TEXT NOT NULL DEFAULT '',
   capture_mode TEXT NOT NULL DEFAULT 'browser',
   entry_url TEXT NOT NULL DEFAULT '',
+  review_status TEXT NOT NULL DEFAULT 'confirmed',
+  reviewed_by TEXT NOT NULL DEFAULT '刘昱（按授权默认确认）',
+  reviewed_at TEXT,
   status TEXT NOT NULL DEFAULT 'queued',
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,

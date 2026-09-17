@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from .analytics import dashboard
-from .config import APP_NAME, Config
+from .config import APP_NAME, Config, MAX_PAIR_PROJECTS
 from .db import Database, now_iso
 from .exports import build_xlsx
 from .service import PairwiseService
@@ -188,6 +188,10 @@ class Handler(BaseHTTPRequestHandler):
                         results.append(self.app.service.submit_delivery(pair_id))
                 return self._json(200, {"count": len(results), "items": results})
             if path == "/api/settings":
+                if "max_pairs_parallel" in body:
+                    pair_limit = int(body["max_pairs_parallel"])
+                    if pair_limit < 1 or pair_limit > MAX_PAIR_PROJECTS:
+                        raise ValueError("Pair 并发只能设置为 1–3；每个 Pair 会占用 A/B 两个终端")
                 for key, value in body.items():
                     self.app.db.set_setting(str(key), value)
                 self.app.db.audit("settings.updated", "settings", "", {"keys": list(body)})
@@ -390,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
           a.branch,a.commit_sha,c.id check_id,c.status artifact_status,c.checks_json,c.error artifact_error,
           c.started_at check_started_at,c.finished_at check_finished_at,r.id recording_id,r.status recording_status,
           r.path,r.sha256,r.width,r.height,r.duration_seconds,r.commit_sha recording_commit_sha,
-          r.commit_match,r.error recording_error,r.capture_mode,r.entry_url,r.updated_at,
+          r.commit_match,r.review_status,r.reviewed_by,r.reviewed_at,r.error recording_error,r.capture_mode,r.entry_url,r.updated_at,
           latest.id latest_attempt_id,latest.status latest_attempt_status,latest.interaction_mode latest_interaction_mode,latest.error latest_attempt_error,
           latest.entry_url latest_attempt_url,latest.created_at latest_attempt_at"""
         from_sql = """FROM arm_runs a JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
@@ -435,8 +439,9 @@ class Handler(BaseHTTPRequestHandler):
           aa.session_id a_session_id,aa.prompt_id a_prompt_id,aa.commit_sha a_commit,
           bb.session_id b_session_id,bb.prompt_id b_prompt_id,bb.commit_sha b_commit,
           ca.status a_check_status,cb.status b_check_status,ra.id a_recording_id,ra.status a_recording_status,
-          ra.sha256 a_recording_sha,ra.commit_match a_recording_match,rb.id b_recording_id,
-          rb.status b_recording_status,rb.sha256 b_recording_sha,rb.commit_match b_recording_match,
+          ra.sha256 a_recording_sha,ra.commit_match a_recording_match,ra.review_status a_recording_review_status,
+          rb.id b_recording_id,rb.status b_recording_status,rb.sha256 b_recording_sha,
+          rb.commit_match b_recording_match,rb.review_status b_recording_review_status,
           g.verdict,g.reason,g.a_reason,g.b_reason,g.status gsb_status,
           g.confirmed_by,g.confirmed_at,g.evidence_version,
           r.id recheck_id,r.result_status recheck_status,r.evidence_version recheck_evidence_version,
@@ -461,7 +466,9 @@ class Handler(BaseHTTPRequestHandler):
             row.get("b_prompt_id"), row.get("b_commit"), row.get("a_check_status") in ("passed", "failed"),
             row.get("b_check_status") in ("passed", "failed"), row.get("a_recording_status") == "passed",
             row.get("b_recording_status") == "passed", int(row.get("a_recording_match") or 0) == 1,
-            int(row.get("b_recording_match") or 0) == 1, row.get("gsb_status") == "confirmed",
+            int(row.get("b_recording_match") or 0) == 1,
+            row.get("a_recording_review_status") == "confirmed",
+            row.get("b_recording_review_status") == "confirmed", row.get("gsb_status") == "confirmed",
         )
         row["readiness"] = "ready" if all(required) and row.get("recheck_status") != "fact_conflict" else "blocked"
         return row
@@ -486,7 +493,8 @@ class Handler(BaseHTTPRequestHandler):
           COALESCE(aa.session_id,'')<>'' AND COALESCE(aa.prompt_id,'')<>'' AND COALESCE(aa.commit_sha,'')<>'' AND
           COALESCE(bb.session_id,'')<>'' AND COALESCE(bb.prompt_id,'')<>'' AND COALESCE(bb.commit_sha,'')<>'' AND
           ca.status IN ('passed','failed') AND cb.status IN ('passed','failed') AND ra.status='passed' AND rb.status='passed' AND
-          COALESCE(ra.commit_match,0)=1 AND COALESCE(rb.commit_match,0)=1 AND g.status='confirmed' AND
+          COALESCE(ra.commit_match,0)=1 AND COALESCE(rb.commit_match,0)=1 AND
+          ra.review_status='confirmed' AND rb.review_status='confirmed' AND g.status='confirmed' AND
           COALESCE(r.result_status,'')<>'fact_conflict'
         )"""
         readiness = self._query(query, "readiness")
