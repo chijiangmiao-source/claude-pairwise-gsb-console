@@ -18,7 +18,7 @@ from pairwise_console.artifact import isolated_compose_environment
 from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
-from pairwise_console.prompts import gsb_prompt
+from pairwise_console.prompts import gsb_prompt, gsb_recheck_prompt
 from pairwise_console.service import PairwiseService
 
 
@@ -941,12 +941,18 @@ class CoreTests(unittest.TestCase):
     def test_gsb_prompt_requires_plain_language_trace_and_reproduced_bug_evidence(self):
         prompt = gsb_prompt("开发送检单", "A evidence", "B evidence", "process events")
         self.assertIn("traceEvidence", prompt)
-        self.assertIn("不要写成审计报告", prompt)
-        self.assertIn("不要复述完整操作过程", prompt)
-        self.assertIn("每段保留一个真实定位即可", prompt)
+        self.assertIn("不要为了显得简短而删掉能支撑结论的证据", prompt)
+        self.assertIn("可以保留多个存在因果关系的步骤", prompt)
+        self.assertIn("不额外追求最短", prompt)
         self.assertIn("没有实际跑接口流程", prompt)
-        self.assertIn("40–180 个中文字符", prompt)
         self.assertIn("process events", prompt)
+
+    def test_gsb_recheck_prioritizes_logic_and_preserves_useful_evidence(self):
+        prompt = gsb_recheck_prompt("开发送检单", "A better", "A reason", "B reason", "evidence")
+        self.assertIn("复检首先检查首次生成的 GSB 逻辑是否正确", prompt)
+        self.assertIn("不要因为理由较长或证据较多就要求精简", prompt)
+        self.assertIn("必须保留原评价中所有会影响结论的有效证据", prompt)
+        self.assertIn("不得仅因篇幅、数字数量或代码细节较多判为需要修改", prompt)
 
     def test_completed_pair_with_current_failed_artifact_is_quarantined(self):
         self.insert_ready_task()
