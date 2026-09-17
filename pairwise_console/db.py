@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def now_iso() -> str:
@@ -128,6 +128,15 @@ class Database:
             ):
                 if name not in recheck_columns:
                     c.execute("ALTER TABLE gsb_rechecks ADD COLUMN %s %s" % (name, definition))
+            delivery_columns = {row[1] for row in c.execute("PRAGMA table_info(delivery_submissions)")}
+            for name, definition in (
+                ("payload_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("remote_status", "TEXT NOT NULL DEFAULT ''"),
+                ("qc_summary", "TEXT NOT NULL DEFAULT ''"),
+                ("remote_updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in delivery_columns:
+                    c.execute("ALTER TABLE delivery_submissions ADD COLUMN %s %s" % (name, definition))
             c.execute(
                 """UPDATE recordings SET commit_sha=COALESCE((
                      SELECT commit_sha FROM arm_runs a
@@ -471,6 +480,10 @@ CREATE TABLE IF NOT EXISTS delivery_submissions (
   status TEXT NOT NULL DEFAULT 'not_submitted',
   remote_id TEXT NOT NULL DEFAULT '',
   remote_url TEXT NOT NULL DEFAULT '',
+  payload_sha256 TEXT NOT NULL DEFAULT '',
+  remote_status TEXT NOT NULL DEFAULT '',
+  qc_summary TEXT NOT NULL DEFAULT '',
+  remote_updated_at TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT '',
   hidden_at TEXT,
   submitted_at TEXT,

@@ -138,6 +138,8 @@ class CoreTests(unittest.TestCase):
         self.assertTrue({"attempt_no", "error_retry_count"} <= arm_columns)
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='gsb_rechecks'"))
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_submissions'"))
+        delivery_columns = {row["name"] for row in self.db.all("PRAGMA table_info(delivery_submissions)")}
+        self.assertTrue({"payload_sha256", "remote_status", "qc_summary", "remote_updated_at"} <= delivery_columns)
         self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='recording_attempts'"))
         self.assertEqual(self.db.setting("gsb_recheck_model"), "gpt-6-astra")
         self.assertEqual(self.db.setting("gsb_recheck_effort"), "high")

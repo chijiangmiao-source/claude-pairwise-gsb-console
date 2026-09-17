@@ -7,6 +7,7 @@ const state = {
   filters: { reviews: {}, evidence: {}, exports: {} },
   reviewSelection: new Set(), reviewItems: [],
   exportSelection: new Set(), exportItems: [], preflight: null,
+  helperReady: false, helperVersion: "", helperRequests: new Map(),
 };
 const titles = {
   dashboard: "数据概览", tasks: "题目池", pairs: "A/B 项目", reviews: "复核与人工确认",
@@ -19,7 +20,8 @@ const statusLabels = {
   passed: "通过", failed: "失败", draft: "草稿", confirmed: "已确认",
   suggested_revision: "建议修改", fact_conflict: "事实冲突", ready: "可提交",
   blocked: "待补资料", not_submitted: "待提交", ready_to_submit: "待提交",
-  submitted: "已提交", needs_review: "待重新确认", missing: "缺失",
+  submitting: "提交中", qc_pending: "质检中", qc_passed: "质检通过",
+  submitted: "已提交", needs_fix: "待返修", discarded: "已废弃", needs_review: "待重新确认", missing: "缺失",
   starting: "正在启动项目", recording: "正在录制",
 };
 const badge = (value) => `<span class="badge ${esc(value)}">${esc(statusLabels[value] || value || "—")}</span>`;
@@ -39,6 +41,31 @@ function notify(message, error = false) {
   const notice = $("#notice"); notice.textContent = message; notice.className = `notice${error ? " error" : ""}`;
   window.setTimeout(() => notice.classList.add("hidden"), 6500);
 }
+function helperCall(type, payload = {}) {
+  if (!state.helperReady) return Promise.reject(new Error("提交助手未连接，请在 Chrome 扩展页加载或重新加载本期 GSB 提交小助手"));
+  const requestId = `gsb-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => { state.helperRequests.delete(requestId); reject(new Error("提交助手等待超时，请检查 SOLO-QA 页面和网络")); }, 30 * 60 * 1000);
+    state.helperRequests.set(requestId, { resolve, reject, timer });
+    window.postMessage({ source: "pairwise-gsb-console", type, requestId, payload }, window.location.origin);
+  });
+}
+window.addEventListener("message", (event) => {
+  if (event.source !== window || event.origin !== window.location.origin) return;
+  const message = event.data;
+  if (!message || message.source !== "solo-qa-gsb-helper") return;
+  if (message.type === "PAIRWISE_GSB_BRIDGE_READY") {
+    const changed = !state.helperReady || state.helperVersion !== String(message.payload?.version || "");
+    state.helperReady = true; state.helperVersion = String(message.payload?.version || "");
+    if (changed && state.page === "exports") renderExports();
+    return;
+  }
+  const pending = state.helperRequests.get(message.requestId);
+  if (!pending) return;
+  window.clearTimeout(pending.timer); state.helperRequests.delete(message.requestId);
+  if (message.type === "PAIRWISE_GSB_BRIDGE_RESULT") pending.resolve(message.payload || {});
+  else if (message.type === "PAIRWISE_GSB_BRIDGE_ERROR") pending.reject(new Error(message.payload?.error || "提交助手执行失败"));
+});
 function loading() { $("#content").innerHTML = '<div class="loading">正在读取数据…</div>'; }
 async function render() {
   if ($("#dialog")?.open) $("#dialog").close();
@@ -167,9 +194,10 @@ async function renderReviews() {
 
 async function renderExports() {
   const filters = state.filters.exports, data = await api(`/api/deliveries?${queryString("exports")}`); state.exportItems = data.items;
-  $("#content").innerHTML = `<div class="card"><div class="toolbar export-heading"><div><h2>完成 Pair 导出与正式提交</h2><p class="sub">0–1、Feature 和 Bug Pair 分别占一行；资料不完整时仍可导出复核副本</p></div><div class="toolbar-group"><b>已选 ${state.exportSelection.size} 项</b><button class="secondary" onclick="preflightSelected()" ${state.exportSelection.size ? "" : "disabled"}>提交前检查</button><button class="secondary" onclick="selectReady()">只选可提交项</button><button class="secondary" onclick="exportSelected()" ${state.exportSelection.size ? "" : "disabled"}>导出 Excel</button><button class="primary" onclick="submitSelected()" ${state.exportSelection.size ? "" : "disabled"}>正式提交</button><button class="danger" onclick="hideSelected()" ${state.exportSelection.size ? "" : "disabled"}>从列表隐藏</button></div></div>
-    ${filterBar("exports", [["q", "search", "项目编号、Pair、题目或题面", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["difficulty", "select", "全部难度", filters.difficulty, ["困难", "地狱"]], ["readiness", "select", "全部资料状态", filters.readiness, [["ready", "可提交"], ["blocked", "待补资料"]]], ["submission_status", "select", "全部提交状态", filters.submission_status, [["ready_to_submit", "待提交"], ["submitted", "已提交"], ["needs_review", "待重新确认"]]], ["date_from", "date", "完成日期从", filters.date_from], ["date_to", "date", "完成日期到", filters.date_to], ["include_hidden", "select", "未隐藏记录", filters.include_hidden, [["1", "包含已隐藏"]]]])}
-    <div class="selection-row"><label><input type="checkbox" onchange="toggleExportPage(this.checked)"> 选择本页</label><button class="tiny" onclick="recheckSelected()" ${state.exportSelection.size ? "" : "disabled"}>复检所选</button><button class="tiny" onclick="repairSelected()" ${state.exportSelection.size ? "" : "disabled"}>应用复检建议</button><button class="tiny" onclick="restoreSelected()" ${state.exportSelection.size ? "" : "disabled"}>恢复所选</button><button class="tiny" onclick="render()">同步状态</button></div>
+  const helperStatus = state.helperReady ? `<span class="ok">● 提交助手已连接 ${esc(state.helperVersion)}</span>` : '<span class="bad">● 提交助手未连接</span><small>请从部署目录加载 chrome-solo-qa-gsb-helper</small>';
+  $("#content").innerHTML = `<div class="card"><div class="toolbar export-heading"><div><h2>完成 Pair 导出与正式提交</h2><p class="sub">本期 Pair-wise 表单：一道题、双轨迹、双产物、双录像和一份 GSB 对比理由</p><div class="helper-status">${helperStatus}</div></div><div class="toolbar-group"><b>已选 ${state.exportSelection.size} 项</b><button class="secondary" onclick="preflightSelected()" ${state.exportSelection.size ? "" : "disabled"}>提交前检查</button><button class="secondary" onclick="selectReady()">只选可提交项</button><button class="secondary" onclick="exportSelected()" ${state.exportSelection.size ? "" : "disabled"}>导出 Excel</button><button class="primary" onclick="submitSelected()" ${state.exportSelection.size && state.helperReady ? "" : "disabled"}>提交到 SOLO-QA</button><button class="danger" onclick="hideSelected()" ${state.exportSelection.size ? "" : "disabled"}>从列表隐藏</button></div></div>
+    ${filterBar("exports", [["q", "search", "项目编号、Pair、题目或题面", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["difficulty", "select", "全部难度", filters.difficulty, ["困难", "地狱"]], ["readiness", "select", "全部资料状态", filters.readiness, [["ready", "可提交"], ["blocked", "待补资料"]]], ["submission_status", "select", "全部提交状态", filters.submission_status, [["ready_to_submit", "待提交"], ["submitting", "提交中"], ["qc_pending", "质检中"], ["qc_passed", "质检通过"], ["needs_fix", "待返修"], ["discarded", "已废弃"], ["failed", "提交失败"], ["needs_review", "待重新确认"]]], ["date_from", "date", "完成日期从", filters.date_from], ["date_to", "date", "完成日期到", filters.date_to], ["include_hidden", "select", "未隐藏记录", filters.include_hidden, [["1", "包含已隐藏"]]]])}
+    <div class="selection-row"><label><input type="checkbox" onchange="toggleExportPage(this.checked)"> 选择本页</label><button class="tiny" onclick="recheckSelected()" ${state.exportSelection.size ? "" : "disabled"}>复检所选</button><button class="tiny" onclick="repairSelected()" ${state.exportSelection.size ? "" : "disabled"}>应用复检建议</button><button class="tiny" onclick="repairRemoteSelected()" ${state.exportSelection.size && state.helperReady ? "" : "disabled"}>返修到 SOLO-QA</button><button class="tiny" onclick="restoreSelected()" ${state.exportSelection.size ? "" : "disabled"}>恢复所选</button><button class="tiny" onclick="syncSoloQa()" ${state.helperReady ? "" : "disabled"}>同步质检状态</button></div>
     ${table(data.items, [["", (row) => `<input type="checkbox" aria-label="选择 ${esc(row.pair_id)}" ${state.exportSelection.has(row.pair_id) ? "checked" : ""} onchange="toggleExport('${row.pair_id}',this.checked)">`], ["项目 / Pair", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong><small>${esc(row.project_number)} · ${esc(row.pair_id)}</small></div>`], ["类型 / 难度", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} <span class="difficulty">${esc(row.difficulty)}</span></div>`], ["A/B 资料", (row) => `<small class="block">A：${esc(row.a_session_id ? "Session ✓" : "缺 Session")} · ${esc(row.a_check_status || "无验收")} · ${esc(row.a_recording_status || "无录像")}</small><small class="block">B：${esc(row.b_session_id ? "Session ✓" : "缺 Session")} · ${esc(row.b_check_status || "无验收")} · ${esc(row.b_recording_status || "无录像")}</small>`], ["GSB / 复检", (row) => `${badge(row.verdict || "无结论")} ${badge(row.recheck_status || "未复检")}`], ["资料", (row) => badge(row.readiness)], ["提交", (row) => badge(row.submission_status || "not_submitted")], ["完成时间", (row) => date(row.completed_at)], ["操作", (row) => `<button class="tiny" onclick="showDelivery('${row.pair_id}')">展开</button>${row.a_recording_id ? ` <button class="tiny" onclick="playRecording('${row.a_recording_id}','A','${esc(row.title)}')">播放 A</button>` : ""}${row.b_recording_id ? ` <button class="tiny" onclick="playRecording('${row.b_recording_id}','B','${esc(row.title)}')">播放 B</button>` : ""}`]])}${pager("exports", data)}</div>`;
 }
 
@@ -243,10 +271,13 @@ async function monitorReviewBatch(operationIds) {
 
 function toggleExport(pairId, checked) { checked ? state.exportSelection.add(pairId) : state.exportSelection.delete(pairId); renderExports(); }
 function toggleExportPage(checked) { state.exportItems.forEach((item) => checked ? state.exportSelection.add(item.pair_id) : state.exportSelection.delete(item.pair_id)); renderExports(); }
-function selectReady() { state.exportSelection.clear(); state.exportItems.filter((item) => item.readiness === "ready" && item.submission_status !== "submitted").forEach((item) => state.exportSelection.add(item.pair_id)); renderExports(); }
+function selectReady() { state.exportSelection.clear(); state.exportItems.filter((item) => item.readiness === "ready" && ["ready_to_submit", "failed", "not_submitted", ""].includes(item.submission_status || "")).forEach((item) => state.exportSelection.add(item.pair_id)); renderExports(); }
 async function preflightSelected() { try { const data = await api("/api/deliveries/preflight", { method: "POST", body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); showDialog(`<h2>提交前检查</h2>${data.results.map((item) => `<section class="preflight-result"><strong>${esc(item.pair_id)} · ${item.eligible ? '<span class="ok">通过</span>' : '<span class="bad">不通过</span>'}</strong>${item.blockers.map((issue) => `<p class="bad">${esc(issue)}</p>`).join("")}${item.warnings.map((issue) => `<p class="warn">${esc(issue)}</p>`).join("")}</section>`).join("")}`); } catch (error) { notify(error.message, true); } }
 async function exportSelected() { try { const response = await fetch("/api/deliveries/export.xlsx", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || `HTTP ${response.status}`); } const blob = await response.blob(), url = URL.createObjectURL(blob), link = document.createElement("a"); link.href = url; const disposition = response.headers.get("Content-Disposition") || ""; link.download = disposition.match(/filename="([^"]+)"/)?.[1] || "ab-gsb-completed-pairs.xlsx"; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1000); notify(`已导出 ${state.exportSelection.size} 个完成 Pair 的 Excel 复核副本`); } catch (error) { notify(error.message, true); } }
-async function submitSelected() { if (!window.confirm(`将对所选 ${state.exportSelection.size} 个 Pair 执行正式提交登记，提交前会再次检查全部证据。`)) return; try { await api("/api/deliveries/submit", { method: "POST", body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); notify("所选 Pair 已完成正式提交登记"); state.exportSelection.clear(); render(); } catch (error) { notify(error.message, true); } }
+function showHelperResults(title, data) { const rows = (data.results || []).map((item) => `<section class="preflight-result"><strong>${esc(item.pair_id)} · ${esc(item.outcome)}</strong>${item.remote_id ? `<p class="code">远端 #${esc(item.remote_id)}</p>` : ""}${item.reason ? `<p>${esc(item.reason)}</p>` : ""}${item.error ? `<p class="bad">${esc(item.error)}</p>` : ""}</section>`).join(""); showDialog(`<h2>${esc(title)}</h2>${rows || '<p class="sub">没有需要处理的记录。</p>'}`); }
+async function submitSelected() { const ids = [...state.exportSelection]; if (!window.confirm(`将向 SOLO-QA 正式提交 ${ids.length} 个 Pair。每条会上传 A/B 两份轨迹和两份录像，并立即创建本期 GSB 记录，是否继续？`)) return; try { notify("提交助手正在读取本期表单并上传文件…"); const data = await helperCall("PAIRWISE_GSB_SUBMIT", { pair_ids: ids }); showHelperResults("SOLO-QA 提交结果", data); notify(data.failed ? `${data.failed} 条提交失败，请查看结果` : `${ids.length} 条已提交或恢复远端记录`, Boolean(data.failed)); state.exportSelection.clear(); renderExports(); } catch (error) { notify(error.message, true); } }
+async function repairRemoteSelected() { const ids = [...state.exportSelection]; if (!window.confirm(`将用当前本地资料返修所选 ${ids.length} 个 SOLO-QA 记录，是否继续？`)) return; try { notify("提交助手正在上传返修资料…"); const data = await helperCall("PAIRWISE_GSB_REPAIR", { pair_ids: ids }); showHelperResults("SOLO-QA 返修结果", data); notify(data.failed ? `${data.failed} 条返修失败` : "返修已提交，等待重新质检", Boolean(data.failed)); state.exportSelection.clear(); renderExports(); } catch (error) { notify(error.message, true); } }
+async function syncSoloQa() { try { notify("正在读取 SOLO-QA 最新质检状态…"); const data = await helperCall("PAIRWISE_GSB_SYNC"); notify(data.failed ? `同步完成，${data.failed} 条读取失败` : `已同步 ${data.results?.length || 0} 条记录`, Boolean(data.failed)); renderExports(); } catch (error) { notify(error.message, true); } }
 async function hideSelected() { if (!window.confirm("从导出列表隐藏所选记录？项目、代码、轨迹、录像和审计记录都会保留。")) return; try { await api("/api/deliveries/hide", { method: "POST", body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); notify("所选记录已从导出列表隐藏"); state.exportSelection.clear(); render(); } catch (error) { notify(error.message, true); } }
 async function restoreSelected() { try { await api("/api/deliveries/restore", { method: "POST", body: JSON.stringify({ pairIds: [...state.exportSelection] }) }); notify("所选记录已恢复"); state.exportSelection.clear(); render(); } catch (error) { notify(error.message, true); } }
 async function recheckSelected() { const ids = [...state.exportSelection]; try { for (const id of ids) await api(`/api/pairs/${id}/gsb/recheck`, { method: "POST", body: "{}" }); notify(`已启动 ${ids.length} 个 GSB 复检作业`); } catch (error) { notify(error.message, true); } }
@@ -270,3 +301,4 @@ window.addEventListener("hashchange", () => { loadUrl(); render(); });
 window.setInterval(() => $("#clock").textContent = new Date().toLocaleString("zh-CN"), 1000);
 render();
 api("/api/settings").then((settings) => $("#runtime-summary").textContent = `Codex ${settings.codex_model} · Claude ${settings.claude_model}`).catch(() => {});
+window.postMessage({ source: "pairwise-gsb-console", type: "PAIRWISE_GSB_BRIDGE_PING", requestId: "", payload: {} }, window.location.origin);

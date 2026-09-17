@@ -75,6 +75,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._reviews_page(query))
             if path == "/api/deliveries":
                 return self._json(200, self._deliveries_page(query))
+            if path == "/api/solo-qa/submissions":
+                return self._json(200, {"items": self.app.db.all(
+                    """SELECT pair_id,status,remote_id,remote_url,payload_sha256,remote_status,
+                              qc_summary,remote_updated_at,error,submitted_at,updated_at
+                       FROM delivery_submissions WHERE remote_id<>'' ORDER BY updated_at DESC"""
+                )})
+            match = re.fullmatch(r"/api/solo-qa/pairs/(pair-[a-f0-9]{16})/payload", path)
+            if match:
+                return self._json(200, self.app.service.solo_qa_payload(match.group(1)))
+            match = re.fullmatch(r"/api/solo-qa/pairs/(pair-[a-f0-9]{16})/files/([a-z_]+)", path)
+            if match:
+                return self._solo_qa_file_content(match.group(1), match.group(2))
             if path == "/api/audit":
                 return self._json(200, self._page("audit_events", query, self._filter(query, ("event_type", "entity_type")), order="id DESC"))
             match = re.fullmatch(r"/api/operations/([^/]+)", path)
@@ -154,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, result)
             if path == "/api/deliveries/preflight":
                 pair_ids = self._pair_ids(body)
-                results = [self.app.service.delivery_preflight(pair_id) for pair_id in pair_ids]
+                results = [self.app.service.delivery_preflight(pair_id, include_platform=True) for pair_id in pair_ids]
                 return self._json(200, {"checked_at": now_iso(), "results": results})
             if path == "/api/deliveries/export.xlsx":
                 pair_ids = self._pair_ids(body)
@@ -162,6 +174,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload, filename = build_xlsx(rows)
                 return self._bytes(200, payload, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    'attachment; filename="%s"' % filename)
+            if path == "/api/solo-qa/state":
+                return self._json(200, self.app.service.update_solo_qa_state(body))
             if path in ("/api/deliveries/hide", "/api/deliveries/restore", "/api/deliveries/submit"):
                 pair_ids = self._pair_ids(body)
                 results = []
@@ -270,6 +284,24 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
+
+    def _solo_qa_file_content(self, pair_id: str, field_key: str) -> None:
+        item = self.app.service.solo_qa_file(pair_id, field_key)
+        path = Path(str(item["path"])).resolve()
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", str(item.get("content_type") or "application/octet-stream"))
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", 'attachment; filename="%s"' % path.name.replace('"', ""))
+        self.send_header("X-Content-SHA256", str(item.get("sha256") or ""))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def _static(self, path: str) -> None:
         relative = "index.html" if path in ("", "/") else path.lstrip("/")

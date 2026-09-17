@@ -1,5 +1,6 @@
 import hashlib
 import json
+import mimetypes
 import re
 import threading
 import time
@@ -849,7 +850,7 @@ class PairwiseService:
         self.db.audit("gsb.recheck_applied", "pair", pair_id, {"recheck_id": recheck_id})
         return self.pair_detail(pair_id)
 
-    def delivery_preflight(self, pair_id: str) -> Dict[str, Any]:
+    def delivery_preflight(self, pair_id: str, include_platform: bool = False) -> Dict[str, Any]:
         detail = self.pair_detail(pair_id)
         blockers: List[str] = []
         warnings: List[str] = []
@@ -877,8 +878,227 @@ class PairwiseService:
             blockers.append("模型复检发现公开理由存在事实冲突")
         elif latest.get("result_status") == "suggested_revision":
             warnings.append("模型复检给出了措辞修改建议")
+        if include_platform:
+            _, _, platform_blockers = self._solo_qa_material(detail)
+            blockers.extend(issue for issue in platform_blockers if issue not in blockers)
         return {"pair_id": pair_id, "eligible": not blockers, "blockers": blockers, "warnings": warnings,
                 "evidence_version": version, "checked_at": now_iso()}
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _trace_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "".join(parts)
+        return ""
+
+    def _inspect_trace(self, arm: Dict[str, Any], prompt: str) -> tuple:
+        issues: List[str] = []
+        session_id = str(arm.get("session_id") or "").strip()
+        root = Path(str(arm.get("trace_path") or "")).expanduser().resolve()
+        allowed_root = (self.config.data_dir / "claude-runs").resolve()
+        if not session_id or allowed_root not in root.parents or not root.is_dir():
+            return None, "", [str(arm.get("arm") or "?") + " 轨迹目录无效"]
+        matches = list(root.rglob(session_id + ".jsonl"))
+        if len(matches) != 1:
+            return None, "", [str(arm.get("arm") or "?") + " 未找到唯一的 SessionID 轨迹文件"]
+        path = matches[0].resolve()
+        if path.stat().st_size > 27 * 1024 * 1024:
+            issues.append(str(arm.get("arm") or "?") + " 轨迹文件超过本期 27 MB 上限")
+        versions, sessions = set(), set()
+        exact_prompt = False
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as source:
+                for line in source:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if event.get("version"):
+                        versions.add(str(event["version"]))
+                    if event.get("sessionId"):
+                        sessions.add(str(event["sessionId"]))
+                    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                    if (event.get("type") == "user" or message.get("role") == "user") and self._trace_text(message.get("content")) == prompt:
+                        exact_prompt = True
+        except OSError as exc:
+            issues.append(str(arm.get("arm") or "?") + " 轨迹读取失败：" + str(exc))
+        if sessions and session_id not in sessions:
+            issues.append(str(arm.get("arm") or "?") + " SessionID 与轨迹内容不一致")
+        if not exact_prompt:
+            issues.append(str(arm.get("arm") or "?") + " 轨迹中没有与题面逐字一致的首轮 User Prompt")
+        version = next(iter(versions)) if len(versions) == 1 else ""
+        if not version:
+            issues.append(str(arm.get("arm") or "?") + " 轨迹无法确定唯一 Harness 版本")
+        return path, version, issues
+
+    def _solo_qa_material(self, detail: Dict[str, Any]) -> tuple:
+        issues: List[str] = []
+        task = detail.get("task") or {}
+        repo = detail.get("repository") or {}
+        review = detail.get("gsb") or {}
+        arms = {row["arm"]: row for row in detail.get("arms", [])}
+        recs = {row["arm"]: row for row in detail.get("recordings", [])}
+        task_types = {"zero_to_one": "0-1代码生成", "feature": "feature迭代", "bugfix": "Bug修复"}
+        verdicts = {"A better": "A 更好", "Same": "Same", "B better": "B 更好"}
+        task_type = task_types.get(str(task.get("task_type") or ""), "")
+        if not task_type:
+            issues.append("任务类型无法映射到本期 GSB 表单")
+        difficulty = str(task.get("difficulty") or "")
+        if difficulty not in ("困难", "地狱"):
+            issues.append("本期只允许提交困难或地狱题目")
+        prompt = str(task.get("prompt") or "")
+        if not prompt:
+            issues.append("缺少完整 User Prompt")
+        remote = str(repo.get("remote_url") or "").removesuffix(".git")
+        main_sha = str(repo.get("main_sha") or detail.get("baseline_sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", main_sha):
+            issues.append("初始环境快照不是 40 位完整 SHA")
+        if not re.fullmatch(r"https://github\.com/[^/]+/[^/]+", remote):
+            issues.append("缺少有效的 GitHub 仓库地址")
+        files: Dict[str, Dict[str, Any]] = {}
+        versions: Dict[str, str] = {}
+        for arm_name in ("A", "B"):
+            arm = arms.get(arm_name) or {"arm": arm_name}
+            trace, version, trace_issues = self._inspect_trace(arm, prompt)
+            issues.extend(trace_issues)
+            versions[arm_name] = version
+            if trace:
+                files[arm_name.lower() + "_trace_file"] = {
+                    "name": trace.name, "path": str(trace), "size": trace.stat().st_size,
+                    "sha256": self._sha256_file(trace), "content_type": "application/x-ndjson",
+                }
+            commit_sha = str(arm.get("commit_sha") or "")
+            if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+                issues.append(arm_name + " 产物快照不是 40 位完整 SHA")
+            workspace = Path(str(arm.get("workspace_path") or "")).expanduser().resolve()
+            if commit_sha and workspace.is_dir():
+                parent = run_command(["git", "rev-parse", commit_sha + "^"], cwd=workspace, check=False, timeout=15)
+                if parent.returncode != 0 or parent.stdout.strip() != main_sha:
+                    issues.append(arm_name + " 产物快照的父提交不是初始环境快照")
+            rec = recs.get(arm_name) or {}
+            video = Path(str(rec.get("path") or "")).expanduser().resolve()
+            recording_root = (self.config.data_dir / "recordings").resolve()
+            if recording_root not in video.parents or not video.is_file():
+                issues.append(arm_name + " 录像文件不存在")
+            elif video.suffix.lower() not in (".mp4", ".mov", ".webm", ".m4v"):
+                issues.append(arm_name + " 录像格式不受本期平台支持")
+            elif video.stat().st_size > 500 * 1024 * 1024:
+                issues.append(arm_name + " 录像超过本期 500 MB 上限")
+            else:
+                files[arm_name.lower() + "_video"] = {
+                    "name": video.name, "path": str(video), "size": video.stat().st_size,
+                    "sha256": str(rec.get("sha256") or self._sha256_file(video)),
+                    "content_type": mimetypes.guess_type(str(video))[0] or "video/mp4",
+                }
+        if versions.get("A") and versions.get("B") and versions["A"] != versions["B"]:
+            issues.append("A/B Harness 版本不一致")
+        a_session = str((arms.get("A") or {}).get("session_id") or "")
+        b_session = str((arms.get("B") or {}).get("session_id") or "")
+        if a_session and a_session == b_session:
+            issues.append("A/B 必须使用不同 SessionID")
+        verdict = verdicts.get(str(review.get("verdict") or ""), "")
+        if not verdict:
+            issues.append("GSB 结论无法映射到本期表单")
+        reason = str(review.get("reason") or "").replace("`", "").strip()
+        if len(reason) < 60:
+            issues.append("GSB 理由不足 60 字")
+        if "A：" not in reason or "B：" not in reason:
+            issues.append("GSB 理由必须分别包含 A、B 评价")
+        values = {
+            "user_prompt": prompt,
+            "question_type": task_type,
+            "difficulty": difficulty,
+            "languages": str(task.get("stack") or "")[:255],
+            "harness": "Claude Code",
+            "harness_version": versions.get("A") or versions.get("B") or "",
+            "os_platform": "MacOS/Linux",
+            "repro_level": "已容器化，可一键起环境",
+            "env_snapshot": remote + "/commit/" + main_sha if remote and main_sha else "",
+            "a_session_id": a_session,
+            "a_artifact_snapshot": remote + "/commit/" + str((arms.get("A") or {}).get("commit_sha") or "") if remote else "",
+            "b_session_id": b_session,
+            "b_artifact_snapshot": remote + "/commit/" + str((arms.get("B") or {}).get("commit_sha") or "") if remote else "",
+            "gsb_verdict": verdict,
+            "gsb_reason": reason,
+            "validity": "有效",
+            "remark": "",
+        }
+        return values, files, issues
+
+    def solo_qa_payload(self, pair_id: str) -> Dict[str, Any]:
+        detail = self.pair_detail(pair_id)
+        check = self.delivery_preflight(pair_id, include_platform=True)
+        values, files, platform_issues = self._solo_qa_material(detail)
+        for key, meta in files.items():
+            meta["url"] = "/api/solo-qa/pairs/%s/files/%s" % (pair_id, key)
+        payload_identity = {
+            "pair_id": pair_id,
+            "values": values,
+            "files": {key: {k: v for k, v in meta.items() if k != "path"} for key, meta in files.items()},
+        }
+        payload_sha256 = hashlib.sha256(json.dumps(payload_identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        return {
+            **payload_identity,
+            "ready": bool(check["eligible"]),
+            "issues": list(dict.fromkeys(check["blockers"] + platform_issues)),
+            "warnings": check["warnings"],
+            "payload_sha256": payload_sha256,
+            "solo_qa": detail.get("delivery") or {},
+        }
+
+    def solo_qa_file(self, pair_id: str, field_key: str) -> Dict[str, Any]:
+        detail = self.pair_detail(pair_id)
+        _, files, _ = self._solo_qa_material(detail)
+        item = files.get(field_key)
+        if not item:
+            raise KeyError("提交文件不存在")
+        return item
+
+    def update_solo_qa_state(self, values: Dict[str, Any]) -> Dict[str, Any]:
+        pair_id = str(values.get("pair_id") or "")
+        self._pair(pair_id)
+        allowed = {"ready_to_submit", "submitting", "qc_pending", "qc_passed", "needs_fix", "discarded", "failed"}
+        status = str(values.get("status") or "")
+        if status not in allowed:
+            raise ValueError("提交状态无效")
+        stamp = now_iso()
+        submission_id = "delivery-" + uuid.uuid4().hex[:16]
+        cleaned = lambda key, limit: str(values.get(key) or "")[:limit]
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,remote_id,remote_url,payload_sha256,
+                 remote_status,qc_summary,remote_updated_at,error,submitted_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pair_id) DO UPDATE SET
+                 status=excluded.status,remote_id=excluded.remote_id,remote_url=excluded.remote_url,
+                 payload_sha256=excluded.payload_sha256,remote_status=excluded.remote_status,
+                 qc_summary=excluded.qc_summary,remote_updated_at=excluded.remote_updated_at,
+                 error=excluded.error,submitted_at=CASE WHEN excluded.submitted_at IS NOT NULL
+                   THEN excluded.submitted_at ELSE delivery_submissions.submitted_at END,
+                 updated_at=excluded.updated_at""",
+            (submission_id, pair_id, status, cleaned("remote_id", 128), cleaned("remote_url", 1000),
+             cleaned("payload_sha256", 64), cleaned("remote_status", 64), cleaned("qc_summary", 2000),
+             cleaned("remote_updated_at", 128), cleaned("error", 2000),
+             cleaned("submitted_at", 128) or None, stamp, stamp),
+        )
+        self.db.audit("solo_qa.state", "pair", pair_id, {"status": status, "remote_id": cleaned("remote_id", 128)})
+        return self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
 
     def set_delivery_hidden(self, pair_id: str, hidden: bool) -> Dict[str, Any]:
         self._pair(pair_id)
@@ -894,19 +1114,7 @@ class PairwiseService:
         return self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
 
     def submit_delivery(self, pair_id: str) -> Dict[str, Any]:
-        check = self.delivery_preflight(pair_id)
-        if not check["eligible"]:
-            raise ValueError("提交前检查未通过：" + "；".join(check["blockers"]))
-        stamp = now_iso()
-        submission_id = "delivery-" + uuid.uuid4().hex[:16]
-        self.db.execute(
-            """INSERT INTO delivery_submissions(id,pair_id,status,submitted_at,created_at,updated_at)
-               VALUES(?,?,'submitted',?,?,?) ON CONFLICT(pair_id) DO UPDATE SET
-               status='submitted',submitted_at=excluded.submitted_at,error='',updated_at=excluded.updated_at""",
-            (submission_id, pair_id, stamp, stamp, stamp),
-        )
-        self.db.audit("delivery.submitted", "pair", pair_id, {"evidence_version": check["evidence_version"]})
-        return self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
+        raise ValueError("正式提交必须通过 Chrome 提交小助手上传到 SOLO-QA，不能只在本地登记")
 
     def pair_detail(self, pair_id: str) -> Dict[str, Any]:
         self.refresh_recording_stage(pair_id)
