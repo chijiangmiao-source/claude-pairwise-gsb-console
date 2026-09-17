@@ -1141,7 +1141,7 @@ class PairwiseService:
              json.dumps(result["evidenceRefs"], ensure_ascii=False), model, effort,
              str(latest_job.get("id") or ""), stamp),
         )
-        self.db.audit("gsb.rechecked", "pair", pair_id, {"recheck_id": recheck_id, "status": result["status"], "model": model, "effort": effort})
+        self.db.audit("gsb.rechecked", "pair", pair_id, {"recheck_id": recheck_id, "status": result_status, "model": model, "effort": effort})
         recheck = self.db.one("SELECT * FROM gsb_rechecks WHERE id=?", (recheck_id,)) or {}
         recheck.pop("suggested_preference_reason", None)
         return recheck
