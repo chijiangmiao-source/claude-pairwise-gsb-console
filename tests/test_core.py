@@ -941,10 +941,11 @@ class CoreTests(unittest.TestCase):
     def test_gsb_prompt_requires_plain_language_trace_and_reproduced_bug_evidence(self):
         prompt = gsb_prompt("开发送检单", "A evidence", "B evidence", "process events")
         self.assertIn("traceEvidence", prompt)
-        self.assertIn("步骤号只能引用 traceEvidence 的 step", prompt)
-        self.assertIn("discoveredBugs 中有已复现问题", prompt)
-        self.assertIn("轨迹里没有跑接口业务测试", prompt)
-        self.assertIn("写得像给同事讲清楚这次开发", prompt)
+        self.assertIn("不要写成审计报告", prompt)
+        self.assertIn("不要复述完整操作过程", prompt)
+        self.assertIn("每段保留一个真实定位即可", prompt)
+        self.assertIn("没有实际跑接口流程", prompt)
+        self.assertIn("40–180 个中文字符", prompt)
         self.assertIn("process events", prompt)
 
     def test_completed_pair_with_current_failed_artifact_is_quarantined(self):
