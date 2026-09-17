@@ -118,6 +118,10 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 operation = self.app.service.recheck_gsb_async(match.group(1))
                 return self._json(202, {"operationId": operation})
+            if path == "/api/gsb-reviews/recheck":
+                pair_ids = self._pair_ids(body)
+                operations = [self.app.service.recheck_gsb_async(pair_id) for pair_id in pair_ids]
+                return self._json(202, {"count": len(operations), "operationIds": operations})
             match = re.fullmatch(r"/api/pairs/([^/]+)/gsb/recheck/([^/]+)/apply", path)
             if match:
                 return self._json(200, self.app.service.apply_gsb_recheck(match.group(1), match.group(2)))
@@ -364,6 +368,12 @@ class Handler(BaseHTTPRequestHandler):
             value = self._query(query, key)
             if value:
                 clauses.append(column + "=?"); params.append(value)
+        date_from, date_to = self._query(query, "date_from"), self._query(query, "date_to")
+        review_date = "date(COALESCE(g.confirmed_at,g.updated_at),'+8 hours')"
+        if date_from:
+            clauses.append(review_date + ">=date(?)"); params.append(date_from)
+        if date_to:
+            clauses.append(review_date + "<=date(?)"); params.append(date_to)
         select = """SELECT g.*,p.chain_id project_number,p.status pair_status,p.stage,t.title,t.task_type,t.difficulty,
           r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,r.issues_json,
           r.evidence_refs_json,r.model recheck_model,r.reasoning_effort recheck_effort,r.evidence_version recheck_evidence_version,

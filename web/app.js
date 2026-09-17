@@ -5,6 +5,7 @@ const state = {
   pages: { tasks: 1, pairs: 1, reviews: 1, codex: 1, bugs: 1, evidence: 1, exports: 1 },
   sizes: { tasks: 20, pairs: 20, reviews: 20, codex: 20, bugs: 20, evidence: 20, exports: 20 },
   filters: { reviews: {}, evidence: {}, exports: {} },
+  reviewSelection: new Set(), reviewItems: [],
   exportSelection: new Set(), exportItems: [], preflight: null,
 };
 const titles = {
@@ -116,9 +117,18 @@ async function renderEvidence() {
 
 async function renderReviews() {
   const filters = state.filters.reviews, data = await api(`/api/gsb-reviews?${queryString("reviews")}`);
-  $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>复核与人工确认</h2><p class="sub">公开理由可用高强度模型复检；事实冲突会阻止正式导出，措辞建议不会阻止确认</p></div></div>
-    ${filterBar("reviews", [["q", "search", "项目编号、Pair、题目、理由或审核人", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, ["zero_to_one", "feature", "bugfix"]], ["difficulty", "select", "全部难度", filters.difficulty, ["困难", "地狱"]], ["verdict", "select", "全部结论", filters.verdict, ["A better", "Same", "B better"]], ["status", "select", "全部确认状态", filters.status, ["draft", "confirmed"]], ["recheck_status", "select", "全部复检状态", filters.recheck_status, [["passed", "复检通过"], ["suggested_revision", "建议修改"], ["fact_conflict", "事实冲突"]]]])}
-    ${table(data.items, [["项目 / Pair", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong><small>${esc(row.project_number)} · ${esc(row.pair_id)}</small></div>`], ["类型 / 难度", (row) => `${esc(row.task_type)} · <span class="difficulty">${esc(row.difficulty)}</span>`], ["结论", (row) => badge(row.verdict)], ["公开理由", (row) => `<div class="review-text clamp">${esc(row.reason)}</div>`], ["复检", (row) => row.recheck_status ? badge(row.recheck_status) : badge("未复检")], ["人工确认", (row) => `${badge(row.status)}<small class="block">${esc(row.confirmed_by || "")}</small>`], ["操作", (row) => `<button class="tiny" onclick="reviewGsb('${row.pair_id}')">查看/编辑</button> <button class="tiny primary" onclick="recheckGsb('${row.pair_id}')">复检</button>`]])}${pager("reviews", data)}</div>`;
+  state.reviewItems = data.items;
+  const allSelected = data.items.length > 0 && data.items.every((row) => state.reviewSelection.has(row.pair_id));
+  const rows = data.items.map((row) => `<article class="review-list-row">
+    <label class="review-select"><input type="checkbox" aria-label="选择 ${esc(row.pair_id)}" ${state.reviewSelection.has(row.pair_id) ? "checked" : ""} onchange="toggleReview('${row.pair_id}',this.checked)"></label>
+    <div class="review-summary"><strong>${esc(row.title)}</strong><small>${esc(row.project_number)} · ${esc(row.pair_id)}</small><small>${esc(row.task_type)} · <span class="difficulty">${esc(row.difficulty)}</span> · ${date(row.confirmed_at || row.updated_at)}</small></div>
+    <div class="review-result"><span>${badge(row.verdict)}</span><span>${row.recheck_status ? badge(row.recheck_status) : badge("未复检")}</span></div>
+    <div class="review-reason"><span class="mobile-label">公开理由</span><p>${esc(row.reason)}</p></div>
+    <div class="review-confirm"><div>${badge(row.status)}<small>${esc(row.confirmed_by || "未确认")}</small></div><div class="review-row-actions"><button class="tiny" onclick="reviewGsb('${row.pair_id}')">查看/编辑</button><button class="tiny primary" onclick="recheckGsb('${row.pair_id}')">复检</button></div></div>
+  </article>`).join("");
+  $("#content").innerHTML = `<div class="card review-page"><div class="toolbar review-heading"><div><h2>复核与人工确认</h2><p class="sub">公开理由可用高强度模型复检；事实冲突会阻止正式导出，措辞建议不会阻止确认</p></div><div class="review-batch-actions"><b>已选 ${state.reviewSelection.size} 项</b><label><input type="checkbox" ${allSelected ? "checked" : ""} onchange="toggleReviewPage(this.checked)"> 选择本页</label><button class="primary" onclick="recheckReviewsSelected()" ${state.reviewSelection.size ? "" : "disabled"}>批量复检</button></div></div>
+    ${filterBar("reviews", [["q", "search", "项目编号、Pair、题目、理由或审核人", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, ["zero_to_one", "feature", "bugfix"]], ["difficulty", "select", "全部难度", filters.difficulty, ["困难", "地狱"]], ["verdict", "select", "全部结论", filters.verdict, ["A better", "Same", "B better"]], ["status", "select", "全部确认状态", filters.status, [["draft", "草稿"], ["confirmed", "已确认"]]], ["recheck_status", "select", "全部复检状态", filters.recheck_status, [["passed", "复检通过"], ["suggested_revision", "建议修改"], ["fact_conflict", "事实冲突"]]], ["date_from", "date", "记录日期从", filters.date_from], ["date_to", "date", "记录日期到", filters.date_to]])}
+    <div class="review-list"><div class="review-list-head"><span></span><span>项目 / 记录时间</span><span>结论 / 复检</span><span>公开理由</span><span>人工确认 / 操作</span></div>${rows || '<div class="empty">暂无记录</div>'}</div>${pager("reviews", data)}</div>`;
 }
 
 async function renderExports() {
@@ -167,6 +177,33 @@ async function reviewGsb(id) {
 async function confirmGsb(id) { const verdict = $('input[name="verdict"]:checked')?.value, reason = $("#gsb-reason").value, confirmedBy = $("#confirmed-by").value; try { await api(`/api/pairs/${id}/gsb/confirm`, { method: "POST", body: JSON.stringify({ verdict, reason, confirmedBy }) }); $("#dialog").close(); notify("GSB 已人工确认，记录进入待正式提交状态"); render(); } catch (error) { notify(error.message, true); } }
 async function recheckGsb(id) { try { if ($("#dialog")?.open) $("#dialog").close(); const data = await api(`/api/pairs/${id}/gsb/recheck`, { method: "POST", body: "{}" }); notify("GSB 高强度复检已启动"); poll(data.operationId, () => reviewGsb(id)); } catch (error) { notify(error.message, true); } }
 async function applyRecheck(pairId, recheckId) { try { await api(`/api/pairs/${pairId}/gsb/recheck/${recheckId}/apply`, { method: "POST", body: "{}" }); notify("已应用复检建议，请人工复核后重新确认"); await reviewGsb(pairId); } catch (error) { notify(error.message, true); } }
+
+function toggleReview(pairId, checked) { checked ? state.reviewSelection.add(pairId) : state.reviewSelection.delete(pairId); renderReviews(); }
+function toggleReviewPage(checked) { state.reviewItems.forEach((item) => checked ? state.reviewSelection.add(item.pair_id) : state.reviewSelection.delete(item.pair_id)); renderReviews(); }
+async function recheckReviewsSelected() {
+  const pairIds = [...state.reviewSelection];
+  if (!pairIds.length) return;
+  try {
+    const data = await api("/api/gsb-reviews/recheck", { method: "POST", body: JSON.stringify({ pairIds }) });
+    notify(`已启动 ${data.count} 条 GSB 批量复检，完成后会自动刷新`);
+    state.reviewSelection.clear();
+    renderReviews();
+    monitorReviewBatch(data.operationIds || []);
+  } catch (error) { notify(error.message, true); }
+}
+async function monitorReviewBatch(operationIds) {
+  let failed = 0;
+  for (let attempt = 0; attempt < 900 && operationIds.length; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    const results = await Promise.all(operationIds.map((id) => api(`/api/operations/${id}`)));
+    if (results.every((item) => ["completed", "failed"].includes(item.status))) {
+      failed = results.filter((item) => item.status === "failed").length;
+      notify(failed ? `批量复检完成，${failed} 条失败` : `批量复检完成，共 ${results.length} 条`, Boolean(failed));
+      if (state.page === "reviews") renderReviews();
+      return;
+    }
+  }
+}
 
 function toggleExport(pairId, checked) { checked ? state.exportSelection.add(pairId) : state.exportSelection.delete(pairId); renderExports(); }
 function toggleExportPage(checked) { state.exportItems.forEach((item) => checked ? state.exportSelection.add(item.pair_id) : state.exportSelection.delete(item.pair_id)); renderExports(); }
