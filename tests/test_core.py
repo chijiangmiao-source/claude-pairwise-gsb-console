@@ -241,7 +241,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["gsb"]["final_verdict"], "A better")
         self.assertEqual(result["delivery"]["status"], "ready_to_submit")
 
-    def test_generated_gsb_is_default_confirmed_and_keeps_two_review_sections(self):
+    def test_generated_gsb_self_corrects_missing_locators_and_is_default_confirmed(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -269,8 +269,14 @@ class CoreTests(unittest.TestCase):
             "bReason": "B 在 app/main.py 的 create 方法完成核心流程，但 pytest 显示异常恢复仍有可复现偏差，因此不优先。",
             "evidence": ["A Docker 通过", "B 异常路径失败"],
         }
-        with patch.object(self.service.codex, "run", return_value=result_payload):
+        first_payload = dict(result_payload)
+        first_payload.update({
+            "aReason": "A 完成了全部主要流程，异常路径与持久化结果都有可见验收证据，因此更倾向 A。",
+            "bReason": "B 完成了核心流程，但异常恢复仍有可复现偏差，因此相比 A 不优先。",
+        })
+        with patch.object(self.service.codex, "run", side_effect=[first_payload, result_payload]) as mocked_run:
             review = self.service.generate_gsb(pair["id"])
+        self.assertEqual(mocked_run.call_count, 2)
         self.assertEqual(review["a_reason"], result_payload["aReason"])
         self.assertEqual(review["b_reason"], result_payload["bReason"])
         self.assertNotIn("preference_reason", review)
@@ -357,11 +363,12 @@ class CoreTests(unittest.TestCase):
             "suggestedBReason": "B 也完成了核心要求，后续验收结果相同，因此两边表现接近。",
             "issues": [], "evidenceRefs": ["checks[A]", "checks[B]"],
         }
-        with patch.object(self.service.codex, "run", return_value=payload):
+        with patch.object(self.service.codex, "run", return_value=payload) as mocked_run:
             result = self.service._recheck_gsb(pair["id"])
         self.assertEqual(result["result_status"], "suggested_revision")
         self.assertIn("A 评价缺少可核对的触发节点", result["issues_json"])
         self.assertIn("B 评价缺少可核对的触发节点", result["issues_json"])
+        self.assertEqual(mocked_run.call_count, 2)
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}

@@ -941,13 +941,34 @@ class PairwiseService:
                WHERE entity_id=? OR entity_id LIKE ? OR detail_json LIKE ? ORDER BY id""",
             (pair_id, pair_id + "-%", "%" + pair_id + "%"),
         )
+        review_prompt = gsb_prompt(
+            task.get("prompt", ""),
+            json.dumps(evidence["A"], ensure_ascii=False),
+            json.dumps(evidence["B"], ensure_ascii=False),
+        )
         result = self.codex.run(
             "gsb_review",
-            gsb_prompt(task.get("prompt", ""), json.dumps(evidence["A"], ensure_ascii=False), json.dumps(evidence["B"], ensure_ascii=False)),
+            review_prompt,
             GSB_SCHEMA, pair_id=pair_id, task_id=pair["task_id"], timeout=1800,
         )
         a_reason = self._clean_gsb_part(result["aReason"], 300)
         b_reason = self._clean_gsb_part(result["bReason"], 300)
+        locator_issues = self._gsb_locator_issues(a_reason, b_reason)
+        if locator_issues:
+            correction = (
+                review_prompt + "\n\n上一次输出未通过具体定位校验：" + "；".join(locator_issues)
+                + "\n上一次 A 理由：" + a_reason + "\n上一次 B 理由：" + b_reason
+                + "\n请只依据上面的真实证据重新生成；每段补充至少一个步骤、文件/函数、命令或报错定位。"
+            )
+            result = self.codex.run(
+                "gsb_review", correction, GSB_SCHEMA,
+                pair_id=pair_id, task_id=pair["task_id"], timeout=1800,
+            )
+            a_reason = self._clean_gsb_part(result["aReason"], 300)
+            b_reason = self._clean_gsb_part(result["bReason"], 300)
+            locator_issues = self._gsb_locator_issues(a_reason, b_reason)
+            if locator_issues:
+                raise ValueError("GSB 自动纠正后仍缺少具体定位：" + "；".join(locator_issues))
         reason = self._compose_gsb_reason(a_reason, b_reason)
         review_id = "gsb-" + uuid.uuid4().hex[:16]
         stamp = now_iso()
@@ -1066,10 +1087,13 @@ class PairwiseService:
         version = self.gsb_evidence_version(pair_id, verdict, reason)
         model = str(self.db.setting("gsb_recheck_model", "gpt-6-astra"))
         effort = str(self.db.setting("gsb_recheck_effort", "high"))
+        recheck_prompt = gsb_recheck_prompt(
+            str(evidence["task"].get("prompt") or ""), verdict, a_reason, b_reason,
+            json.dumps(evidence, ensure_ascii=False),
+        )
         result = self.codex.run(
             "gsb_recheck",
-            gsb_recheck_prompt(str(evidence["task"].get("prompt") or ""), verdict, a_reason, b_reason,
-                               json.dumps(evidence, ensure_ascii=False)),
+            recheck_prompt,
             GSB_RECHECK_SCHEMA,
             pair_id=pair_id,
             task_id=pair["task_id"],
@@ -1080,6 +1104,20 @@ class PairwiseService:
         suggested_a = self._clean_gsb_part(result["suggestedAReason"], 300)
         suggested_b = self._clean_gsb_part(result["suggestedBReason"], 300)
         locator_issues = self._gsb_locator_issues(suggested_a, suggested_b)
+        if locator_issues:
+            correction = (
+                recheck_prompt + "\n\n上一次建议文本未通过具体定位校验：" + "；".join(locator_issues)
+                + "\n上一次建议 A 理由：" + suggested_a + "\n上一次建议 B 理由：" + suggested_b
+                + "\n请重新复检，并确保 suggestedAReason 与 suggestedBReason 各自包含真实可核对的位置。"
+            )
+            result = self.codex.run(
+                "gsb_recheck", correction, GSB_RECHECK_SCHEMA,
+                pair_id=pair_id, task_id=pair["task_id"], timeout=1800,
+                model_override=model, effort_override=effort,
+            )
+            suggested_a = self._clean_gsb_part(result["suggestedAReason"], 300)
+            suggested_b = self._clean_gsb_part(result["suggestedBReason"], 300)
+            locator_issues = self._gsb_locator_issues(suggested_a, suggested_b)
         result_status = str(result["status"])
         result_issues = [str(item) for item in result.get("issues", [])]
         if locator_issues:
