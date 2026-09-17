@@ -13,6 +13,7 @@ from pairwise_console.config import OLD_APP_DIR, load_config
 from pairwise_console.db import Database, now_iso
 from pairwise_console.gitops import GitOps
 from pairwise_console.analytics import dashboard
+from pairwise_console.artifact import isolated_compose_environment
 from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
@@ -624,6 +625,82 @@ class CoreTests(unittest.TestCase):
                                        pair["id"], "arm-artifact-A", "Build a hard project with Docker Compose")
         current = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(current["stage"], "development")
+
+    def test_compose_port_variables_are_all_isolated(self):
+        compose = self.root / "docker-compose.yml"
+        compose.write_text(
+            "services:\n"
+            "  api:\n    ports: ['${API_PORT:-8000}:8000']\n"
+            "  web:\n    ports: ['${WEB_PORT:-8080}:80']\n",
+            encoding="utf-8",
+        )
+        env, assigned = isolated_compose_environment(compose)
+        self.assertEqual(env["API_PORT"], assigned["API_PORT"])
+        self.assertEqual(env["WEB_PORT"], assigned["WEB_PORT"])
+        self.assertNotEqual(assigned["API_PORT"], assigned["WEB_PORT"])
+        self.assertTrue(all(value.isdigit() for value in assigned.values()))
+
+    def test_host_port_collision_reuses_completed_commits(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-port-" + arm, pair["id"], arm, arm, str(self.root / arm), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", arm.lower() * 40, stamp, stamp),
+            )
+        collision = {
+            "status": "failed", "error": "Docker Compose 清洁启动失败",
+            "checks_json": json.dumps([{
+                "name": "clean_start", "passed": False,
+                "detail": "Bind for 0.0.0.0:8080 failed: port is already allocated",
+            }]),
+        }
+        checks = [{**collision, "arm": "A"}, {**collision, "arm": "B"}]
+        with patch.object(self.service.artifacts, "validate", side_effect=checks), \
+             patch.object(self.service, "_handle_attempt_failure") as retry:
+            result = self.service._validate_pair_artifacts(pair["id"])
+        retry.assert_not_called()
+        self.assertEqual(result["reused"], ["A", "B"])
+        current = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {"status": "running", "stage": "artifact_validation"})
+        arms = self.db.all("SELECT status,commit_sha FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair["id"],))
+        self.assertEqual([arm["status"] for arm in arms], ["completed", "completed"])
+        self.assertEqual([arm["commit_sha"] for arm in arms], ["a" * 40, "b" * 40])
+
+    def test_recording_failure_pair_reopens_without_redeveloping(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-reuse-" + arm, pair["id"], arm, arm, str(self.root / arm), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""",
+                ("check-reuse-" + arm, pair["id"], arm, sha, stamp, stamp),
+            )
+        self.db.execute(
+            "UPDATE pairs SET status='failed',stage='recording_failed',error='old failure' WHERE id=?",
+            (pair["id"],),
+        )
+        self.assertTrue(self.service._resume_one_reusable_pair())
+        current = self.db.one("SELECT status,stage,error FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {"status": "running", "stage": "recording", "error": ""})
+        arms = self.db.all("SELECT status,commit_sha FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair["id"],))
+        self.assertEqual([arm["status"] for arm in arms], ["completed", "completed"])
+        self.assertEqual([arm["commit_sha"] for arm in arms], ["a" * 40, "b" * 40])
+        event = self.db.one(
+            "SELECT event_type FROM audit_events WHERE entity_id=? ORDER BY id DESC LIMIT 1", (pair["id"],),
+        )
+        self.assertEqual(event["event_type"], "recording.retry_window_started")
 
     def test_completed_trace_prompt_mismatch_restarts_only_invalid_arm(self):
         self.insert_ready_task()

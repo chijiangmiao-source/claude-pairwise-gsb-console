@@ -12,6 +12,31 @@ from .commands import redact, run_command
 from .db import Database, now_iso
 
 
+def isolated_compose_environment(compose: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Return a Compose environment with every declared host port isolated.
+
+    Generated projects have historically used both API_PORT and WEB_PORT.  A
+    validator that sets only one of them appears isolated in its audit output
+    while Compose still binds the other's default (usually 8080).  Discover
+    PORT variables from the actual Compose file and give each one a separate
+    free host port; keep the conventional aliases for older projects.
+    """
+    env = os.environ.copy()
+    text = compose.read_text(encoding="utf-8", errors="replace")
+    variables = {
+        name for name in re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", text)
+        if "PORT" in name.upper()
+    }
+    variables.update(("API_PORT", "WEB_PORT", "APP_PORT", "HOST_PORT", "HTTP_PORT"))
+    assigned: Dict[str, str] = {}
+    for name in sorted(variables):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            assigned[name] = str(int(probe.getsockname()[1]))
+        env[name] = assigned[name]
+    return env, assigned
+
+
 class ArtifactChecker:
     def __init__(self, db: Database):
         self.db = db
@@ -32,9 +57,11 @@ class ArtifactChecker:
             self._record(checks, "dockerfile", bool(dockerfile), str(dockerfile or "未找到 Dockerfile"))
             if not compose or not dockerfile:
                 raise RuntimeError("缺少 Docker Compose 或 Dockerfile")
-            compose_env = os.environ.copy()
-            compose_env["API_PORT"] = str(self._free_port())
-            self._record(checks, "isolated_host_port", True, compose_env["API_PORT"])
+            compose_env, assigned_ports = isolated_compose_environment(compose)
+            self._record(
+                checks, "isolated_host_port", True,
+                json.dumps(assigned_ports, ensure_ascii=False, sort_keys=True),
+            )
             config = run_command(
                 ["docker", "compose", "-f", str(compose), "--profile", "*", "config"],
                 cwd=workspace, check=False, timeout=60, env=compose_env,

@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 from .commands import redact, run_command
 from .config import Config
 from .db import Database, now_iso
+from .artifact import isolated_compose_environment
 
 
 class RecordingManager:
@@ -127,9 +128,8 @@ class RecordingManager:
         if check.get("status") != "passed":
             self._launch_failure_evidence(attempt_id, workspace, path, check)
             return
-        env = os.environ.copy()
-        port = self._free_port()
-        env["API_PORT"] = str(port)
+        env, assigned_ports = isolated_compose_environment(compose)
+        port = int(assigned_ports.get("API_PORT") or next(iter(assigned_ports.values())))
         base = ["docker", "compose", "-p", project, "-f", str(compose)]
         try:
             run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=env)

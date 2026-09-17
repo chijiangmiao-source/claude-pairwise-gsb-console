@@ -66,6 +66,16 @@ function sampleValue(schema, spec, depth = 0) {
   return "demo";
 }
 
+function fallbackBodyForPath(path) {
+  if (/align/i.test(path)) {
+    return { planned: [{ code: "A", at_ms: 0 }], actual: [{ code: "A", at_ms: 0 }] };
+  }
+  if (/turnpike/i.test(path)) {
+    return { L: 10, n: 5, distances: [2, 4, 7, 10, 2, 5, 8, 3, 6, 3] };
+  }
+  return {};
+}
+
 async function moveAndClick(page, locator) {
   await locator.scrollIntoViewIfNeeded();
   const box = await locator.boundingBox();
@@ -101,8 +111,8 @@ async function selectSwaggerOperation(page) {
   const selected = candidates[0];
   const body = selected.content
     ? (selected.content.example ?? selected.content.examples?.default?.value ?? sampleValue(selected.content.schema, spec))
-    : null;
-  return { path: selected.path, method: selected.method, body };
+    : (["post", "put", "patch"].includes(selected.method) ? fallbackBodyForPath(selected.path) : null);
+  return { path: selected.path, method: selected.method, body, declaredBody: Boolean(selected.content) };
 }
 
 async function findSwaggerBlock(page, selected) {
@@ -125,6 +135,9 @@ async function demonstrateSwaggerWorkflow(page) {
     await moveAndClick(page, block.locator(".opblock-summary").first());
   }
   await page.waitForTimeout(3000);
+  if (!selected.declaredBody && selected.body !== null) {
+    return demonstrateDirectApiWorkflow(page, selected);
+  }
   await moveAndClick(page, block.locator("button.try-out__btn").first());
   await page.waitForTimeout(3000);
   if (selected.body !== null) {
@@ -141,6 +154,87 @@ async function demonstrateSwaggerWorkflow(page) {
   const status = Number(statusTexts.map((text) => text.match(/\d{3}/)?.[0]).find(Boolean) || 0);
   await page.waitForTimeout(7000);
   const result = { required: true, ok: status >= 200 && status < 300, status, method: selected.method, path: selected.path };
+  process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
+  return result;
+}
+
+async function demonstrateDirectApiWorkflow(page, selected) {
+  await page.evaluate(({ path, method, body }) => {
+    document.getElementById("pairwise-direct-api-demo")?.remove();
+    const panel = document.createElement("section");
+    panel.id = "pairwise-direct-api-demo";
+    Object.assign(panel.style, {
+      margin: "24px auto", padding: "20px", maxWidth: "980px", border: "2px solid #2563eb",
+      borderRadius: "12px", background: "#eff6ff", color: "#172554", font: "16px/1.5 system-ui",
+    });
+    panel.innerHTML = `<h2 style="margin:0 0 12px">真实接口演示</h2>
+      <p><strong>${method.toUpperCase()} ${path}</strong></p>
+      <pre style="white-space:pre-wrap">${JSON.stringify(body, null, 2)}</pre>
+      <button type="button" style="font-size:18px;padding:10px 18px;cursor:pointer">发送真实请求</button>
+      <pre data-result style="min-height:70px;white-space:pre-wrap">等待点击</pre>`;
+    const result = panel.querySelector("[data-result]");
+    panel.querySelector("button").addEventListener("click", async () => {
+      result.textContent = "请求中…";
+      try {
+        const response = await fetch(path, {
+          method: method.toUpperCase(), headers: { "content-type": "application/json" },
+          body: body === null ? undefined : JSON.stringify(body),
+        });
+        const text = await response.text();
+        panel.dataset.status = String(response.status);
+        result.textContent = `HTTP ${response.status}\n${text.slice(0, 1800)}`;
+      } catch (error) {
+        panel.dataset.status = "0";
+        result.textContent = String(error);
+      }
+    });
+    document.querySelector(".swagger-ui")?.prepend(panel);
+    panel.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, selected);
+  const panel = page.locator("#pairwise-direct-api-demo");
+  await moveAndClick(page, panel.locator("button"));
+  await page.waitForFunction(() => Boolean(document.querySelector("#pairwise-direct-api-demo")?.dataset.status));
+  const status = Number(await panel.getAttribute("data-status") || 0);
+  await page.waitForTimeout(7000);
+  const result = { required: true, ok: status >= 200 && status < 300, status,
+    method: selected.method, path: selected.path, compatibilityRequest: true };
+  process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
+  return result;
+}
+
+async function demonstrateGenericWorkflow(page) {
+  await page.waitForTimeout(3000);
+  const before = await page.locator("body").innerText();
+  const clicked = [];
+  const clickMatching = async (pattern) => {
+    const buttons = page.locator("button:visible:not([disabled]), [role=button]:visible:not([aria-disabled=true])");
+    for (let index = 0; index < await buttons.count(); index += 1) {
+      const button = buttons.nth(index);
+      const label = (await button.innerText().catch(() => "")).trim();
+      if (!pattern.test(label)) continue;
+      await moveAndClick(page, button);
+      clicked.push(label || `control-${index + 1}`);
+      await page.waitForTimeout(3500);
+      return true;
+    }
+    return false;
+  };
+  await clickMatching(/载入|示例|样例|模板|预置|demo|sample|example/i);
+  const actionClicked = await clickMatching(/计算|运行|分析|核验|检查|生成|提交|开始|求解|solve|compute|run|inspect|check|analy/i);
+  if (!clicked.length) {
+    await clickMatching(/^(?!.*(?:删除|清空|取消|关闭|remove|delete|clear|cancel|close)).+/i);
+  }
+  const after = await page.locator("body").innerText();
+  const visibleChange = before !== after;
+  const result = {
+    required: true,
+    ok: clicked.length > 0 && (visibleChange || successfulRequests.length > 0 || actionClicked),
+    clicks: clicked,
+    requests: successfulRequests.length,
+    visibleChange,
+    workflow: "browser-ui",
+    error: "没有完成可见的真实功能操作",
+  };
   process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
   return result;
 }
@@ -271,9 +365,12 @@ try {
     ? demonstrateFailureEvidence(page)
     : interactionMode === "manual"
     ? Promise.resolve({ required: false, ok: true, interactionMode })
-    : demonstrateSwaggerWorkflow(page).catch((error) => ({
-      required: new URL(page.url()).pathname.startsWith("/docs"), ok: false, error: error?.message || String(error),
-    }));
+    : new URL(page.url()).pathname.startsWith("/docs")
+    ? demonstrateSwaggerWorkflow(page).catch((error) => ({ required: true, ok: false, error: error?.message || String(error) }))
+    : demonstrateGenericWorkflow(page).catch((error) => ({ required: true, ok: false, error: error?.message || String(error) }));
+  if (interactionMode === "auto") {
+    setTimeout(() => finish("automatic_workflow_complete"), Math.min(maximum, 38) * 1000);
+  }
   setTimeout(() => finish("maximum_duration"), maximum * 1000);
   setInterval(() => { if (existsSync(stopFile)) finish("manual_stop"); }, 250);
   process.on("SIGINT", () => finish("manual_stop"));
