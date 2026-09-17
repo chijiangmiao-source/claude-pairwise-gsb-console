@@ -61,6 +61,29 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("codex_bug_effort"), "high")
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
         self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 40)
+        self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
+
+    def test_original_prompts_are_staggered_between_a_and_b(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm, sent_at in (("A", stamp), ("B", None)):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,prompt_sent_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (pair["id"] + "-" + arm.lower(), pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image",
+                 "developing" if sent_at else "running", sent_at, stamp, stamp),
+            )
+        b_arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm='B'", (pair["id"],))
+        with patch("pairwise_console.service.time.sleep") as sleep, \
+             patch.object(self.service.claude, "send_prompt") as send_prompt:
+            self.service._send_prompt_with_pair_stagger(pair["id"], b_arm, "same prompt")
+        self.assertEqual(send_prompt.call_count, 1)
+        waited = sleep.call_args.args[0]
+        self.assertGreaterEqual(waited, 30)
+        self.assertLessEqual(waited, 31)
 
     def test_completed_arm_is_scheduled_for_validation_before_peer_finishes(self):
         self.insert_ready_task()

@@ -208,6 +208,10 @@ class Handler(BaseHTTPRequestHandler):
                     pair_limit = int(body["max_pairs_parallel"])
                     if pair_limit < 1 or pair_limit > MAX_PAIR_PROJECTS:
                         raise ValueError("Pair 并发只能设置为 1–3；每个 Pair 会占用 A/B 两个终端")
+                if "ab_prompt_stagger_seconds" in body:
+                    prompt_stagger = int(body["ab_prompt_stagger_seconds"])
+                    if prompt_stagger < 0 or prompt_stagger > 300:
+                        raise ValueError("A/B 题面发送间隔只能设置为 0–300 秒")
                 for key, value in body.items():
                     self.app.db.set_setting(str(key), value)
                 self.app.db.audit("settings.updated", "settings", "", {"keys": list(body)})

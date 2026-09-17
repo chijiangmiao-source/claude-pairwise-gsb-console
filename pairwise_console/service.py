@@ -78,6 +78,8 @@ class PairwiseService:
         self._pair_creation_lock = threading.Lock()
         self._repository_locks_lock = threading.Lock()
         self._repository_locks: Dict[str, threading.Lock] = {}
+        self._prompt_locks_lock = threading.Lock()
+        self._prompt_locks: Dict[str, threading.Lock] = {}
         self._pair_completion_lock = threading.RLock()
         self._auto_retry_after: Dict[str, float] = {}
         self._artifact_retry_after: Dict[str, float] = {}
@@ -99,6 +101,7 @@ class PairwiseService:
             "claude_model": self.config.claude_model,
             "claude_image": self.config.claude_image,
             "max_pairs_parallel": self.config.max_pairs_parallel,
+            "ab_prompt_stagger_seconds": 30,
             "task_generation_max_parallel": self.config.task_generation_max_parallel,
             "task_pool_min_ready": 6,
             "task_pool_target_ready": 12,
@@ -219,7 +222,6 @@ class PairwiseService:
             """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
                JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
                WHERE a.prompt_sent_at IS NULL
-                 AND a.error_retry_count > 0
                  AND a.status IN ('queued','waiting_retry','running')
                  AND p.stage='development'"""
         )
@@ -250,7 +252,7 @@ class PairwiseService:
             self.claude.wait_until_ready(arm)
             self.claude.materialize_repository(arm, canonical, pair["baseline_sha"])
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
-            self.claude.send_prompt(arm, prompt)
+            self._send_prompt_with_pair_stagger(pair_id, arm, prompt)
             self.db.audit("claude.pending_retry_recovered", "arm_run", arm_id, {
                 "attempt": int(arm.get("attempt_no") or 1),
                 "prompt_mode": "same_original_prompt_once",
@@ -260,6 +262,46 @@ class PairwiseService:
             failure = "恢复全新 Session 失败：%s" % redact(str(exc))
             current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             return self._handle_attempt_failure(pair_id, current, prompt, failure)
+
+    def _send_prompt_with_pair_stagger(self, pair_id: str, arm: Dict[str, Any], prompt: str) -> None:
+        """Send one original prompt while keeping the two Arm sends apart.
+
+        The per-Pair lock also covers concurrent A/B recovery threads. The
+        persisted timestamp keeps the spacing after a service restart; one
+        extra second compensates for the database timestamp's second-level
+        precision so the real interval never becomes shorter than configured.
+        """
+        with self._prompt_locks_lock:
+            prompt_lock = self._prompt_locks.setdefault(pair_id, threading.Lock())
+        with prompt_lock:
+            interval = max(0, min(300, int(self.db.setting("ab_prompt_stagger_seconds", 30))))
+            other = self.db.one(
+                """SELECT arm,prompt_sent_at FROM arm_runs
+                   WHERE pair_id=? AND arm<>? AND prompt_sent_at IS NOT NULL
+                   ORDER BY prompt_sent_at DESC LIMIT 1""",
+                (pair_id, arm["arm"]),
+            )
+            waited = 0.0
+            if interval and other and other.get("prompt_sent_at"):
+                try:
+                    sent_at = datetime.fromisoformat(str(other["prompt_sent_at"]).replace("Z", "+00:00"))
+                    if sent_at.tzinfo is None:
+                        sent_at = sent_at.replace(tzinfo=timezone.utc)
+                    elapsed = max(0.0, (datetime.now(timezone.utc) - sent_at).total_seconds())
+                    waited = max(0.0, interval + 1.0 - elapsed)
+                except (TypeError, ValueError):
+                    waited = float(interval)
+                if waited:
+                    time.sleep(waited)
+            refreshed = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
+            if refreshed.get("prompt_sent_at"):
+                return
+            self.claude.send_prompt(refreshed, prompt)
+            self.db.audit("claude.original_prompt_sent", "arm_run", arm["id"], {
+                "arm": arm["arm"],
+                "configured_stagger_seconds": interval,
+                "waited_seconds": round(waited, 3),
+            })
 
     def _scheduler_loop(self) -> None:
         # Let HTTP start first. Task-pool refill has its own slower cadence;
@@ -790,15 +832,16 @@ class PairwiseService:
                 self.claude.materialize_repository(
                     run, Path(repo["local_root"]) / run["arm"], pair["baseline_sha"]
                 )
-            # Both containers are started before either receives the identical prompt.
-            prompt = task["prompt"]
-            for run in runs:
-                refreshed = self.db.one("SELECT * FROM arm_runs WHERE id=?", (run["id"],)) or run
-                self.claude.send_prompt(refreshed, prompt)
+            # Both containers are ready before A receives the original prompt.
+            # Mark development first so a service restart during the configured
+            # A/B gap can recover the still-unsent Arm.
             self.db.execute(
                 "UPDATE pairs SET status='running',stage='development',error='',started_at=?,updated_at=? WHERE id=?",
                 (now_iso(), now_iso(), pair_id),
             )
+            prompt = task["prompt"]
+            for run in runs:
+                self._send_prompt_with_pair_stagger(pair_id, run, prompt)
             for run in runs:
                 self._submit_monitor("monitor-" + run["id"], self._monitor_arm, pair_id, run["id"], prompt)
             return self.pair_detail(pair_id)
@@ -2075,7 +2118,7 @@ class PairwiseService:
         self.claude.wait_until_ready(restarted)
         self.claude.materialize_repository(restarted, canonical, pair["baseline_sha"])
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
-        self.claude.send_prompt(restarted, prompt)
+        self._send_prompt_with_pair_stagger(pair_id, restarted, prompt)
         self.db.execute("UPDATE pairs SET status='running',stage='development',error='',updated_at=? WHERE id=?", (now_iso(), pair_id))
         self.db.audit("claude.arm_restarted_after_error", "arm_run", arm["id"], {
             "attempt": int(restarted.get("attempt_no") or 1), "baseline_sha": pair["baseline_sha"],
@@ -2116,7 +2159,7 @@ class PairwiseService:
         self.claude.wait_until_ready(restarted)
         self.claude.materialize_repository(restarted, canonical, source_sha)
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
-        self.claude.send_prompt(restarted, prompt)
+        self._send_prompt_with_pair_stagger(pair_id, restarted, prompt)
         self.db.execute(
             "UPDATE pairs SET status='running',stage='development',error='',updated_at=? WHERE id=?",
             (now_iso(), pair_id),
