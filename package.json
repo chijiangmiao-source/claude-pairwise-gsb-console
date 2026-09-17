@@ -5,7 +5,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --check scripts/browser_recorder.mjs && node --check web/app.js && node --check chrome-solo-qa-gsb-helper/background.js && node --test tests/test_helper_mapping.mjs"
+    "test": "node --check scripts/browser_recorder.mjs && node --check scripts/recording_timing.mjs && node --check web/app.js && node --check chrome-solo-qa-gsb-helper/background.js && node --test tests/*.mjs"
   },
   "keywords": [],
   "author": "",

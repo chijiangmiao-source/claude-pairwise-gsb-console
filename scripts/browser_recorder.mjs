@@ -3,6 +3,7 @@ import ffmpegPath from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { automaticFinishDelayMs } from "./recording_timing.mjs";
 
 const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`, interactionMode = "auto"] = process.argv.slice(2);
 if (!url || !outputPath || !profileDir) {
@@ -17,6 +18,7 @@ let finishing = false;
 let demonstrationPromise = Promise.resolve({ required: false, ok: true });
 let monitorRequests = false;
 const successfulRequests = [];
+const recordingStartedAt = Date.now();
 
 async function saveVideo(sourcePath, targetPath) {
   if (!targetPath.toLowerCase().endsWith(".mp4")) {
@@ -290,6 +292,32 @@ async function finish(reason) {
   }
 }
 
+async function finishAfterAutomaticWorkflow(page) {
+  await demonstrationPromise;
+  if (finishing) return;
+  const elapsedMs = Date.now() - recordingStartedAt;
+  const delayMs = automaticFinishDelayMs(outputPath, elapsedMs, maximum);
+  process.stdout.write(`${JSON.stringify({
+    event: "automatic_timing",
+    workflowSeconds: Math.round(elapsedMs / 100) / 10,
+    plannedSeconds: Math.round((elapsedMs + delayMs) / 100) / 10,
+  })}\n`);
+  if (delayMs > 0) {
+    const firstPause = Math.min(delayMs, Math.max(1200, Math.round(delayMs * 0.55)));
+    try {
+      await page.mouse.move(1010, 520, { steps: 28 });
+      await page.waitForTimeout(firstPause);
+      if (delayMs > firstPause) {
+        await page.mouse.move(760, 420, { steps: 20 });
+        await page.waitForTimeout(delayMs - firstPause);
+      }
+    } catch {
+      return;
+    }
+  }
+  await finish("automatic_workflow_complete");
+}
+
 try {
   context = await chromium.launchPersistentContext(profileDir, {
     executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -369,7 +397,7 @@ try {
     ? demonstrateSwaggerWorkflow(page).catch((error) => ({ required: true, ok: false, error: error?.message || String(error) }))
     : demonstrateGenericWorkflow(page).catch((error) => ({ required: true, ok: false, error: error?.message || String(error) }));
   if (interactionMode === "auto") {
-    setTimeout(() => finish("automatic_workflow_complete"), Math.min(maximum, 38) * 1000);
+    void finishAfterAutomaticWorkflow(page);
   }
   setTimeout(() => finish("maximum_duration"), maximum * 1000);
   setInterval(() => { if (existsSync(stopFile)) finish("manual_stop"); }, 250);
