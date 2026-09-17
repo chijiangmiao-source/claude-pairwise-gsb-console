@@ -51,7 +51,17 @@ class PairwiseService:
         self.git = GitOps(config, db)
         self.artifacts = ArtifactChecker(db)
         self.recordings = RecordingManager(config, db)
-        self.executor = ThreadPoolExecutor(max_workers=max(8, config.task_generation_max_parallel + 2))
+        # Arm monitors are intentionally long lived.  Keeping them in the same
+        # pool as user actions can starve GSB rechecks (and every other short
+        # operation) whenever all A/B slots are occupied.
+        self.executor = ThreadPoolExecutor(
+            max_workers=max(8, config.task_generation_max_parallel + 2),
+            thread_name_prefix="pairwise-operation",
+        )
+        self.monitor_executor = ThreadPoolExecutor(
+            max_workers=max(8, MAX_PAIR_PROJECTS * 2 + 2),
+            thread_name_prefix="pairwise-monitor",
+        )
         self._future_lock = threading.Lock()
         self._futures: Dict[str, Any] = {}
         self._scheduler_started = False
@@ -158,7 +168,10 @@ class PairwiseService:
         pair_ids = set()
         for row in rows:
             pair_ids.add(row["pair_id"])
-            self._submit("monitor-" + row["arm_id"], self._monitor_arm, row["pair_id"], row["arm_id"], row["prompt"])
+            self._submit_monitor(
+                "monitor-" + row["arm_id"], self._monitor_arm,
+                row["pair_id"], row["arm_id"], row["prompt"],
+            )
         pending_retries = self.db.all(
             """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
                JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
@@ -169,7 +182,7 @@ class PairwiseService:
         )
         for row in pending_retries:
             pair_ids.add(row["pair_id"])
-            self._submit(
+            self._submit_monitor(
                 "retry-recover-" + row["arm_id"], self._recover_pending_retry,
                 row["pair_id"], row["arm_id"], row["prompt"],
             )
@@ -660,7 +673,7 @@ class PairwiseService:
                 (now_iso(), now_iso(), pair_id),
             )
             for run in runs:
-                self._submit("monitor-" + run["id"], self._monitor_arm, pair_id, run["id"], prompt)
+                self._submit_monitor("monitor-" + run["id"], self._monitor_arm, pair_id, run["id"], prompt)
             return self.pair_detail(pair_id)
         except Exception as exc:
             self.db.execute("UPDATE pairs SET status='failed',error=?,updated_at=? WHERE id=?", (str(exc)[-3000:], now_iso(), pair_id))
@@ -1615,7 +1628,10 @@ class PairwiseService:
                     return {"pairId": pair_id, "checks": results, "restarted": restarted, "retired": True}
                 if current.get("status") != "failed":
                     restarted.append(arm_name)
-                    self._submit("monitor-" + current["id"], self._monitor_arm, current["id"], pair_id, prompt)
+                    self._submit_monitor(
+                        "monitor-" + current["id"], self._monitor_arm,
+                        pair_id, current["id"], prompt,
+                    )
             self.db.audit("artifact.failed_arms_restarted", "pair", pair_id, {
                 "arms": restarted, "rule": "fresh_session_from_common_baseline",
             })
@@ -1644,6 +1660,14 @@ class PairwiseService:
             if existing and not existing.done():
                 return
             self._futures[operation] = self.executor.submit(fn, *args)
+
+    def _submit_monitor(self, operation: str, fn, *args) -> None:
+        """Run long-lived Claude monitoring without blocking user actions."""
+        with self._future_lock:
+            existing = self._futures.get(operation)
+            if existing and not existing.done():
+                return
+            self._futures[operation] = self.monitor_executor.submit(fn, *args)
 
     def _pair(self, pair_id: str) -> Dict[str, Any]:
         pair = self.db.one("SELECT * FROM pairs WHERE id=?", (pair_id,))

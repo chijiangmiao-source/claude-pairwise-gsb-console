@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 import zipfile
 from io import BytesIO
@@ -38,6 +39,7 @@ class CoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.service.executor.shutdown(wait=False, cancel_futures=True)
+        self.service.monitor_executor.shutdown(wait=False, cancel_futures=True)
         self.temp.cleanup()
 
     def insert_ready_task(self):
@@ -54,6 +56,30 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("codex_default_effort"), "medium")
         self.assertEqual(self.db.setting("codex_bug_effort"), "high")
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
+
+    def test_full_monitor_capacity_does_not_starve_user_operations(self):
+        release = threading.Event()
+        started = threading.Event()
+        start_lock = threading.Lock()
+        start_count = 0
+
+        def monitor():
+            nonlocal start_count
+            with start_lock:
+                start_count += 1
+                if start_count == 8:
+                    started.set()
+            release.wait(5)
+
+        try:
+            for index in range(8):
+                self.service._submit_monitor("test-monitor-%d" % index, monitor)
+            self.assertTrue(started.wait(2), "monitor pool did not reach full capacity")
+            completed = threading.Event()
+            self.service._submit("test-user-operation", completed.set)
+            self.assertTrue(completed.wait(2), "user operation was starved by arm monitors")
+        finally:
+            release.set()
 
     def test_user_paths_and_github_credential_helper_are_portable(self):
         self.assertEqual(OLD_APP_DIR, Path.home() / "Library/Application Support/Claude Eval Console")
@@ -221,6 +247,31 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(review["confirmed_by"], "刘昱（按授权默认确认）")
         completed = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(completed, {"status": "completed", "stage": "completed"})
+
+    def test_gsb_recheck_persists_split_review_suggestions(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,a_reason,b_reason,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'confirmed',?,?)""",
+            ("gsb-recheck-source", pair["id"], "A better", "A：原 A 评价 B：原 B 评价",
+             "原 A 评价有足够的具体事实与验收依据。", "原 B 评价说明了真实存在的交付差异。", stamp, stamp),
+        )
+        payload = {
+            "status": "suggested_revision",
+            "suggestedVerdict": "A better",
+            "suggestedAReason": "A 的建议评价明确区分开发说明与后续独立验收，并保留可核对的具体结果。",
+            "suggestedBReason": "B 的建议评价指出实际接口偏差及其客观后果，措辞限定在现有证据范围内。",
+            "issues": ["原评价需要明确验收发生阶段。"],
+            "evidenceRefs": ["checks[A]", "checks[B]"],
+        }
+        with patch.object(self.service.codex, "run", return_value=payload):
+            result = self.service._recheck_gsb(pair["id"])
+        self.assertEqual(result["result_status"], "suggested_revision")
+        self.assertEqual(result["suggested_a_reason"], payload["suggestedAReason"])
+        self.assertEqual(result["suggested_b_reason"], payload["suggestedBReason"])
+        self.assertEqual(self.db.one("SELECT COUNT(*) count FROM gsb_rechecks")["count"], 1)
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
@@ -456,12 +507,12 @@ class CoreTests(unittest.TestCase):
         restarted = {"id": "arm-artifact-A", "arm": "A", "status": "developing"}
         with patch.object(self.service.artifacts, "validate", side_effect=checks), \
              patch.object(self.service, "_handle_attempt_failure", return_value=restarted) as retry, \
-             patch.object(self.service, "_submit") as submit:
+             patch.object(self.service, "_submit_monitor") as submit:
             result = self.service._validate_pair_artifacts(pair["id"])
         self.assertEqual(result["restarted"], ["A"])
         self.assertIn("Docker 产物验收失败", retry.call_args.args[3])
         submit.assert_called_once_with("monitor-arm-artifact-A", self.service._monitor_arm,
-                                       "arm-artifact-A", pair["id"], "Build a hard project with Docker Compose")
+                                       pair["id"], "arm-artifact-A", "Build a hard project with Docker Compose")
         current = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(current["stage"], "development")
 
