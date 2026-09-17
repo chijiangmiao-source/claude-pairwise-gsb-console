@@ -12,6 +12,7 @@ from pairwise_console.config import OLD_APP_DIR, load_config
 from pairwise_console.db import Database, now_iso
 from pairwise_console.gitops import GitOps
 from pairwise_console.analytics import dashboard
+from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
 from pairwise_console.service import PairwiseService
@@ -337,6 +338,24 @@ class CoreTests(unittest.TestCase):
             sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
         self.assertIn("项目编号", sheet)
         self.assertIn("pair-1", sheet)
+
+    def test_delivery_list_exposes_each_missing_material(self):
+        row = {
+            "a_session_id": "session-a", "a_prompt_id": "prompt-a", "a_commit": "a" * 40,
+            "a_check_status": "failed", "a_recording_status": "passed", "a_recording_match": 1,
+            "a_recording_review_status": "confirmed",
+            "b_session_id": "", "b_prompt_id": "", "b_commit": "", "b_check_status": None,
+            "b_recording_status": None, "b_recording_match": 0, "b_recording_review_status": "pending",
+            "gsb_status": "draft", "recheck_status": "fact_conflict",
+        }
+        result = Handler._decorate_delivery(row)
+        self.assertEqual(result["readiness"], "blocked")
+        self.assertIn("A Docker 验收失败", result["readiness_issues"])
+        self.assertIn("B 缺少 SessionID", result["readiness_issues"])
+        self.assertIn("B 缺少通过的 Docker 验收", result["readiness_issues"])
+        self.assertIn("B 缺少合格录像", result["readiness_issues"])
+        self.assertIn("GSB 尚未确认", result["readiness_issues"])
+        self.assertIn("复检发现公开理由存在事实冲突", result["readiness_issues"])
 
     def test_historical_import_excludes_bug_and_medium(self):
         source = sqlite3.connect(str(self.config.old_db_path))

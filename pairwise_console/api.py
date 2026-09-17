@@ -467,16 +467,35 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _decorate_delivery(row: Dict[str, Any]) -> Dict[str, Any]:
-        required = (
-            row.get("a_session_id"), row.get("a_prompt_id"), row.get("a_commit"), row.get("b_session_id"),
-            row.get("b_prompt_id"), row.get("b_commit"), row.get("a_check_status") == "passed",
-            row.get("b_check_status") == "passed", row.get("a_recording_status") == "passed",
-            row.get("b_recording_status") == "passed", int(row.get("a_recording_match") or 0) == 1,
-            int(row.get("b_recording_match") or 0) == 1,
-            row.get("a_recording_review_status") == "confirmed",
-            row.get("b_recording_review_status") == "confirmed", row.get("gsb_status") == "confirmed",
-        )
-        row["readiness"] = "ready" if all(required) and row.get("recheck_status") != "fact_conflict" else "blocked"
+        issues = []
+        for prefix in ("a", "b"):
+            arm = prefix.upper()
+            if not row.get(prefix + "_session_id"):
+                issues.append(arm + " 缺少 SessionID")
+            if not row.get(prefix + "_prompt_id"):
+                issues.append(arm + " 缺少 PromptID")
+            if not row.get(prefix + "_commit"):
+                issues.append(arm + " 缺少最终提交")
+            check_status = row.get(prefix + "_check_status")
+            if check_status == "failed":
+                issues.append(arm + " Docker 验收失败")
+            elif check_status != "passed":
+                issues.append(arm + " 缺少通过的 Docker 验收")
+            recording_status = row.get(prefix + "_recording_status")
+            if recording_status != "passed":
+                issues.append(arm + (" 录像未通过" if recording_status else " 缺少合格录像"))
+            else:
+                if int(row.get(prefix + "_recording_match") or 0) != 1:
+                    issues.append(arm + " 录像与最终提交不匹配")
+                if row.get(prefix + "_recording_review_status") != "confirmed":
+                    issues.append(arm + " 录像尚未确认")
+        gsb_status = row.get("gsb_status")
+        if gsb_status != "confirmed":
+            issues.append("GSB 尚未确认" if gsb_status else "缺少 GSB")
+        if row.get("recheck_status") == "fact_conflict":
+            issues.append("复检发现公开理由存在事实冲突")
+        row["readiness_issues"] = issues
+        row["readiness"] = "blocked" if issues else "ready"
         return row
 
     def _deliveries_page(self, query: Dict[str, list]) -> Dict[str, Any]:
@@ -498,7 +517,7 @@ class Handler(BaseHTTPRequestHandler):
         ready_expression = """(
           COALESCE(aa.session_id,'')<>'' AND COALESCE(aa.prompt_id,'')<>'' AND COALESCE(aa.commit_sha,'')<>'' AND
           COALESCE(bb.session_id,'')<>'' AND COALESCE(bb.prompt_id,'')<>'' AND COALESCE(bb.commit_sha,'')<>'' AND
-          ca.status IN ('passed','failed') AND cb.status IN ('passed','failed') AND ra.status='passed' AND rb.status='passed' AND
+          ca.status='passed' AND cb.status='passed' AND ra.status='passed' AND rb.status='passed' AND
           COALESCE(ra.commit_match,0)=1 AND COALESCE(rb.commit_match,0)=1 AND
           ra.review_status='confirmed' AND rb.review_status='confirmed' AND g.status='confirmed' AND
           COALESCE(r.result_status,'')<>'fact_conflict'
