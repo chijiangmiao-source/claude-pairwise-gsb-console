@@ -370,10 +370,19 @@ async function batch(payload, action) {
   return { results, failed: results.filter((item) => item.outcome === "failed").length };
 }
 
-async function syncRemote() {
+function selectSyncItems(items, payload = {}) {
+  const requested = Array.isArray(payload?.pair_ids)
+    ? [...new Set(payload.pair_ids.map(String).filter(Boolean))] : [];
+  if (!requested.length) return items;
+  if (requested.length > 100 || requested.some((id) => !PAIR_RE.test(id))) throw new Error("请选择有效的 Pair");
+  const wanted = new Set(requested);
+  return items.filter((item) => wanted.has(String(item.pair_id || "")));
+}
+
+async function syncRemote(payload = {}) {
   const local = await localJson("/submissions");
   const results = [];
-  for (const item of local.items || []) {
+  for (const item of selectSyncItems(local.items || [], payload)) {
     try {
       const detail = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(item.remote_id)}`));
       await localJson("/state", jsonOptions({ pair_id: item.pair_id, payload_sha256: item.payload_sha256 || "", ...stateValues(detail) }));
@@ -393,7 +402,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     ? () => batch(message.payload || {}, submitOne)
     : message?.type === "PAIRWISE_GSB_REPAIR"
       ? () => batch(message.payload || {}, repairOne)
-      : message?.type === "PAIRWISE_GSB_SYNC" ? syncRemote : null;
+      : message?.type === "PAIRWISE_GSB_SYNC" ? () => syncRemote(message.payload || {}) : null;
   if (!action) { sendResponse({ ok: false, error: "未知的提交助手操作" }); return false; }
   action().then((data) => sendResponse({ ok: true, data })).catch((error) => sendResponse({
     ok: false, error: error instanceof Error ? error.message : String(error),

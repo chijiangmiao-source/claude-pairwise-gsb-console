@@ -62,3 +62,25 @@ test("still rejects an unknown required field", () => {
     /SOLO-QA 本期新增了无法映射的必填项：全新必填项/,
   );
 });
+
+test("limits a status sync to the requested Pair when a row button is used", () => {
+  context.syncItems = [
+    { pair_id: "pair-1111111111111111", remote_id: "51" },
+    { pair_id: "pair-2222222222222222", remote_id: "52" },
+  ];
+  context.syncPayload = { pair_ids: ["pair-2222222222222222"] };
+  const result = vm.runInContext("selectSyncItems(syncItems, syncPayload)", context);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), [
+    { pair_id: "pair-2222222222222222", remote_id: "52" },
+  ]);
+});
+
+test("keeps the existing all-record sync when no Pair is selected", () => {
+  context.syncItems = [
+    { pair_id: "pair-1111111111111111" },
+    { pair_id: "pair-2222222222222222" },
+  ];
+  context.syncPayload = {};
+  const result = vm.runInContext("selectSyncItems(syncItems, syncPayload)", context);
+  assert.equal(result.length, 2);
+});

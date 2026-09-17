@@ -485,7 +485,8 @@ class Handler(BaseHTTPRequestHandler):
           g.confirmed_by,g.confirmed_at,g.evidence_version,
           r.id recheck_id,r.result_status recheck_status,r.evidence_version recheck_evidence_version,
           r.applied_at recheck_applied_at,r.applied_by recheck_applied_by,
-          d.status submission_status,d.remote_id,d.remote_url submission_url,d.error submission_error,d.hidden_at,d.submitted_at"""
+          d.status submission_status,d.remote_id,d.remote_url submission_url,d.remote_status,d.qc_summary,
+          d.remote_updated_at,d.error submission_error,d.hidden_at,d.submitted_at"""
         from_sql = """FROM pairs p JOIN tasks t ON t.id=p.task_id
           LEFT JOIN git_repositories repo ON repo.pair_id=p.id
           LEFT JOIN arm_runs aa ON aa.pair_id=p.id AND aa.arm='A'
