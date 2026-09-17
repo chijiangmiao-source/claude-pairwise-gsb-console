@@ -47,6 +47,14 @@ test("keeps exact field-key mapping for existing SOLO-QA fields", () => {
   assert.equal(result.user_prompt, "实现复杂工作流");
 });
 
+test("keeps sending validity when the form schema omits it but the validator requires it", () => {
+  const schema = { fields: [{ field_key: "user_prompt", label: "User Prompt", is_required: true }] };
+  const result = buildData(schema, {
+    values: { user_prompt: "实现复杂工作流", validity: "有效" },
+  }, {});
+  assert.equal(result.validity, "有效");
+});
+
 test("still rejects an unknown required field", () => {
   const schema = { fields: [{ field_key: "new_required", label: "全新必填项", is_required: true }] };
   assert.throws(

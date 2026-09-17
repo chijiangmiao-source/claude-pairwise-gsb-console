@@ -225,6 +225,13 @@ function buildData(schema, bundle, uploaded) {
     else if (valueKey) result[key] = normalizeChoice(field, bundle.values[valueKey]);
     else if (field.is_required) missing.push(field.label || key);
   }
+  // The current SOLO-QA form schema no longer exposes `validity`, while the
+  // submission validator still requires it. Keep sending the local value until
+  // the platform schema and validator are consistent again.
+  if (!Object.prototype.hasOwnProperty.call(result, "validity")
+      && Object.prototype.hasOwnProperty.call(bundle.values || {}, "validity")) {
+    result.validity = bundle.values.validity;
+  }
   if (missing.length) throw new Error(`SOLO-QA 本期新增了无法映射的必填项：${missing.join("、")}`);
   return result;
 }
