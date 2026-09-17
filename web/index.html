@@ -29,7 +29,10 @@
   <main>
     <header>
       <div><p class="eyebrow">A/B PAIRWISE EVALUATION</p><h1 id="page-title">数据概览</h1></div>
-      <div class="header-actions"><span class="clock" id="clock"></span><button class="secondary" id="refresh">刷新数据</button></div>
+      <div class="header-actions">
+        <div class="pair-locator"><input id="pair-locator" autocomplete="off" placeholder="输入 Pair 唯一 ID"><button class="secondary" id="locate-pair">定位 Pair</button></div>
+        <span class="clock" id="clock"></span><button class="secondary" id="refresh">刷新数据</button>
+      </div>
     </header>
     <div id="notice" class="notice hidden"></div>
     <section id="content" aria-live="polite"></section>
