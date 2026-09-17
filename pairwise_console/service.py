@@ -414,6 +414,7 @@ class PairwiseService:
                 elif stage in ("development", "artifact_validation"):
                     if stage == "development":
                         self._schedule_pending_arm_retries(pair_id)
+                        self._schedule_checkpoint_pushes(pair_id)
                     self._schedule_completed_arm_validations(pair_id)
                 elif stage == "difficulty_review":
                     self._submit_auto(
@@ -536,6 +537,48 @@ class PairwiseService:
                 "retry-recover-" + arm["id"], self._recover_pending_retry,
                 pair_id, arm["id"], prompt,
             )
+
+    def _schedule_checkpoint_pushes(self, pair_id: str) -> None:
+        for arm in self.db.all(
+            """SELECT id FROM arm_runs WHERE pair_id=? AND status='checkpointing'
+               AND trace_path<>''""", (pair_id,),
+        ):
+            self._submit_auto(
+                "checkpoint-push-" + arm["id"], self._finish_checkpointed_arm,
+                pair_id, arm["id"],
+            )
+
+    def _finish_checkpointed_arm(self, pair_id: str, arm_id: str) -> Dict[str, Any]:
+        arm = self.db.one("SELECT * FROM arm_runs WHERE id=? AND pair_id=?", (arm_id, pair_id)) or {}
+        pair = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair_id,)) or {}
+        if arm.get("status") != "checkpointing" or pair.get("status") not in ("running", "review"):
+            return {"pairId": pair_id, "armId": arm_id, "skipped": True}
+        trace_path = Path(str(arm.get("trace_path") or ""))
+        if not trace_path.is_dir():
+            raise RuntimeError("已完成 Arm 缺少导出的原生轨迹，不能继续推送")
+        try:
+            sha = self.git.push_arm(pair_id, str(arm["arm"]))
+        except Exception as exc:
+            error = "已保留完成代码和轨迹，等待重试 Git 推送：%s" % redact(str(exc))
+            self.db.execute(
+                "UPDATE arm_runs SET error=?,updated_at=? WHERE id=?",
+                (error[-3000:], now_iso(), arm_id),
+            )
+            self.db.audit("git.completed_arm_push_deferred", "arm_run", arm_id, {
+                "error": redact(str(exc))[-1000:], "codePreserved": True, "tracePreserved": True,
+            })
+            raise
+        stamp = now_iso()
+        self.db.execute(
+            """UPDATE arm_runs SET status='completed',commit_sha=?,error='',
+               finished_at=?,updated_at=? WHERE id=?""",
+            (sha, stamp, stamp, arm_id),
+        )
+        self.db.audit("claude.arm_completed", "arm_run", arm_id, {
+            "arm": arm["arm"], "commit_sha": sha, "checkpointedDelivery": True,
+        })
+        self._refresh_pair_after_arm(pair_id)
+        return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
 
     def _resume_one_reusable_pair(self) -> bool:
         # Reopening a preserved delivery consumes the same Pair slot as
@@ -2420,16 +2463,12 @@ class PairwiseService:
                 try:
                     self.db.execute("UPDATE arm_runs SET status='checkpointing',result=?,updated_at=? WHERE id=?", (result, now_iso(), arm_id))
                     trace_dir = self.claude.export_and_stop(arm)
-                    sha = self.git.push_arm(pair_id, arm["arm"])
                     self.db.execute(
-                        """UPDATE arm_runs SET status='completed',trace_path=?,commit_sha=?,result=?,finished_at=?,updated_at=? WHERE id=?""",
-                        (str(trace_dir), sha, result, now_iso(), now_iso(), arm_id),
+                        "UPDATE arm_runs SET trace_path=?,result=?,error='',updated_at=? WHERE id=?",
+                        (str(trace_dir), result, now_iso(), arm_id),
                     )
-                    self.db.audit("claude.arm_completed", "arm_run", arm_id, {"arm": arm["arm"], "commit_sha": sha})
-                    self._refresh_pair_after_arm(pair_id)
-                    return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
                 except Exception as exc:
-                    failure = "完成后导出轨迹或推送代码失败：%s" % redact(str(exc))
+                    failure = "完成后导出轨迹失败：%s" % redact(str(exc))
                     current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
                     retried = self._handle_attempt_failure(pair_id, current, prompt, failure)
                     if retried.get("status") == "failed":
@@ -2437,6 +2476,13 @@ class PairwiseService:
                     started = time.monotonic()
                     warned = False
                     continue
+                try:
+                    return self._finish_checkpointed_arm(pair_id, arm_id)
+                except Exception:
+                    # The completed code and native trace stay in place. The
+                    # scheduler retries only the Git push instead of asking
+                    # Claude to redo an already finished implementation.
+                    return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
             elapsed = time.monotonic() - started
             workspace = Path(arm["workspace_path"])
             has_code = self.claude.has_business_code(

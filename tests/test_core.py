@@ -1105,6 +1105,59 @@ class CoreTests(unittest.TestCase):
             pair["id"], "arm-stale-A", "Build a hard project with Docker Compose",
         )
 
+    def test_checkpointed_arm_retries_only_git_push(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        traces = self.root / "completed-traces"
+        traces.mkdir()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,trace_path,result,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'checkpointing',?,?,?,?)""",
+            ("arm-checkpoint-A", pair["id"], "A", "A", str(self.root / "workspace-A"),
+             "container-A", "screen-A", "auto_model/urm", "image", str(traces),
+             "finished", stamp, stamp),
+        )
+        delivered = "d" * 40
+        with patch.object(self.service.git, "push_arm", return_value=delivered) as push:
+            result = self.service._finish_checkpointed_arm(pair["id"], "arm-checkpoint-A")
+        push.assert_called_once_with(pair["id"], "A")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["commit_sha"], delivered)
+        self.assertEqual(result["trace_path"], str(traces))
+
+    def test_checkpointed_push_failure_preserves_code_and_trace(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        traces = self.root / "completed-traces"
+        traces.mkdir()
+        workspace = self.root / "workspace-A"
+        workspace.mkdir()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,trace_path,result,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'checkpointing',?,?,?,?)""",
+            ("arm-checkpoint-fail-A", pair["id"], "A", "A", str(workspace),
+             "container-A", "screen-A", "auto_model/urm", "image", str(traces),
+             "finished", stamp, stamp),
+        )
+        with patch.object(self.service.git, "push_arm", side_effect=TimeoutError("network timeout")):
+            with self.assertRaisesRegex(TimeoutError, "network timeout"):
+                self.service._finish_checkpointed_arm(pair["id"], "arm-checkpoint-fail-A")
+        current = self.db.one("SELECT status,trace_path,error FROM arm_runs WHERE id='arm-checkpoint-fail-A'")
+        self.assertEqual(current["status"], "checkpointing")
+        self.assertEqual(current["trace_path"], str(traces))
+        self.assertIn("等待重试 Git 推送", current["error"])
+        self.assertTrue(workspace.is_dir())
+
     def test_compose_port_variables_are_all_isolated(self):
         compose = self.root / "docker-compose.yml"
         compose.write_text(
