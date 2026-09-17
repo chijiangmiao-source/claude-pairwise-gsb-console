@@ -42,6 +42,11 @@ VALIDATION_SCHEMA = {
     },
 }
 
+GSB_STEP_REFERENCE = re.compile(
+    r"第\s*[一二三四五六七八九十百千万零〇\d]+"
+    r"(?:\s*[、，,及和与]\s*[一二三四五六七八九十百千万零〇\d]+)*\s*步"
+)
+
 
 class PairwiseService:
     def __init__(self, config: Config, db: Database):
@@ -1111,7 +1116,7 @@ class PairwiseService:
         return {
             "available": True, "traceFile": files[0].name,
             "events": events, "omittedEvents": omitted,
-            "stepRule": "step 是 JSONL 中真实记录号，公开评价引用第几步时必须使用该值",
+            "stepRule": "step 是 JSONL 内部记录号，只用于定位证据，公开评价不输出第几步",
         }
 
     def _bug_evidence(self, pair_id: str, arm: str) -> List[Dict[str, Any]]:
@@ -1125,7 +1130,26 @@ class PairwiseService:
 
     @staticmethod
     def _clean_gsb_part(value: Any, limit: int) -> str:
-        return re.sub(r"[`\r\n]+", " ", str(value or "")).strip()[:limit]
+        text = re.sub(r"[`\r\n]+", " ", str(value or "")).strip()
+        # Keep the underlying action and result while removing internal JSONL
+        # line numbers from public prose. Handle the common "failed at step X,
+        # fixed at step Y" form first so the sentence remains natural.
+        paired = re.compile(
+            GSB_STEP_REFERENCE.pattern
+            + r"(?P<middle>[^。；]{0,100}?)已(?:在|于)\s*"
+            + GSB_STEP_REFERENCE.pattern
+            + r"(?P<verb>修正|修复|修好|解决|通过|完成)"
+        )
+
+        def replace_pair(match: re.Match) -> str:
+            middle = str(match.group("middle") or "").lstrip("的")
+            return middle + "后来已" + str(match.group("verb") or "")
+
+        text = paired.sub(replace_pair, text)
+        text = re.sub(GSB_STEP_REFERENCE.pattern + r"\s*(?:及|和|与)\s*", "", text)
+        text = GSB_STEP_REFERENCE.sub("", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:limit]
 
     @staticmethod
     def _compose_gsb_reason(a_reason: str, b_reason: str) -> str:
@@ -1136,12 +1160,12 @@ class PairwiseService:
         """Return whether a public reason contains one reviewable evidence locator."""
         text = str(value or "")
         patterns = (
-            r"第\s*[一二三四五六七八九十百\d]+\s*(?:步|次|轮|个工具调用|次工具调用)",
             r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+",
             r"\b[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|kt|rb|php|sh|yml|yaml|json|toml|md)\b",
             r"\b(?:docker\s+compose|pytest|npm\s+(?:test|run)|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|python3?\s+|curl\s+|git\s+)[^，。；]*",
             r"\b(?:[1-5]\d\d|[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\b",
             r"(?:函数|方法|接口)\s*[A-Za-z_][A-Za-z0-9_]*",
+            r"(?:报错|错误|冲突|失败)",
         )
         return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
@@ -1149,9 +1173,9 @@ class PairwiseService:
     def _gsb_locator_issues(cls, a_reason: str, b_reason: str) -> List[str]:
         issues = []
         if not cls._gsb_has_locator(a_reason):
-            issues.append("A 评价缺少可核对的触发节点（步骤、文件/函数、命令或报错）")
+            issues.append("A 评价缺少可核对的具体证据（文件/函数、命令、接口状态或报错）")
         if not cls._gsb_has_locator(b_reason):
-            issues.append("B 评价缺少可核对的触发节点（步骤、文件/函数、命令或报错）")
+            issues.append("B 评价缺少可核对的具体证据（文件/函数、命令、接口状态或报错）")
         return issues
 
     @staticmethod
@@ -1159,7 +1183,7 @@ class PairwiseService:
         """Flag narrow, mechanical patterns without penalizing useful detail."""
         issues: List[str] = []
         numbered_cases = re.compile(
-            r"第\s*\d+\s*(?:[、，,]\s*\d+){2,}(?:\s*(?:至|到|-)\s*\d+)?\s*(?:项|条|步|次)?"
+            r"第\s*\d+\s*(?:[、，,]\s*\d+){2,}(?:\s*(?:至|到|-)\s*\d+)?\s*(?:项|条|次)?"
         )
         test_count_pile = re.compile(
             r"\d+\s*个(?:单元测试|单测|端到端测试|e2e)[^。；]{0,80}"
@@ -1169,6 +1193,8 @@ class PairwiseService:
         recording_seconds = re.compile(r"\d+(?:\.\d+)?\s*秒(?:钟)?(?:的)?录像")
         for label, value in (("A", a_reason), ("B", b_reason)):
             text = str(value or "")
+            if GSB_STEP_REFERENCE.search(text):
+                issues.append(label + " 评价包含轨迹步骤号，应改写为实际操作或验证场景")
             if numbered_cases.search(text):
                 issues.append(label + " 评价机械罗列测试编号，应改写为实际验证的业务场景")
             if test_count_pile.search(text):
@@ -1221,7 +1247,7 @@ class PairwiseService:
             correction = (
                 review_prompt + "\n\n上一次输出需要修正：" + "；".join(locator_issues + style_issues)
                 + "\n上一次 A 理由：" + a_reason + "\n上一次 B 理由：" + b_reason
-                + "\n请只依据上面的真实证据重新生成。保留能支撑结论的证据，把机械编号和数字改写成业务场景；每段仍要有真实步骤、文件/函数、命令或报错定位。"
+                + "\n请只依据上面的真实证据重新生成。保留能支撑结论的证据，把轨迹步骤号和机械数字改写成业务场景；每段仍要有文件/函数、命令、接口状态或报错等真实定位。"
             )
             result = self.codex.run(
                 "gsb_review", correction, GSB_SCHEMA,
@@ -1372,7 +1398,7 @@ class PairwiseService:
                 recheck_prompt + "\n\n当前原评价或上一次建议需要修正："
                 + "；".join(source_style_issues + locator_issues + suggestion_style_issues)
                 + "\n上一次建议 A 理由：" + suggested_a + "\n上一次建议 B 理由：" + suggested_b
-                + "\n请重新复检。保留所有影响结论的证据，把机械编号和无意义数字改写成业务场景，并确保两段各自包含真实可核对的位置。"
+                + "\n请重新复检。保留所有影响结论的证据，把轨迹步骤号和无意义数字改写成实际操作或业务场景，并确保两段各自包含文件/函数、命令、接口状态或报错等可核对证据。"
             )
             result = self.codex.run(
                 "gsb_recheck", correction, GSB_RECHECK_SCHEMA,

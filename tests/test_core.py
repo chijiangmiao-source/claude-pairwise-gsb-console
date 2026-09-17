@@ -469,8 +469,8 @@ class CoreTests(unittest.TestCase):
         with patch.object(self.service.codex, "run", return_value=payload) as mocked_run:
             result = self.service._recheck_gsb(pair["id"])
         self.assertEqual(result["result_status"], "suggested_revision")
-        self.assertIn("A 评价缺少可核对的触发节点", result["issues_json"])
-        self.assertIn("B 评价缺少可核对的触发节点", result["issues_json"])
+        self.assertIn("A 评价缺少可核对的具体证据", result["issues_json"])
+        self.assertIn("B 评价缺少可核对的具体证据", result["issues_json"])
         self.assertEqual(mocked_run.call_count, 2)
 
     def test_gsb_recheck_rewrites_mechanical_case_lists_even_when_model_first_passes(self):
@@ -1190,7 +1190,8 @@ class CoreTests(unittest.TestCase):
         prompt = gsb_prompt("开发送检单", "A evidence", "B evidence", "process events")
         self.assertIn("traceEvidence", prompt)
         self.assertIn("不要为了显得简短而删掉能支撑结论的证据", prompt)
-        self.assertIn("可以保留多个存在因果关系的步骤", prompt)
+        self.assertIn("公开理由不得出现“第175步”", prompt)
+        self.assertIn("step 只供内部找到证据", prompt)
         self.assertIn("不额外追求最短", prompt)
         self.assertIn("没有实际跑接口流程", prompt)
         self.assertIn("process events", prompt)
@@ -1200,6 +1201,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("复检首先检查首次生成的 GSB 逻辑是否正确", prompt)
         self.assertIn("不要因为理由较长或证据较多就要求精简", prompt)
         self.assertIn("必须保留原评价中所有会影响结论的有效证据", prompt)
+        self.assertIn("建议理由中不得出现第几步", prompt)
         self.assertIn("不得仅因篇幅、数字数量或代码细节较多判为需要修改", prompt)
 
     def test_gsb_style_check_targets_mechanical_numbers_without_rejecting_real_evidence(self):
@@ -1211,7 +1213,18 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(any("堆叠测试数量" in issue for issue in issues))
         self.assertTrue(any("录像时长" in issue for issue in issues))
         self.assertTrue(any("生硬的无缺陷套话" in issue for issue in issues))
-        self.assertFalse(any(issue.startswith("B ") for issue in issues))
+        self.assertTrue(any(issue.startswith("B ") and "轨迹步骤号" in issue for issue in issues))
+
+    def test_gsb_cleanup_removes_trace_step_numbers_without_dropping_evidence(self):
+        source = (
+            "B 中途第439步的回溯属性错误已在第448步修正，"
+            "第569步及 Docker 又跑通重复码分叉，第646步测试全过。"
+        )
+        cleaned = self.service._clean_gsb_part(source, 300)
+        self.assertNotRegex(cleaned, r"第\d+步")
+        self.assertIn("回溯属性错误后来已修正", cleaned)
+        self.assertIn("Docker 又跑通重复码分叉", cleaned)
+        self.assertIn("测试全过", cleaned)
 
     def test_completed_pair_with_current_failed_artifact_is_quarantined(self):
         self.insert_ready_task()
