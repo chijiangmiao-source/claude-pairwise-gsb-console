@@ -70,15 +70,14 @@ class CoreTests(unittest.TestCase):
                 "Python 3.13、FastAPI、Pydantic、SQLAlchemy/Alembic、持久化后台 worker；"
                 "TypeScript、React、Vite；pytest、Vitest、Playwright；Docker、Docker Compose"
             ),
-            "Python 3.13, FastAPI, Pydantic, SQLAlchemy, Alembic, TypeScript, React, Vite, "
-            "pytest, Vitest, Playwright, Docker",
+            "Python 3.13, FastAPI, TypeScript, React",
         )
         self.assertEqual(
             normalize_stack(
                 "Python 3.13、FastAPI、Pydantic、pytest、Docker Compose；"
                 "沿用现有算法，不引入外部服务。"
             ),
-            "Python 3.13, FastAPI, Pydantic, pytest, Docker",
+            "Python 3.13, FastAPI",
         )
 
     def test_original_prompts_are_staggered_between_a_and_b(self):

@@ -4,14 +4,29 @@ from typing import Any
 
 PROJECT_CATEGORIES = ("纯后端", "纯前端", "全栈")
 
+PRIMARY_FRAMEWORKS = {
+    "fastapi": "FastAPI", "django": "Django", "flask": "Flask",
+    "react": "React", "vue": "Vue", "vue.js": "Vue.js", "angular": "Angular",
+    "svelte": "Svelte", "solidjs": "SolidJS", "next.js": "Next.js", "nuxt": "Nuxt",
+    "express": "Express", "nestjs": "NestJS", "spring boot": "Spring Boot",
+    "gin": "Gin", "fiber": "Fiber", "echo": "Echo", "rails": "Rails",
+    "laravel": "Laravel", "symfony": "Symfony", "asp.net core": "ASP.NET Core",
+}
+PRIMARY_LANGUAGES = {
+    "python": "Python", "typescript": "TypeScript", "javascript": "JavaScript",
+    "go": "Go", "java": "Java", "kotlin": "Kotlin", "rust": "Rust",
+    "c#": "C#", "c++": "C++", "c": "C", "ruby": "Ruby", "php": "PHP",
+    "swift": "Swift", "dart": "Dart", "scala": "Scala", "elixir": "Elixir",
+    "erlang": "Erlang", "node.js": "Node.js", "deno": "Deno", "bun": "Bun",
+}
+
 
 def normalize_stack(value: Any = "") -> str:
     """Return a compact, comma-separated list of technology names.
 
-    The submission field is not a project description. Generated and legacy
-    rows sometimes append architecture decisions or Chinese explanations;
-    those are removed while language, framework, test and container labels
-    are retained. Docker Compose is represented once as Docker.
+    The submission field is not a general technology-stack description. Keep
+    only the main programming languages/runtimes and application frameworks;
+    omit libraries, build tools, tests, databases and container tooling.
     """
     raw = str(value or "").strip()
     parts = re.split(r"[,，、;；\n|]+|\s+\+\s+", raw)
@@ -29,8 +44,14 @@ def normalize_stack(value: Any = "") -> str:
             candidate = re.sub(r"\s+", " ", candidate).strip()
             if not candidate or len(candidate) > 48 or ":" in candidate:
                 continue
-            if candidate.casefold() in ("docker compose", "docker-compose"):
-                candidate = "Docker"
+            versioned = re.fullmatch(r"(.+?)\s+(\d+(?:\.\d+)*)", candidate)
+            base = (versioned.group(1) if versioned else candidate).casefold()
+            if base in PRIMARY_LANGUAGES:
+                candidate = PRIMARY_LANGUAGES[base] + ((" " + versioned.group(2)) if versioned else "")
+            elif base in PRIMARY_FRAMEWORKS:
+                candidate = PRIMARY_FRAMEWORKS[base] + ((" " + versioned.group(2)) if versioned else "")
+            else:
+                continue
             key = candidate.casefold()
             if key not in seen:
                 seen.add(key)

@@ -1967,11 +1967,14 @@ class PairwiseService:
                 str(review.get("a_reason") or ""), str(review.get("b_reason") or "")
             ) if issue not in issues
         )
+        languages = normalize_stack(task.get("stack"))
+        if not languages:
+            issues.append("语言/框架缺少主要编程语言或应用框架")
         values = {
             "user_prompt": prompt,
             "question_type": task_type,
             "difficulty": difficulty,
-            "languages": normalize_stack(task.get("stack")),
+            "languages": languages,
             "harness": "Claude Code",
             "harness_version": versions.get("A") or versions.get("B") or "",
             "os_platform": "MacOS/Linux",
