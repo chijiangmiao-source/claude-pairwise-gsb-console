@@ -66,6 +66,7 @@ class PairwiseService:
         self._futures: Dict[str, Any] = {}
         self._scheduler_started = False
         self._automation_lock = threading.Lock()
+        self._pair_creation_lock = threading.Lock()
         self._auto_retry_after: Dict[str, float] = {}
         self._seed_settings()
         self._quarantine_invalid_completed_pairs()
@@ -571,6 +572,13 @@ class PairwiseService:
         raise RuntimeError("未能生成可进入 A/B 的困难 Feature：%s" % last_error)
 
     def create_pair(self, task_id: str) -> Dict[str, Any]:
+        # Capacity checks and insertion must be one operation.  The scheduler
+        # and failed-task replacement path can otherwise both observe the same
+        # free slot and create a fourth Pair concurrently.
+        with self._pair_creation_lock:
+            return self._create_pair_locked(task_id)
+
+    def _create_pair_locked(self, task_id: str) -> Dict[str, Any]:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
         if not task:
             raise KeyError("任务不存在")
@@ -1532,7 +1540,21 @@ class PairwiseService:
                         break
             if not candidate:
                 raise RuntimeError("连续生成 3 次仍没有通过准入的困难或地狱新题")
-            replacement = self.create_pair(candidate["id"])
+            try:
+                replacement = self.create_pair(candidate["id"])
+            except ValueError as exc:
+                if "已达到 Pair 并发上限" not in str(exc):
+                    raise
+                stamp = now_iso()
+                self.db.execute(
+                    "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
+                    ("开发连续 3 次失败；并发空位已由自动补位使用，无需重复创建替换 Pair", stamp, retired_pair_id),
+                )
+                self.db.audit("pair.task_replacement_skipped_capacity", "pair", retired_pair_id, {
+                    "reason": "capacity_filled_by_scheduler",
+                })
+                return {"retiredPairId": retired_pair_id, "replacementPairId": "",
+                        "replacementTaskId": "", "outcome": "capacity_filled"}
             replacement_id = replacement["id"]
             self.prepare_pair_repository(replacement_id)
             self.start_pair(replacement_id)

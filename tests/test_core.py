@@ -114,6 +114,38 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "最多 3 个 Pair"):
             self.service.create_pair("task-limit-3")
 
+    def test_concurrent_pair_creation_cannot_exceed_three(self):
+        stamp = now_iso()
+        for index in range(4):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+                   fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"task-race-{index}", "test", "zero_to_one", f"hard-race-{index}", "Build a hard project",
+                 "困难", '["并发状态"]', f"fingerprint-race-{index}", "ready", stamp, stamp),
+            )
+        barrier = threading.Barrier(4)
+        outcomes = []
+        outcome_lock = threading.Lock()
+
+        def create(index):
+            barrier.wait()
+            try:
+                self.service.create_pair(f"task-race-{index}")
+                outcome = "created"
+            except ValueError as exc:
+                outcome = str(exc)
+            with outcome_lock:
+                outcomes.append(outcome)
+
+        threads = [threading.Thread(target=create, args=(index,)) for index in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(outcomes.count("created"), 3)
+        self.assertEqual(self.db.one("SELECT COUNT(*) count FROM pairs")["count"], 3)
+        self.assertTrue(any("最多 3 个 Pair" in outcome for outcome in outcomes))
+
     def test_one_click_automation_is_persistent_and_forces_three_pair_target(self):
         self.db.set_setting("max_pairs_parallel", 1)
         with patch.object(self.service, "_schedule_auto_pipeline_once") as schedule:
