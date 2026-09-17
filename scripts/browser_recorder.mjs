@@ -3,7 +3,7 @@ import ffmpegPath from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { automaticFinishDelayMs } from "./recording_timing.mjs";
+import { automaticFinishDelayMs, finalizeInteractionEvidence } from "./recording_timing.mjs";
 
 const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`, interactionMode = "auto"] = process.argv.slice(2);
 if (!url || !outputPath || !profileDir) {
@@ -269,13 +269,9 @@ async function finish(reason) {
     const pages = context?.pages() || [];
     if (!demonstration.required && pages[0]) {
       const metrics = await pages[0].evaluate(() => window.__pairwiseRecordingMetrics || { clicks: 0 });
-      demonstration = {
-        required: true,
-        ok: Number(metrics.clicks || 0) > 0 && successfulRequests.length > 0,
-        clicks: Number(metrics.clicks || 0),
-        requests: successfulRequests.length,
-        error: "没有检测到真实功能点击和成功接口请求",
-      };
+      demonstration = finalizeInteractionEvidence(
+        interactionMode, demonstration, metrics, successfulRequests.length,
+      );
     }
     stopping = true;
     const video = pages[0]?.video();

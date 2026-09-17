@@ -16,3 +16,26 @@ export function automaticFinishDelayMs(recordingKey, elapsedMs, maximumSeconds) 
   const finishAtMs = Math.min(desiredFinishMs, latestFinishMs);
   return Math.max(0, finishAtMs - Number(elapsedMs || 0));
 }
+
+export function finalizeInteractionEvidence(interactionMode, demonstration, metrics = {}, requestCount = 0) {
+  if (demonstration?.required) return demonstration;
+  const clicks = Number(metrics?.clicks || 0);
+  const requests = Number(requestCount || 0);
+  if (interactionMode === "manual") {
+    return {
+      required: false,
+      ok: true,
+      interactionMode: "manual",
+      clicks,
+      requests,
+      review: "human",
+    };
+  }
+  return {
+    required: true,
+    ok: clicks > 0 && requests > 0,
+    clicks,
+    requests,
+    error: "没有检测到真实功能点击和成功接口请求",
+  };
+}
