@@ -1026,6 +1026,104 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))["stage"], "development")
         self.assertEqual(self.db.one("SELECT status FROM gsb_reviews WHERE pair_id=?", (pair["id"],))["status"], "draft")
 
+    def test_archived_completed_trace_is_restored_before_prompt_validation(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        arm_id = pair["id"] + "-a"
+        session_id = "session-archived-A"
+        missing = self.config.data_dir / "claude-runs" / arm_id / "traces"
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,session_id,prompt_id,trace_path,commit_sha,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?,?,?,?)""",
+            (arm_id, pair["id"], "A", "A", str(self.root / "A"), "container-A", "screen-A",
+             "auto_model/urm", "image", session_id, "prompt-A", str(missing), "a" * 40,
+             stamp, stamp),
+        )
+        archived = (
+            self.config.data_dir / "claude-attempts" /
+            (arm_id + "-attempt-1-archive") / "traces" / "-workspace"
+        )
+        archived.mkdir(parents=True)
+        (archived / (session_id + ".jsonl")).write_text(
+            json.dumps({
+                "type": "user", "version": "2.1.269", "sessionId": session_id,
+                "message": {"role": "user", "content": "Build a hard project with Docker Compose"},
+            }) + "\n",
+            encoding="utf-8",
+        )
+        arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,))
+
+        trace, version, issues = self.service._inspect_trace(
+            arm, "Build a hard project with Docker Compose",
+        )
+
+        self.assertEqual(issues, [])
+        self.assertEqual(version, "2.1.269")
+        self.assertTrue(trace.is_file())
+        self.assertTrue(str(trace).startswith(str(missing.resolve())))
+        self.assertEqual(
+            self.db.one("SELECT trace_path FROM arm_runs WHERE id=?", (arm_id,))["trace_path"],
+            str(missing),
+        )
+        self.assertIsNotNone(self.db.one(
+            "SELECT id FROM audit_events WHERE entity_id=? AND event_type='claude.archived_trace_restored'",
+            (arm_id,),
+        ))
+
+    def test_missing_trace_is_not_reported_as_prompt_mismatch(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        arm = {
+            "id": pair["id"] + "-a", "pair_id": pair["id"], "arm": "A",
+            "status": "completed", "attempt_no": 1,
+        }
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?)""",
+            (arm["id"], pair["id"], "A", "A", str(self.root / "A"), "container-A", "screen-A",
+             "auto_model/urm", "image", stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
+               VALUES(?,?,'needs_review',?,?)""",
+            ("delivery-trace-label", pair["id"], stamp, stamp),
+        )
+        restarted = {**arm, "status": "developing"}
+        with patch.object(self.service, "_restart_arm_from_baseline", return_value=restarted), \
+             patch.object(self.service, "_submit_monitor"):
+            self.service._restart_trace_invalid_arms(
+                pair["id"], [arm], "Build a hard project with Docker Compose", ["A 轨迹目录无效"],
+            )
+
+        delivery = self.db.one("SELECT status,error FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(delivery["status"], "needs_review")
+        self.assertIn("轨迹文件校验未通过", delivery["error"])
+        self.assertNotIn("题面不一致", delivery["error"])
+
+    def test_retired_pair_delivery_is_discarded_instead_of_waiting_for_repair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,error,created_at,updated_at)
+               VALUES(?,?,'needs_review','轨迹题面不一致，等待单侧重跑和重新验收',?,?)""",
+            ("delivery-retired", pair["id"], stamp, stamp),
+        )
+        with patch.object(self.service, "_submit") as submit:
+            self.service._retire_pair_and_schedule_replacement(
+                pair["id"], pair["id"] + "-b", "首轮超时且无代码产出",
+            )
+
+        delivery = self.db.one("SELECT status,error FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(delivery["status"], "discarded")
+        self.assertIn("已停止交付", delivery["error"])
+        submit.assert_called_once_with(
+            "replace-task-" + pair["id"], self.service._start_replacement_pair, pair["id"],
+        )
+
     def test_gsb_process_evidence_excludes_discarded_arm_sessions(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

@@ -2,6 +2,7 @@ import hashlib
 import json
 import mimetypes
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -1560,11 +1561,57 @@ class PairwiseService:
             return "".join(parts)
         return ""
 
+    def _restore_archived_trace(self, arm: Dict[str, Any]) -> Optional[Path]:
+        """Restore a completed Arm's trace when a repair archived its runtime.
+
+        Artifact repair archives the old container before opening a new session.
+        If that repair is interrupted and the preserved commit is later resumed,
+        the database can still point at the old runtime directory even though the
+        exact trace now lives under ``claude-attempts``. Recovering that immutable
+        trace avoids misclassifying a storage move as a prompt mismatch.
+        """
+        if str(arm.get("status") or "") != "completed":
+            return None
+        arm_id = str(arm.get("id") or "").strip()
+        session_id = str(arm.get("session_id") or "").strip()
+        if not arm_id or not session_id:
+            return None
+        archive_root = self.config.data_dir / "claude-attempts"
+        candidates: List[Path] = []
+        for attempt in archive_root.glob(arm_id + "-attempt-*"):
+            candidates.extend((attempt / "traces").rglob(session_id + ".jsonl"))
+        if not candidates:
+            return None
+        # A session id is immutable. Duplicate archive copies are harmless; use
+        # the newest complete copy and restore its whole trace tree.
+        source_file = max(candidates, key=lambda item: item.stat().st_mtime)
+        source_root = source_file
+        while source_root.name != "traces" and source_root != source_root.parent:
+            source_root = source_root.parent
+        if source_root.name != "traces":
+            return None
+        target_root = self.config.data_dir / "claude-runs" / arm_id / "traces"
+        target_root.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_root, target_root, dirs_exist_ok=True)
+        self.db.execute(
+            "UPDATE arm_runs SET trace_path=?,updated_at=? WHERE id=? AND status='completed'",
+            (str(target_root), now_iso(), arm_id),
+        )
+        self.db.audit("claude.archived_trace_restored", "arm_run", arm_id, {
+            "session_id": session_id, "archive": str(source_root),
+            "restored_to": str(target_root),
+        })
+        return target_root
+
     def _inspect_trace(self, arm: Dict[str, Any], prompt: str) -> tuple:
         issues: List[str] = []
         session_id = str(arm.get("session_id") or "").strip()
         root = Path(str(arm.get("trace_path") or "")).expanduser().resolve()
         allowed_root = (self.config.data_dir / "claude-runs").resolve()
+        if session_id and (allowed_root not in root.parents or not root.is_dir()):
+            restored = self._restore_archived_trace(arm)
+            if restored:
+                root = restored.resolve()
         if not session_id or allowed_root not in root.parents or not root.is_dir():
             return None, "", [str(arm.get("arm") or "?") + " 轨迹目录无效"]
         matches = list(root.rglob(session_id + ".jsonl"))
@@ -1940,6 +1987,11 @@ class PairwiseService:
                 "UPDATE pairs SET status='failed',stage='task_replacement',error=?,updated_at=? WHERE id=?",
                 (("开发连续 3 次失败，正在自动换题：" + redact(error))[-3000:], stamp, pair_id),
             )
+            conn.execute(
+                """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
+                   WHERE pair_id=?""",
+                ("原 Pair 开发连续 3 次失败，已停止交付并正在自动换题", stamp, pair_id),
+            )
         self._invalidate_recordings(pair_id, reason="当前 Pair 已连续失败并换题：" + error)
         for other in self.db.all("SELECT * FROM arm_runs WHERE pair_id=? AND id<>?", (pair_id, failed_arm_id)):
             if other["status"] in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
@@ -1984,6 +2036,11 @@ class PairwiseService:
                     "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
                     ("开发连续 3 次失败；并发空位已由自动补位使用，无需重复创建替换 Pair", stamp, retired_pair_id),
                 )
+                self.db.execute(
+                    """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
+                       WHERE pair_id=?""",
+                    ("原 Pair 已废弃；并发空位已由自动补位使用", stamp, retired_pair_id),
+                )
                 self.db.audit("pair.task_replacement_skipped_capacity", "pair", retired_pair_id, {
                     "reason": "capacity_filled_by_scheduler",
                 })
@@ -1996,6 +2053,12 @@ class PairwiseService:
                 "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
                 ("开发连续 3 次失败，已自动换题为 %s" % replacement_id, now_iso(), retired_pair_id),
             )
+            self.db.execute(
+                """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
+                   WHERE pair_id=?""",
+                ("原 Pair 已废弃，已自动换题为 %s" % replacement_id,
+                 now_iso(), retired_pair_id),
+            )
             self.db.audit("pair.task_replaced", "pair", retired_pair_id, {
                 "replacement_pair_id": replacement_id, "replacement_task_id": candidate["id"],
             })
@@ -2005,6 +2068,12 @@ class PairwiseService:
             self.db.execute(
                 "UPDATE pairs SET stage='replacement_failed',error=?,updated_at=? WHERE id=?",
                 (("自动换题失败：" + redact(str(exc)))[-3000:], now_iso(), retired_pair_id),
+            )
+            self.db.execute(
+                """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
+                   WHERE pair_id=?""",
+                (("原 Pair 已废弃；自动换题失败：" + redact(str(exc)))[-2000:],
+                 now_iso(), retired_pair_id),
             )
             self.db.audit("pair.task_replacement_failed", "pair", retired_pair_id, {
                 "error": redact(str(exc))[-1000:],
@@ -2102,12 +2171,19 @@ class PairwiseService:
             raise RuntimeError("当前 6 个开发终端均在运行，轨迹返工需等待一个终端空位")
         stamp = now_iso()
         reason = "；".join(dict.fromkeys(str(issue) for issue in issues))[-2500:]
+        prompt_mismatch = any("首轮 User Prompt" in str(issue) for issue in issues)
+        problem = "轨迹题面不一致" if prompt_mismatch else "轨迹文件校验未通过"
+        retry_reason = (
+            "轨迹首轮题面不一致，按数据库原题面重新运行"
+            if prompt_mismatch else
+            "轨迹文件不可用，按数据库原题面重新运行"
+        )
         pair = self._pair(pair_id)
         with self.db.transaction() as conn:
             conn.execute(
                 """UPDATE pairs SET status='running',stage='development',winner='',completed_at=NULL,
                    error=?,updated_at=? WHERE id=?""",
-                ("轨迹题面不一致，正在按原题面用新 Session 重跑：" + reason, stamp, pair_id),
+                ((problem + "，正在按原题面用新 Session 重跑：" + reason)[-3000:], stamp, pair_id),
             )
             for arm in arms:
                 conn.execute(
@@ -2123,7 +2199,7 @@ class PairwiseService:
             conn.execute(
                 """UPDATE delivery_submissions SET status='needs_review',error=?,updated_at=?
                    WHERE pair_id=?""",
-                ("轨迹题面不一致，等待单侧重跑和重新验收", stamp, pair_id),
+                (problem + "，等待受影响侧重跑和重新验收", stamp, pair_id),
             )
             if pair.get("chain_id"):
                 conn.execute(
@@ -2135,7 +2211,7 @@ class PairwiseService:
         for arm in arms:
             current = self._restart_arm_from_baseline(
                 pair_id, arm, prompt,
-                "轨迹首轮题面不一致，按数据库原题面重新运行",
+                retry_reason,
                 count_development_failure=False,
             )
             restarted.append(str(arm["arm"]))
@@ -2143,6 +2219,10 @@ class PairwiseService:
                 "monitor-" + current["id"], self._monitor_arm,
                 pair_id, current["id"], prompt,
             )
+        self.db.execute(
+            "UPDATE pairs SET error=?,updated_at=? WHERE id=? AND stage='development'",
+            ((problem + "，正在按原题面用新 Session 重跑：" + reason)[-3000:], now_iso(), pair_id),
+        )
         self.db.audit("claude.trace_prompt_repair_started", "pair", pair_id, {
             "arms": restarted, "issues": list(dict.fromkeys(issues)),
             "prompt_mode": "exact_database_prompt_new_session",
