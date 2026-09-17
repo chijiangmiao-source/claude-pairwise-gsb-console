@@ -230,8 +230,8 @@ class CoreTests(unittest.TestCase):
             )
         result = self.service.confirm_gsb(
             pair["id"], "A better",
-            "A 完成了主要流程和异常路径，真实验收覆盖完整，录像中的操作结果稳定。",
-            "B 完成了主要流程，但异常路径仍有可复现失败，部分结果无法正常返回。",
+            "A 在 app/main.py 的 create 方法完成主要流程和异常路径，pytest 验收与录像结果稳定。",
+            "B 在 app/main.py 的 create 方法完成主要流程，但 pytest 显示异常路径仍有可复现失败。",
             "刘昱",
         )
         self.assertEqual(result["status"], "completed")
@@ -265,8 +265,8 @@ class CoreTests(unittest.TestCase):
             )
         result_payload = {
             "verdict": "A better",
-            "aReason": "A 完成了全部主要流程，异常路径与持久化结果都有可见验收证据，因此本次更倾向 A。",
-            "bReason": "B 完成了核心流程，但异常恢复场景仍有可复现偏差，因此相比 A 不优先选择 B。",
+            "aReason": "A 在 app/main.py 的 create 方法完成全部主要流程，pytest 覆盖异常路径与持久化结果，因此更倾向 A。",
+            "bReason": "B 在 app/main.py 的 create 方法完成核心流程，但 pytest 显示异常恢复仍有可复现偏差，因此不优先。",
             "evidence": ["A Docker 通过", "B 异常路径失败"],
         }
         with patch.object(self.service.codex, "run", return_value=result_payload):
@@ -307,8 +307,8 @@ class CoreTests(unittest.TestCase):
         payload = {
             "status": "suggested_revision",
             "suggestedVerdict": "A better",
-            "suggestedAReason": "A 的建议评价明确区分开发说明与后续独立验收，并保留可核对的具体结果。",
-            "suggestedBReason": "B 的建议评价指出实际接口偏差及其客观后果，措辞限定在现有证据范围内。",
+            "suggestedAReason": "A 的 app/main.py 开发说明与 docker compose run verify 后续独立验收已明确区分。",
+            "suggestedBReason": "B 的 app/main.py 接口偏差由 pytest 验证，评价写明了实际行为和客观后果。",
             "issues": ["原评价需要明确验收发生阶段。"],
             "evidenceRefs": ["checks[A]", "checks[B]"],
         }
@@ -326,6 +326,42 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(review["a_reason"], payload["suggestedAReason"])
         self.assertEqual(review["b_reason"], payload["suggestedBReason"])
         self.assertEqual(review["status"], "confirmed")
+
+    def test_gsb_recheck_cannot_pass_reasons_without_evidence_locators(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,a_reason,b_reason,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'confirmed',?,?)""",
+            ("gsb-locator-source", pair["id"], "Same", "A：评价 A B：评价 B",
+             "A 的结果完整，验收结果稳定。", "B 的结果完整，验收结果也稳定。", stamp, stamp),
+        )
+        for arm in ("A", "B"):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-locator-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed',?,?)""",
+                ("check-locator-" + arm, pair["id"], arm, sha, stamp, stamp),
+            )
+        payload = {
+            "status": "passed", "suggestedVerdict": "Same",
+            "suggestedAReason": "A 完成了核心要求，后续验收结果稳定，没有发现影响交付的问题。",
+            "suggestedBReason": "B 也完成了核心要求，后续验收结果相同，因此两边表现接近。",
+            "issues": [], "evidenceRefs": ["checks[A]", "checks[B]"],
+        }
+        with patch.object(self.service.codex, "run", return_value=payload):
+            result = self.service._recheck_gsb(pair["id"])
+        self.assertEqual(result["result_status"], "suggested_revision")
+        self.assertIn("A 评价缺少可核对的触发节点", result["issues_json"])
+        self.assertIn("B 评价缺少可核对的触发节点", result["issues_json"])
 
     def test_new_evidence_review_and_delivery_schema_is_available(self):
         recording_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recordings)")}
@@ -409,8 +445,8 @@ class CoreTests(unittest.TestCase):
         )
         self.service.confirm_gsb(
             pair["id"], "Same",
-            "A 完成了全部主要要求，Docker 验收与录像均显示核心流程可用，与 B 的结果接近。",
-            "B 也完成了全部主要要求，Docker 验收与录像呈现相同结果，因此两边判为 Same。",
+            "A 的 app/main.py 完成全部主要要求，docker compose run verify 显示核心流程可用，与 B 接近。",
+            "B 的 app/main.py 也完成全部主要要求，docker compose run verify 呈现相同结果，因此判为 Same。",
             "刘昱",
         )
         self.db.execute(

@@ -59,7 +59,7 @@ def feature_generation_prompt(original_task: str, artifact_summary: str, existin
 def gsb_prompt(task: str, a_evidence: str, b_evidence: str) -> str:
     return f"""比较同一道开发任务的 A、B 两份最终产物，给出 GSB 结论。只依据可见题面、代码提交、Docker 验收、真实操作录像和开发轨迹，不索取内部思维。
 
-结论只能是 A better、Same 或 B better。只填写 aReason 和 bReason 两段，不生成单独的偏好依据。aReason 说明 A 的可见操作、产物、验收结果和具体问题，并自然交代这些事实如何支持最终结论；bReason 对 B 做同样说明。两段合起来必须能直接看出为什么选择 A better、Same 或 B better。使用自然、口语化中文，不使用反引号、Markdown 列表、JSON 文本、模型名称或空泛套话。A、B 各 20–300 个字符。选择 Same 时也要分别说明两边的实际表现和结果接近的依据。
+结论只能是 A better、Same 或 B better。只填写 aReason 和 bReason 两段，不生成单独的偏好依据。aReason 说明 A 的可见操作、产物、验收结果和具体问题，并自然交代这些事实如何支持最终结论；bReason 对 B 做同样说明。两段合起来必须能直接看出为什么选择 A better、Same 或 B better。每段至少写出一个真实、可核对的触发节点或证据位置，例如第几步或第几次工具调用、文件名与函数名、实际命令，或报错原文；只写“后续验收通过”“存在问题”“经过重试”不合格。具体问题还要说明该节点的实际行为和已发生的结果，证据没有提供的细节不得编造。使用自然、口语化中文，不使用反引号、Markdown 列表、JSON 文本、模型名称或空泛套话。A、B 各 20–300 个字符。选择 Same 时也要分别说明两边的实际表现和结果接近的依据。
 
 任务：
 {task}
@@ -77,7 +77,7 @@ def gsb_recheck_prompt(task: str, verdict: str, a_reason: str, b_reason: str,
                        evidence: str) -> str:
     return f"""复检一条 A/B 开发任务的公开 GSB 理由。只依据给出的可见证据检查，不修改代码，也不索取内部思维。
 
-重点检查结论与 A/B 事实是否一致，是否把后续独立验收写成开发过程事实，是否遗漏会改变结论的重试、追加提示或未验证范围，是否包含不存在的测试数字、文件、命令或结果。A、B 理由必须分别描述对应产物，并把支持最终偏好的比较依据自然融入两段；不得新增单独的偏好依据。每段使用自然中文，不含反引号、Markdown、JSON 或模型名称。
+重点检查结论与 A/B 事实是否一致，是否把后续独立验收写成开发过程事实，是否遗漏会改变结论的重试、追加提示或未验证范围，是否包含不存在的测试数字、文件、命令或结果。A、B 理由必须分别描述对应产物，并把支持最终偏好的比较依据自然融入两段；不得新增单独的偏好依据。每段必须至少包含一个真实、可核对的触发节点或证据位置：第几步或第几次工具调用、文件名与函数名、实际命令、报错原文中的任意一种。出现具体问题时，还要写清该节点的实际行为和已发生结果。任一段缺少这种定位时不能返回 passed，应返回 suggested_revision，并在建议文本中补齐；证据不足时明确指出缺项，禁止编造。每段使用自然中文，不含反引号、Markdown、JSON 或模型名称。
 
 轻微措辞、顺序或表达精简使用 suggested_revision；只有结论与证据相反、关键事实错误或引用不存在时使用 fact_conflict；事实与表达都可接受时使用 passed。无论状态如何，都返回可直接使用的 suggestedVerdict、suggestedAReason 与 suggestedBReason。不要因为未提供内部思维而判错。
 

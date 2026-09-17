@@ -893,6 +893,29 @@ class PairwiseService:
     def _compose_gsb_reason(a_reason: str, b_reason: str) -> str:
         return "A：%s B：%s" % (a_reason, b_reason)
 
+    @staticmethod
+    def _gsb_has_locator(value: str) -> bool:
+        """Return whether a public reason contains one reviewable evidence locator."""
+        text = str(value or "")
+        patterns = (
+            r"第\s*[一二三四五六七八九十百\d]+\s*(?:步|次|轮|个工具调用|次工具调用)",
+            r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+",
+            r"\b[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|kt|rb|php|sh|yml|yaml|json|toml|md)\b",
+            r"\b(?:docker\s+compose|pytest|npm\s+(?:test|run)|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|python3?\s+|curl\s+|git\s+)[^，。；]*",
+            r"\b(?:[1-5]\d\d|[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\b",
+            r"(?:函数|方法|接口)\s*[A-Za-z_][A-Za-z0-9_]*",
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+    @classmethod
+    def _gsb_locator_issues(cls, a_reason: str, b_reason: str) -> List[str]:
+        issues = []
+        if not cls._gsb_has_locator(a_reason):
+            issues.append("A 评价缺少可核对的触发节点（步骤、文件/函数、命令或报错）")
+        if not cls._gsb_has_locator(b_reason):
+            issues.append("B 评价缺少可核对的触发节点（步骤、文件/函数、命令或报错）")
+        return issues
+
     def generate_gsb(self, pair_id: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)
         self.refresh_recording_stage(pair_id)
@@ -957,6 +980,9 @@ class PairwiseService:
         clean_b = self._clean_gsb_part(b_reason, 300)
         if len(clean_a) < 20 or len(clean_b) < 20:
             raise ValueError("A、B 评价均至少 20 个字符，并在两段中说明支持结论的依据")
+        locator_issues = self._gsb_locator_issues(clean_a, clean_b)
+        if locator_issues:
+            raise ValueError("；".join(locator_issues))
         clean = self._compose_gsb_reason(clean_a, clean_b)
         stamp = now_iso()
         evidence_version = self.gsb_evidence_version(pair_id, verdict, clean)
@@ -1053,6 +1079,12 @@ class PairwiseService:
         )
         suggested_a = self._clean_gsb_part(result["suggestedAReason"], 300)
         suggested_b = self._clean_gsb_part(result["suggestedBReason"], 300)
+        locator_issues = self._gsb_locator_issues(suggested_a, suggested_b)
+        result_status = str(result["status"])
+        result_issues = [str(item) for item in result.get("issues", [])]
+        if locator_issues:
+            result_status = "suggested_revision"
+            result_issues.extend(issue for issue in locator_issues if issue not in result_issues)
         suggested_reason = self._compose_gsb_reason(suggested_a, suggested_b)
         latest_job = self.db.one(
             "SELECT id FROM codex_jobs WHERE pair_id=? AND job_type='gsb_recheck' ORDER BY created_at DESC LIMIT 1",
@@ -1065,9 +1097,9 @@ class PairwiseService:
                suggested_verdict,suggested_reason,suggested_a_reason,suggested_b_reason,
                suggested_preference_reason,issues_json,evidence_refs_json,model,reasoning_effort,
                codex_job_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (recheck_id, pair_id, version, verdict, reason, result["status"], result["suggestedVerdict"],
+            (recheck_id, pair_id, version, verdict, reason, result_status, result["suggestedVerdict"],
              suggested_reason, suggested_a, suggested_b, "",
-             json.dumps(result["issues"], ensure_ascii=False),
+             json.dumps(result_issues, ensure_ascii=False),
              json.dumps(result["evidenceRefs"], ensure_ascii=False), model, effort,
              str(latest_job.get("id") or ""), stamp),
         )
@@ -1179,6 +1211,11 @@ class PairwiseService:
             if rec.get("review_status") != "confirmed": blockers.append(arm + " 录像尚未审核通过")
         review = detail.get("gsb") or {}
         if review.get("status") != "confirmed": blockers.append("GSB 尚未确认")
+        blockers.extend(
+            issue for issue in self._gsb_locator_issues(
+                str(review.get("a_reason") or ""), str(review.get("b_reason") or "")
+            ) if issue not in blockers
+        )
         verdict, reason = str(review.get("verdict") or ""), str(review.get("reason") or "")
         version = self.gsb_evidence_version(pair_id, verdict, reason) if review else ""
         latest = self.db.one("SELECT * FROM gsb_rechecks WHERE pair_id=? ORDER BY created_at DESC LIMIT 1", (pair_id,))
@@ -1332,6 +1369,11 @@ class PairwiseService:
             issues.append("GSB 理由不足 60 字")
         if "A：" not in reason or "B：" not in reason:
             issues.append("GSB 理由必须分别包含 A、B 评价")
+        issues.extend(
+            issue for issue in self._gsb_locator_issues(
+                str(review.get("a_reason") or ""), str(review.get("b_reason") or "")
+            ) if issue not in issues
+        )
         values = {
             "user_prompt": prompt,
             "question_type": task_type,
