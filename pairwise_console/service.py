@@ -540,7 +540,7 @@ class PairwiseService:
 
     def _schedule_checkpoint_pushes(self, pair_id: str) -> None:
         for arm in self.db.all(
-            """SELECT id FROM arm_runs WHERE pair_id=? AND status='checkpointing'
+            """SELECT id FROM arm_runs WHERE pair_id=? AND status IN ('checkpointing','exported')
                AND trace_path<>''""", (pair_id,),
         ):
             self._submit_auto(
@@ -551,7 +551,7 @@ class PairwiseService:
     def _finish_checkpointed_arm(self, pair_id: str, arm_id: str) -> Dict[str, Any]:
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=? AND pair_id=?", (arm_id, pair_id)) or {}
         pair = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair_id,)) or {}
-        if arm.get("status") != "checkpointing" or pair.get("status") not in ("running", "review"):
+        if arm.get("status") not in ("checkpointing", "exported") or pair.get("status") not in ("running", "review"):
             return {"pairId": pair_id, "armId": arm_id, "skipped": True}
         trace_path = Path(str(arm.get("trace_path") or ""))
         if not trace_path.is_dir():
@@ -2464,7 +2464,8 @@ class PairwiseService:
                     self.db.execute("UPDATE arm_runs SET status='checkpointing',result=?,updated_at=? WHERE id=?", (result, now_iso(), arm_id))
                     trace_dir = self.claude.export_and_stop(arm)
                     self.db.execute(
-                        "UPDATE arm_runs SET trace_path=?,result=?,error='',updated_at=? WHERE id=?",
+                        """UPDATE arm_runs SET status='checkpointing',trace_path=?,result=?,
+                           error='',updated_at=? WHERE id=?""",
                         (str(trace_dir), result, now_iso(), arm_id),
                     )
                 except Exception as exc:

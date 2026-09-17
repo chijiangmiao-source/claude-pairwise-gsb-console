@@ -1117,7 +1117,7 @@ class CoreTests(unittest.TestCase):
         self.db.execute(
             """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
                model,image,status,trace_path,result,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,'checkpointing',?,?,?,?)""",
+               VALUES(?,?,?,?,?,?,?,?,?,'exported',?,?,?,?)""",
             ("arm-checkpoint-A", pair["id"], "A", "A", str(self.root / "workspace-A"),
              "container-A", "screen-A", "auto_model/urm", "image", str(traces),
              "finished", stamp, stamp),
