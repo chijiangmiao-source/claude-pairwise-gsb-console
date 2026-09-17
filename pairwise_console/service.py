@@ -415,30 +415,33 @@ class PairwiseService:
     def _resume_one_reusable_pair(self) -> bool:
         """Prefer finished code over consuming another task-pool entry.
 
-        A recording failure does not invalidate either Git commit, trace, or
-        Docker check.  Reopen one such Pair when capacity is available and
-        grant the improved recorder a fresh three-attempt window while keeping
-        every historical failed recording for audit.
+        A recording or artifact failure does not erase either Git commit or
+        trace. Reopen one such Pair when capacity is available; recordings get
+        a fresh three-attempt window, while real artifact defects start a
+        targeted repair from the delivered commit.
         """
         row = self.db.one(
-            """SELECT p.id,p.chain_id FROM pairs p
-               WHERE p.status='failed' AND p.stage='recording_failed'
+            """SELECT p.id,p.chain_id,p.stage FROM pairs p
+               WHERE p.status='failed' AND p.stage IN ('recording_failed','artifact_failed')
                  AND (SELECT COUNT(*) FROM arm_runs a
                       WHERE a.pair_id=p.id AND a.status='completed' AND a.commit_sha<>'')=2
-                 AND (SELECT COUNT(*) FROM artifact_checks c
-                      JOIN arm_runs a ON a.pair_id=c.pair_id AND a.arm=c.arm
-                                     AND a.commit_sha=c.commit_sha
-                      WHERE c.pair_id=p.id AND c.status='passed')=2
-               ORDER BY p.updated_at,p.created_at LIMIT 1"""
+                 AND (p.stage='artifact_failed' OR
+                      (SELECT COUNT(*) FROM artifact_checks c
+                       JOIN arm_runs a ON a.pair_id=c.pair_id AND a.arm=c.arm
+                                      AND a.commit_sha=c.commit_sha
+                       WHERE c.pair_id=p.id AND c.status='passed')=2)
+               ORDER BY CASE p.stage WHEN 'recording_failed' THEN 0 ELSE 1 END,
+                        p.updated_at,p.created_at LIMIT 1"""
         )
         if not row:
             return False
         stamp = now_iso()
+        next_stage = "recording" if row["stage"] == "recording_failed" else "artifact_validation"
         with self.db.transaction() as conn:
             conn.execute(
-                """UPDATE pairs SET status='running',stage='recording',error='',
+                """UPDATE pairs SET status='running',stage=?,error='',
                    winner='',completed_at=NULL,updated_at=? WHERE id=?""",
-                (stamp, row["id"]),
+                (next_stage, stamp, row["id"]),
             )
             conn.execute(
                 """UPDATE delivery_submissions SET status='needs_review',error='',updated_at=?
@@ -450,10 +453,16 @@ class PairwiseService:
                        completed_at=NULL,updated_at=? WHERE id=?""",
                     (stamp, row["chain_id"]),
                 )
-        self.db.audit("recording.retry_window_started", "pair", row["id"], {
-            "reason": "reuse_existing_commits_after_recorder_update",
-            "preserved": ["A_commit", "B_commit", "traces", "artifact_checks"],
-        })
+        if next_stage == "recording":
+            self.db.audit("recording.retry_window_started", "pair", row["id"], {
+                "reason": "reuse_existing_commits_after_recorder_update",
+                "preserved": ["A_commit", "B_commit", "traces", "artifact_checks"],
+            })
+        else:
+            self.db.audit("artifact.revalidation_started", "pair", row["id"], {
+                "reason": "reuse_existing_commits_before_targeted_repair",
+                "preserved": ["A_commit", "B_commit", "traces"],
+            })
         return True
 
     def _schedule_refill_once(self) -> None:
@@ -1668,6 +1677,48 @@ class PairwiseService:
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
 
+    def _restart_arm_from_delivered_commit(self, pair_id: str, arm: Dict[str, Any],
+                                            prompt: str, error: str) -> Dict[str, Any]:
+        """Repair a real artifact defect without discarding delivered code."""
+        arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
+        attempt = max(1, int(arm.get("attempt_no") or 1))
+        maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
+        if attempt >= maximum:
+            archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
+            self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error)
+            return archived
+        source_sha = str(arm.get("commit_sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+            raise RuntimeError("缺少可复用的 %s 已交付提交" % arm.get("arm", "Arm"))
+        repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
+        canonical = Path(str(repo.get("local_root") or "")) / str(arm["arm"])
+        restarted = self.claude.archive_failed_attempt(
+            arm, error, prepare_retry=True,
+            count_development_failure=True, count_error_retry=True,
+        )
+        self.db.execute(
+            "UPDATE arm_runs SET status='waiting_retry',error=?,updated_at=? WHERE id=?",
+            (redact(error)[-2000:], now_iso(), arm["id"]),
+        )
+        time.sleep(8)
+        restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
+        self.claude.launch(restarted)
+        restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
+        self.claude.wait_until_ready(restarted)
+        self.claude.materialize_repository(restarted, canonical, source_sha)
+        restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
+        self.claude.send_prompt(restarted, prompt)
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development',error='',updated_at=? WHERE id=?",
+            (now_iso(), pair_id),
+        )
+        self.db.audit("artifact.repair_started_from_commit", "arm_run", arm["id"], {
+            "arm": arm["arm"], "source_commit": source_sha,
+            "attempt": int(restarted.get("attempt_no") or attempt + 1),
+            "prompt_mode": "exact_database_prompt_once",
+        })
+        return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
+
     def _handle_attempt_failure(self, pair_id: str, arm: Dict[str, Any], prompt: str,
                                 error: str) -> Dict[str, Any]:
         """Retry every failed development attempt in a new session.
@@ -1999,7 +2050,7 @@ class PairwiseService:
                 if not arm:
                     continue
                 reason = "Docker 产物验收失败：" + str(item.get("error") or "未通过清洁 Compose 验收")
-                current = self._handle_attempt_failure(pair_id, arm, prompt, reason)
+                current = self._restart_arm_from_delivered_commit(pair_id, arm, prompt, reason)
                 pair = self._pair(pair_id)
                 if pair.get("stage") in ("task_replacement", "replaced", "replacement_failed"):
                     return {"pairId": pair_id, "checks": results, "restarted": restarted, "retired": True}
@@ -2010,7 +2061,7 @@ class PairwiseService:
                         pair_id, current["id"], prompt,
                     )
             self.db.audit("artifact.failed_arms_restarted", "pair", pair_id, {
-                "arms": restarted, "rule": "fresh_session_from_common_baseline",
+                "arms": restarted, "rule": "fresh_session_from_delivered_commit",
             })
             return {"pairId": pair_id, "checks": results, "restarted": restarted}
         self.db.execute(

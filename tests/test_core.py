@@ -616,7 +616,7 @@ class CoreTests(unittest.TestCase):
         ]
         restarted = {"id": "arm-artifact-A", "arm": "A", "status": "developing"}
         with patch.object(self.service.artifacts, "validate", side_effect=checks), \
-             patch.object(self.service, "_handle_attempt_failure", return_value=restarted) as retry, \
+             patch.object(self.service, "_restart_arm_from_delivered_commit", return_value=restarted) as retry, \
              patch.object(self.service, "_submit_monitor") as submit:
             result = self.service._validate_pair_artifacts(pair["id"])
         self.assertEqual(result["restarted"], ["A"])
@@ -660,7 +660,7 @@ class CoreTests(unittest.TestCase):
         }
         checks = [{**collision, "arm": "A"}, {**collision, "arm": "B"}]
         with patch.object(self.service.artifacts, "validate", side_effect=checks), \
-             patch.object(self.service, "_handle_attempt_failure") as retry:
+             patch.object(self.service, "_restart_arm_from_delivered_commit") as retry:
             result = self.service._validate_pair_artifacts(pair["id"])
         retry.assert_not_called()
         self.assertEqual(result["reused"], ["A", "B"])
@@ -701,6 +701,30 @@ class CoreTests(unittest.TestCase):
             "SELECT event_type FROM audit_events WHERE entity_id=? ORDER BY id DESC LIMIT 1", (pair["id"],),
         )
         self.assertEqual(event["event_type"], "recording.retry_window_started")
+
+    def test_artifact_failure_pair_reopens_for_commit_based_repair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-artifact-reuse-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+        self.db.execute(
+            "UPDATE pairs SET status='failed',stage='artifact_failed',error='missing Dockerfile' WHERE id=?",
+            (pair["id"],),
+        )
+        self.assertTrue(self.service._resume_one_reusable_pair())
+        current = self.db.one("SELECT status,stage,error FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {"status": "running", "stage": "artifact_validation", "error": ""})
+        event = self.db.one(
+            "SELECT event_type FROM audit_events WHERE entity_id=? ORDER BY id DESC LIMIT 1", (pair["id"],),
+        )
+        self.assertEqual(event["event_type"], "artifact.revalidation_started")
 
     def test_completed_trace_prompt_mismatch_restarts_only_invalid_arm(self):
         self.insert_ready_task()
