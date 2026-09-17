@@ -1160,6 +1160,9 @@ class PairwiseService:
         detail = self.pair_detail(pair_id)
         blockers: List[str] = []
         warnings: List[str] = []
+        repository = detail.get("repository") or {}
+        if repository and str(repository.get("visibility") or "").casefold() != "public":
+            blockers.append("GitHub 仓库不是公开仓库，SOLO-QA 无法核验分支与提交")
         arms = {row["arm"]: row for row in detail.get("arms", [])}
         checks = {row["arm"]: row for row in detail.get("checks", [])}
         recs = {row["arm"]: row for row in detail.get("recordings", [])}

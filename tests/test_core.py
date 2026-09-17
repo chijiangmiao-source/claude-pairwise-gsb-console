@@ -413,9 +413,19 @@ class CoreTests(unittest.TestCase):
             "B 也完成了全部主要要求，Docker 验收与录像呈现相同结果，因此两边判为 Same。",
             "刘昱",
         )
+        self.db.execute(
+            """INSERT INTO git_repositories(id,pair_id,owner,name,visibility,local_root,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'ready',?,?)""",
+            ("repo-preflight", pair["id"], "owner", "repo", "public", str(self.root), stamp, stamp),
+        )
         check = self.service.delivery_preflight(pair["id"])
         self.assertTrue(check["eligible"])
         self.assertTrue(check["warnings"])
+        self.db.execute("UPDATE git_repositories SET visibility='private' WHERE pair_id=?", (pair["id"],))
+        private = self.service.delivery_preflight(pair["id"])
+        self.assertFalse(private["eligible"])
+        self.assertIn("GitHub 仓库不是公开仓库，SOLO-QA 无法核验分支与提交", private["blockers"])
+        self.db.execute("UPDATE git_repositories SET visibility='public' WHERE pair_id=?", (pair["id"],))
         review = self.db.one("SELECT * FROM gsb_reviews WHERE pair_id=?", (pair["id"],))
         version = self.service.gsb_evidence_version(pair["id"], review["verdict"], review["reason"])
         self.db.execute(
