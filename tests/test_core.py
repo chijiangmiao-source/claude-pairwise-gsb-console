@@ -416,6 +416,12 @@ class CoreTests(unittest.TestCase):
                VALUES(?,?,?,?,?,'manual','passed',?,?)""",
             ("manual-rerecord", pair["id"], "A", "a" * 40, str(self.root / "manual.mp4"), stamp, stamp),
         )
+        self.db.execute(
+            """INSERT INTO recording_attempts(
+                 id,pair_id,arm,commit_sha,path,interaction_mode,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'manual','recording',?,?)""",
+            ("manual-active", pair["id"], "B", "b" * 40, str(self.root / "active.mp4"), stamp, stamp),
+        )
         handler = Handler.__new__(Handler)
         handler.server = MagicMock(db=self.db)
         manual = handler._evidence_page({"manual_rerecorded": ["yes"], "page": ["1"], "size": ["20"]})

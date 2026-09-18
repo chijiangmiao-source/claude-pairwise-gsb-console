@@ -459,8 +459,13 @@ class Handler(BaseHTTPRequestHandler):
             if value:
                 clauses.append(column + "=?"); params.append(value)
         manual_rerecorded = self._query(query, "manual_rerecorded")
+        # Starting an attempt must not move the row between the "人工重录"
+        # filters while the operator still needs its controls.  The row is
+        # classified as manually rerecorded only after the MP4 is saved and
+        # validated successfully.
         manual_attempt = """EXISTS(SELECT 1 FROM recording_attempts manual
-          WHERE manual.pair_id=a.pair_id AND manual.arm=a.arm AND manual.interaction_mode='manual')"""
+          WHERE manual.pair_id=a.pair_id AND manual.arm=a.arm
+            AND manual.interaction_mode='manual' AND manual.status='passed')"""
         if manual_rerecorded == "yes":
             clauses.append(manual_attempt)
         elif manual_rerecorded == "no":
