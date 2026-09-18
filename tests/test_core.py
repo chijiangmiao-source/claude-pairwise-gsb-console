@@ -60,6 +60,27 @@ class CoreTests(unittest.TestCase):
              "困难", '["跨模块状态","异常恢复"]', "fingerprint-1", "ready", stamp, stamp),
         )
 
+    def mark_completed_feature_source(self, pair_id, completed_at=None):
+        stamp = completed_at or now_iso()
+        commit = (pair_id.replace("pair-", "") + "a" * 40)[:40]
+        self.db.execute(
+            """UPDATE pairs SET status='completed',stage='completed',winner='A better',
+               completed_at=?,updated_at=? WHERE id=?""",
+            (stamp, stamp, pair_id),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+            (pair_id + "-source-a", pair_id, "A", "A", str(self.root), pair_id + "-container-a",
+             pair_id + "-screen-a", "auto_model/urm", "image", commit, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,created_at,updated_at)
+               VALUES(?,?, 'A',?,'passed','[]',?,?)""",
+            (pair_id + "-source-check-a", pair_id, commit, stamp, stamp),
+        )
+
     def test_defaults_use_codex_for_review_and_claude_for_development(self):
         self.assertEqual(self.db.setting("codex_model"), "gpt-5.6-sol")
         self.assertEqual(self.db.setting("codex_default_effort"), "medium")
@@ -249,10 +270,7 @@ class CoreTests(unittest.TestCase):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
-        self.db.execute(
-            "UPDATE pairs SET status='completed',stage='completed',completed_at=?,updated_at=? WHERE id=?",
-            (stamp, stamp, pair["id"]),
-        )
+        self.mark_completed_feature_source(pair["id"], stamp)
         submitted = []
         with patch.object(
             self.service, "_submit_auto",
@@ -287,6 +305,22 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(self.service._schedule_task_source("bugfix"))
         self.assertEqual(submitted, ["generate-mix-zero-to-one", "generate-mix-zero-to-one"])
 
+    def test_failed_winner_artifact_is_not_retried_as_feature_source(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.mark_completed_feature_source(pair["id"])
+        self.db.execute(
+            "UPDATE artifact_checks SET status='observed_failed' WHERE pair_id=? AND arm='A'",
+            (pair["id"],),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_auto",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ):
+            self.assertTrue(self.service._schedule_task_source("feature"))
+        self.assertEqual(submitted, ["generate-mix-zero-to-one"])
+
     def test_latest_zero_to_one_gets_at_most_three_feature_tasks_then_new_project(self):
         self.insert_ready_task()
         older = self.service.create_pair("task-1")
@@ -304,10 +338,7 @@ class CoreTests(unittest.TestCase):
         )
         latest = self.service.create_pair("task-latest-root")
         later = datetime.now(timezone.utc).isoformat()
-        self.db.execute(
-            "UPDATE pairs SET status='completed',stage='completed',completed_at=?,updated_at=? WHERE id=?",
-            (later, later, latest["id"]),
-        )
+        self.mark_completed_feature_source(latest["id"], later)
         statuses = ("used", "rejected", "used")
         for index, status in enumerate(statuses):
             self.db.execute(

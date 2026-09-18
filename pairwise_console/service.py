@@ -878,6 +878,27 @@ class PairwiseService:
                 return index
         return 0
 
+    def _eligible_feature_sources(self) -> List[Dict[str, Any]]:
+        return self.db.all(
+            """SELECT p.id,t.title,COALESCE(r.remote_url,'') baseline_repo_url
+                 FROM pairs p JOIN tasks t ON t.id=p.task_id
+            LEFT JOIN git_repositories r ON r.pair_id=p.id
+               WHERE p.status='completed' AND t.task_type='zero_to_one'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM delivery_submissions d
+                    WHERE d.pair_id=p.id AND d.status='discarded'
+                 )
+                 AND EXISTS (
+                   SELECT 1 FROM arm_runs a
+                   JOIN artifact_checks c
+                     ON c.pair_id=a.pair_id AND c.arm=a.arm
+                    AND c.commit_sha=a.commit_sha AND c.status='passed'
+                  WHERE a.pair_id=p.id AND a.status='completed' AND a.commit_sha<>''
+                    AND a.arm=CASE WHEN p.winner='B better' THEN 'B' ELSE 'A' END
+                 )
+               ORDER BY p.completed_at DESC,p.id DESC"""
+        )
+
     def _retire_outdated_ready_bug_task(self, task: Dict[str, Any]) -> bool:
         if task.get("source") != "bug_discovery" or task.get("task_type") != "bugfix":
             return False
@@ -955,17 +976,7 @@ class PairwiseService:
         )
         if pending_bug:
             return self._schedule_task_source("bugfix")
-        feature_sources = self.db.all(
-            """SELECT p.id,t.title,COALESCE(r.remote_url,'') baseline_repo_url
-                 FROM pairs p JOIN tasks t ON t.id=p.task_id
-            LEFT JOIN git_repositories r ON r.pair_id=p.id
-               WHERE p.status='completed' AND t.task_type='zero_to_one'
-                 AND NOT EXISTS (
-                   SELECT 1 FROM delivery_submissions d
-                    WHERE d.pair_id=p.id AND d.status='discarded'
-                 )
-               ORDER BY p.completed_at DESC,p.id DESC"""
-        )
+        feature_sources = self._eligible_feature_sources()
         for source in feature_sources:
             feature_count = len(self._feature_project_rows({
                 "baseline_repo_url": source.get("baseline_repo_url", ""),
@@ -998,17 +1009,8 @@ class PairwiseService:
                 "generate-mix-zero-to-one", self.generate_tasks, 1, "zero_to_one",
             )
         if task_type == "feature":
-            source = self.db.one(
-                """SELECT p.id,t.title,COALESCE(r.remote_url,'') baseline_repo_url
-                     FROM pairs p JOIN tasks t ON t.id=p.task_id
-                LEFT JOIN git_repositories r ON r.pair_id=p.id
-                   WHERE p.status='completed' AND t.task_type='zero_to_one'
-                     AND NOT EXISTS (
-                       SELECT 1 FROM delivery_submissions d
-                        WHERE d.pair_id=p.id AND d.status='discarded'
-                     )
-                   ORDER BY p.completed_at DESC,p.id DESC LIMIT 1"""
-            )
+            sources = self._eligible_feature_sources()
+            source = sources[0] if sources else None
             feature_count = len(self._feature_project_rows({
                 "baseline_repo_url": source.get("baseline_repo_url", "") if source else "",
                 "parent_pair_id": source.get("id", "") if source else "",
