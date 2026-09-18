@@ -438,11 +438,12 @@ class Handler(BaseHTTPRequestHandler):
         clauses, params = [], []
         q = self._query(query, "q")
         if q:
-            clauses.append("(p.id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR a.commit_sha LIKE ?)")
-            params += ["%" + q + "%"] * 4
+            clauses.append("(p.id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR a.commit_sha LIKE ? OR d.remote_id LIKE ?)")
+            params += ["%" + q + "%"] * 5
         for key, column in (("arm", "a.arm"), ("task_type", "t.task_type"), ("project_category", "t.project_category"),
                             ("artifact_status", "c.status"), ("recording_status", "r.status"),
-                            ("pair_status", "p.status")):
+                            ("pair_status", "p.status"),
+                            ("submission_status", "COALESCE(d.status,'not_submitted')")):
             value = self._query(query, key)
             if value:
                 clauses.append(column + "=?"); params.append(value)
@@ -457,24 +458,27 @@ class Handler(BaseHTTPRequestHandler):
           r.path,r.sha256,r.width,r.height,r.duration_seconds,r.commit_sha recording_commit_sha,
           r.commit_match,r.review_status,r.reviewed_by,r.reviewed_at,r.error recording_error,r.capture_mode,r.entry_url,r.updated_at,
           latest.id latest_attempt_id,latest.status latest_attempt_status,latest.interaction_mode latest_interaction_mode,latest.error latest_attempt_error,
-          latest.entry_url latest_attempt_url,latest.created_at latest_attempt_at"""
+          latest.entry_url latest_attempt_url,latest.created_at latest_attempt_at,
+          COALESCE(d.status,'not_submitted') submission_status,d.remote_id,d.remote_status"""
         from_sql = """FROM arm_runs a JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
           LEFT JOIN artifact_checks c ON c.pair_id=a.pair_id AND c.arm=a.arm AND c.commit_sha=a.commit_sha
           LEFT JOIN recordings r ON r.pair_id=a.pair_id AND r.arm=a.arm
           LEFT JOIN recording_attempts latest ON latest.id=(SELECT id FROM recording_attempts x
             WHERE x.pair_id=a.pair_id AND x.arm=a.arm ORDER BY x.created_at DESC LIMIT 1)
-          LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id"""
+          LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id
+          LEFT JOIN delivery_submissions d ON d.pair_id=p.id"""
         return self._joined_page(select, from_sql, clauses, params, "p.updated_at DESC,p.id,a.arm", query)
 
     def _reviews_page(self, query: Dict[str, list]) -> Dict[str, Any]:
         clauses, params = [], []
         q = self._query(query, "q")
         if q:
-            clauses.append("(g.pair_id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR g.reason LIKE ? OR g.a_reason LIKE ? OR g.b_reason LIKE ? OR g.preference_reason LIKE ? OR g.confirmed_by LIKE ?)")
-            params += ["%" + q + "%"] * 8
+            clauses.append("(g.pair_id LIKE ? OR p.chain_id LIKE ? OR t.title LIKE ? OR g.reason LIKE ? OR g.a_reason LIKE ? OR g.b_reason LIKE ? OR g.preference_reason LIKE ? OR g.confirmed_by LIKE ? OR d.remote_id LIKE ?)")
+            params += ["%" + q + "%"] * 9
         for key, column in (("status", "g.status"), ("verdict", "g.verdict"), ("task_type", "t.task_type"),
                             ("project_category", "t.project_category"),
-                            ("difficulty", "t.difficulty"), ("recheck_status", "r.result_status")):
+                            ("difficulty", "t.difficulty"), ("recheck_status", "r.result_status"),
+                            ("submission_status", "COALESCE(d.status,'not_submitted')")):
             value = self._query(query, key)
             if value:
                 clauses.append(column + "=?"); params.append(value)
@@ -492,10 +496,12 @@ class Handler(BaseHTTPRequestHandler):
           r.id recheck_id,r.result_status recheck_status,r.suggested_verdict,r.suggested_reason,
           r.suggested_a_reason,r.suggested_b_reason,r.issues_json,
           r.evidence_refs_json,r.model recheck_model,r.reasoning_effort recheck_effort,r.evidence_version recheck_evidence_version,
-          r.applied_at recheck_applied_at,r.applied_by recheck_applied_by,r.created_at rechecked_at"""
+          r.applied_at recheck_applied_at,r.applied_by recheck_applied_by,r.created_at rechecked_at,
+          COALESCE(d.status,'not_submitted') submission_status,d.remote_id,d.remote_status"""
         from_sql = """FROM gsb_reviews g JOIN pairs p ON p.id=g.pair_id JOIN tasks t ON t.id=p.task_id
           LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id
           LEFT JOIN gsb_rechecks r ON r.id=(SELECT id FROM gsb_rechecks x WHERE x.pair_id=g.pair_id ORDER BY x.created_at DESC LIMIT 1)"""
+        from_sql += " LEFT JOIN delivery_submissions d ON d.pair_id=p.id"
         return self._joined_page(select, from_sql, clauses, params, "g.updated_at DESC,g.pair_id", query)
 
     def _delivery_select(self) -> Tuple[str, str]:
