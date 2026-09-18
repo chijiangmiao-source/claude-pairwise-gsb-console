@@ -305,19 +305,23 @@ async function demonstrateGenericWorkflow(page) {
 }
 
 async function demonstrateFailureEvidence(page) {
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(1800);
   const sections = page.locator("section");
   for (let index = 0; index < await sections.count(); index += 1) {
     const section = sections.nth(index);
     await section.scrollIntoViewIfNeeded();
+    const output = section.locator("pre");
+    if (await output.count()) {
+      await output.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    }
     const box = await section.boundingBox();
     if (box) {
       await page.mouse.move(Math.min(1180, box.x + 80), Math.min(650, box.y + 45), { steps: 24 });
     }
-    await page.waitForTimeout(2200);
+    await page.waitForTimeout(1400);
   }
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: "smooth" }));
-  await page.waitForTimeout(3500);
+  await page.waitForTimeout(1800);
   return { required: true, ok: true, interactionMode: "failure", evidence: "docker-validation-output" };
 }
 

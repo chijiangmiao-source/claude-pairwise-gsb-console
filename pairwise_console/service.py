@@ -1903,7 +1903,9 @@ class PairwiseService:
         if pair["stage"] != "recording":
             return
         checks = self._current_artifact_checks(pair_id)
-        if len(checks) != 2 or any(row.get("status") != "passed" for row in checks):
+        if len(checks) != 2 or any(
+            row.get("status") not in ("passed", "observed_failed") for row in checks
+        ):
             return
         rows = self.db.all(
             """SELECT r.status FROM recordings r
@@ -2296,13 +2298,12 @@ class PairwiseService:
         by_arm = {arm["arm"]: arm for arm in arms}
         check_by_arm = {item["arm"]: item for item in checks}
         rec_by_arm = {item["arm"]: item for item in recordings}
-        if not has_observed_failure:
-            missing_recordings = [
-                arm for arm in ("A", "B")
-                if (rec_by_arm.get(arm) or {}).get("status") != "passed"
-            ]
-            if missing_recordings:
-                raise ValueError("可启动产物必须先完成合格录像；缺少：" + "、".join(missing_recordings))
+        missing_recordings = [
+            arm for arm in ("A", "B")
+            if (rec_by_arm.get(arm) or {}).get("status") != "passed"
+        ]
+        if missing_recordings:
+            raise ValueError("A/B 必须先完成对应录像；缺少：" + "、".join(missing_recordings))
         evidence = {}
         for arm in ("A", "B"):
             evidence[arm] = {
@@ -2392,46 +2393,33 @@ class PairwiseService:
             (verdict, clean, clean_a, clean_b, "", verdict, clean, evidence_version,
              confirmed_by.strip() or "人工确认", stamp, stamp, pair_id),
         )
-        if has_observed_failure:
-            failure_arms = [row.get("arm") for row in checks if row.get("status") == "observed_failed"]
-            self.db.execute(
-                """UPDATE pairs SET status='failed',stage='artifact_failed_evaluated',winner=?,
-                   error=?,completed_at=?,updated_at=? WHERE id=?""",
-                (verdict, "Claude 原始交付无法通过 Docker 启动，已保留产物并完成 GSB：" + "、".join(failure_arms),
-                 stamp, stamp, pair_id),
-            )
-        else:
-            self.db.execute(
-                """UPDATE pairs SET status='completed',stage='completed',winner=?,error='',
-                   completed_at=?,updated_at=? WHERE id=?""",
-                (verdict, stamp, stamp, pair_id),
-            )
+        failure_arms = [row.get("arm") for row in checks if row.get("status") == "observed_failed"]
+        completion_note = (
+            "原始交付的 Docker/测试验收失败，已保存短录像并按轨迹完成 GSB：" + "、".join(failure_arms)
+            if failure_arms else ""
+        )
+        self.db.execute(
+            """UPDATE pairs SET status='completed',stage='completed',winner=?,error=?,
+               completed_at=?,updated_at=? WHERE id=?""",
+            (verdict, completion_note, stamp, stamp, pair_id),
+        )
         pair = self._pair(pair_id)
         task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         if not has_observed_failure and task.get("task_type") in ("feature", "bugfix"):
             self.db.execute("UPDATE project_chains SET followup_completed=1,status='completed',completed_at=?,updated_at=? WHERE id=?", (stamp, stamp, pair["chain_id"]))
         submission_id = "delivery-" + uuid.uuid4().hex[:16]
-        if has_observed_failure:
-            self.db.execute(
-                """INSERT INTO delivery_submissions(id,pair_id,status,error,created_at,updated_at)
-                   VALUES(?,?,'discarded','Docker 产物无法启动；保留 GSB 但不进入正式提交',?,?)
-                   ON CONFLICT(pair_id) DO UPDATE SET status='discarded',
-                     error='Docker 产物无法启动；保留 GSB 但不进入正式提交',updated_at=excluded.updated_at""",
-                (submission_id, pair_id, stamp, stamp),
-            )
-        else:
-            self.db.execute(
-                """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
-                   VALUES(?,?,'ready_to_submit',?,?)
-                   ON CONFLICT(pair_id) DO UPDATE SET
-                     status=CASE
-                       WHEN delivery_submissions.remote_id='' THEN 'ready_to_submit'
-                       WHEN delivery_submissions.remote_status='PENDING_FIX' THEN 'needs_fix'
-                       ELSE delivery_submissions.status
-                     END,
-                     error='',updated_at=excluded.updated_at""",
-                (submission_id, pair_id, stamp, stamp),
-            )
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
+               VALUES(?,?,'ready_to_submit',?,?)
+               ON CONFLICT(pair_id) DO UPDATE SET
+                 status=CASE
+                   WHEN delivery_submissions.remote_id='' THEN 'ready_to_submit'
+                   WHEN delivery_submissions.remote_status='PENDING_FIX' THEN 'needs_fix'
+                   ELSE delivery_submissions.status
+                 END,
+                 error='',updated_at=excluded.updated_at""",
+            (submission_id, pair_id, stamp, stamp),
+        )
         self.db.audit("gsb.confirmed", "pair", pair_id, {"verdict": verdict, "confirmed_by": confirmed_by})
         return self.pair_detail(pair_id)
 
@@ -2649,7 +2637,8 @@ class PairwiseService:
             if not item.get("prompt_id"): blockers.append(arm + " 缺少 PromptID")
             if not item.get("commit_sha"): blockers.append(arm + " 缺少最终提交")
             check_status = (checks.get(arm) or {}).get("status")
-            if check_status != "passed": blockers.append(arm + " Docker 产物验收未通过")
+            if check_status not in ("passed", "observed_failed"):
+                blockers.append(arm + " Docker 产物验收尚未形成最终结论")
             rec = recs.get(arm) or {}
             if rec.get("status") != "passed": blockers.append(arm + " 录像未通过")
             if not int(rec.get("commit_match") or 0): blockers.append(arm + " 录像与最终提交不匹配")
@@ -3705,12 +3694,12 @@ class PairwiseService:
         )
         if all_completed and passed_count + len(observed_failed) == 2 and observed_failed:
             self.db.execute(
-                "UPDATE pairs SET status='running',stage='gsb_ready',error=?,updated_at=? WHERE id=?",
-                ("Claude 原始交付 Docker 验收失败，保留当前提交并直接生成 GSB：" + "、".join(observed_failed),
+                "UPDATE pairs SET status='running',stage='recording',error=?,updated_at=? WHERE id=?",
+                ("Claude 原始交付 Docker/测试验收失败，将录制简短失败命令画面后生成 GSB：" + "、".join(observed_failed),
                  now_iso(), pair_id),
             )
             self.db.audit("artifact.pair_failure_ready_for_gsb", "pair", pair_id, {
-                "failed_arms": observed_failed, "recording_required": False,
+                "failed_arms": observed_failed, "recording_required": True,
                 "difficulty_review_required": False,
             })
             return {"pairId": pair_id, "checks": results, "preserved": observed_failed}

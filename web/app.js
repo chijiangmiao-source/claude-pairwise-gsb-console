@@ -32,7 +32,7 @@ const statusLabels = {
   artifact_validation: "Docker 验收", difficulty_review: "实际难度复评",
   difficulty_rejected: "难度复评未通过", starting: "正在启动项目", recording: "正在录制",
   gsb_ready: "等待 GSB", gsb_confirmation: "GSB 确认",
-  artifact_failed: "Docker 验收失败", artifact_failed_evaluated: "启动失败，已完成 GSB",
+  artifact_failed: "Docker 验收失败", observed_failed: "验收失败（已留证）", artifact_failed_evaluated: "启动失败，已完成 GSB",
   baseline_preflight_failed: "基线预检失败", development_failed: "开发失败",
   recording_failed: "录像失败", task_replacement: "正在自动换题",
   replaced: "已自动换题", replacement_failed: "自动换题失败", completed: "已完成",
@@ -209,7 +209,7 @@ const pages = {
 async function renderEvidence() {
   const filters = state.filters.evidence, data = await api(`/api/evidence?${queryString("evidence")}`);
   $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>Docker 产物验收与真实操作录像</h2><p class="sub">每行对应一个 Pair 的一个 Arm，可直接播放最终提交的真实演示</p></div></div>
-    ${filterBar("evidence", [["q", "search", "Pair 唯一 ID、项目编号、题目、提交或平台编号", filters.q], ["arm", "select", "全部 Arm", filters.arm, ["A", "B"]], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["pair_status", "select", "全部最终数据状态", filters.pair_status, [["completed", "已生成最终数据"], ["running", "流程处理中"], ["review", "等待确认"], ["failed", "流程失败"], ["cancelled", "已取消"]]], ["submission_status", "select", "全部提交状态", filters.submission_status, submissionStatusOptions], ["artifact_status", "select", "全部验收状态", filters.artifact_status, [["queued", "排队中"], ["running", "验收中"], ["passed", "验收通过"], ["failed", "验收失败"]]], ["recording_status", "select", "全部录像状态", filters.recording_status, [["queued", "排队中"], ["recording", "录制中"], ["passed", "录像通过"], ["failed", "录像失败"]]], ["manual_rerecorded", "select", "全部人工重录状态", filters.manual_rerecorded, [["yes", "有人工重新录像"], ["no", "没有人工重新录像"]]], ["missing", "select", "全部资料", filters.missing, [["1", "只看缺失或失败"]]]])}
+    ${filterBar("evidence", [["q", "search", "Pair 唯一 ID、项目编号、题目、提交或平台编号", filters.q], ["arm", "select", "全部 Arm", filters.arm, ["A", "B"]], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["pair_status", "select", "全部最终数据状态", filters.pair_status, [["completed", "已生成最终数据"], ["running", "流程处理中"], ["review", "等待确认"], ["failed", "流程失败"], ["cancelled", "已取消"]]], ["submission_status", "select", "全部提交状态", filters.submission_status, submissionStatusOptions], ["artifact_status", "select", "全部验收状态", filters.artifact_status, [["queued", "排队中"], ["running", "验收中"], ["passed", "验收通过"], ["observed_failed", "验收失败（已留证）"], ["failed", "验收失败（处理中）"]]], ["recording_status", "select", "全部录像状态", filters.recording_status, [["queued", "排队中"], ["recording", "录制中"], ["passed", "录像通过"], ["failed", "录像失败"]]], ["manual_rerecorded", "select", "全部人工重录状态", filters.manual_rerecorded, [["yes", "有人工重新录像"], ["no", "没有人工重新录像"]]], ["missing", "select", "全部资料", filters.missing, [["1", "只看缺失或失败"]]]])}
     ${table(data.items, [["项目 / Arm / Pair 唯一 ID", (row) => `<div class="title-cell"><strong>${esc(row.title)} · ${row.arm}</strong><small>项目编号：${esc(row.project_number)}</small>${pairIdentity(row.pair_id)}</div>`], ["类型 / 难度", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} ${difficultyDisplay(row)}</div>`], ["最终提交", (row) => `<span class="code">${esc((row.commit_sha || "").slice(0, 12))}</span>`], ["Docker 验收", (row) => badge(row.artifact_status || "missing")], ["真实操作录像", (row) => `${badge(["starting", "recording", "stopping"].includes(row.latest_attempt_status) ? row.latest_attempt_status : row.recording_status || "missing")}<small class="block">${[recordingFormat(row), row.latest_interaction_mode === "manual" ? "人工操作" : row.latest_attempt_id ? "自动操作" : "", row.manual_rerecorded ? "曾人工重新录像" : "未人工重新录像", row.capture_mode === "browser" ? "浏览器视口" : row.recording_id ? "历史屏幕录像" : ""].filter(Boolean).join(" · ")} ${row.width || 0}×${row.height || 0} · ${row.duration_seconds || 0}s</small><small class="block">${row.review_status === "confirmed" ? `默认审核通过 · ${esc(row.reviewed_by || "刘昱")}` : "待审核"}</small>`], ["最终数据", finalDataState], ["提交状态", submissionState], ["提交匹配", (row) => row.commit_match ? '<span class="ok">● 匹配</span>' : '<span class="bad">● 未匹配</span>'], ["操作", evidenceActions]])}${pager("evidence", data)}</div>`;
 }
 
@@ -240,7 +240,7 @@ function evidenceActions(row) {
     record = '<button class="tiny" disabled>正在启动项目…</button>';
   } else if (["difficulty_review", "difficulty_rejected"].includes(row.pair_stage)) {
     record = '<button class="tiny" disabled>等待实际难度复评</button>';
-  } else if (!["passed", "failed"].includes(row.artifact_status) || !row.commit_sha) {
+  } else if (!["passed", "observed_failed", "failed"].includes(row.artifact_status) || !row.commit_sha) {
     record = '<button class="tiny" disabled>等待 Docker 验收</button>';
   } else {
     record = row.recording_id

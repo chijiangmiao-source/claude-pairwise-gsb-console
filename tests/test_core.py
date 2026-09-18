@@ -1021,7 +1021,7 @@ class CoreTests(unittest.TestCase):
         completed = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(completed, {"status": "completed", "stage": "completed"})
 
-    def test_gsb_records_unstartable_delivery_without_recording_or_repair(self):
+    def test_gsb_records_unstartable_delivery_with_failure_recording(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -1045,6 +1045,12 @@ class CoreTests(unittest.TestCase):
                  '[{"name":"clean_start","passed":false,"detail":"dependency path missing"}]' if error else "[]",
                  error, stamp, stamp),
             )
+            self.db.execute(
+                """INSERT INTO recordings(id,pair_id,arm,path,commit_sha,commit_match,review_status,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,1,'confirmed','passed',?,?)""",
+                ("rec-failed-gsb-" + arm, pair["id"], arm, str(self.root / (arm + "-failure.mp4")),
+                 sha, stamp, stamp),
+            )
         payload = {
             "verdict": "B better",
             "aReason": "A 在 compose.yaml 的启动流程因依赖路径缺失而失败，清洁 Docker 无法启动，原始交付不可用。",
@@ -1056,9 +1062,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(review["status"], "confirmed")
         self.assertIn("observed_failed", run.call_args.args[1])
         final = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
-        self.assertEqual(final, {"status": "failed", "stage": "artifact_failed_evaluated"})
+        self.assertEqual(final, {"status": "completed", "stage": "completed"})
         delivery = self.db.one("SELECT status FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
-        self.assertEqual(delivery["status"], "discarded")
+        self.assertEqual(delivery["status"], "ready_to_submit")
 
     def test_gsb_recheck_persists_split_review_suggestions(self):
         self.insert_ready_task()
@@ -1548,8 +1554,31 @@ class CoreTests(unittest.TestCase):
              '[{"name":"compose_file","passed":false,"detail":"未找到 Compose 文件"}]',
              "缺少 Docker Compose", stamp, stamp),
         )
-        with self.assertRaisesRegex(ValueError, "Docker 产物验收未通过"):
+        with self.assertRaisesRegex(ValueError, "Docker 产物验收尚未形成最终结论"):
             self.service.start_recording(pair["id"], "A")
+
+    def test_observed_artifact_failure_starts_short_evidence_recording(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+            ("arm-observed-recording", pair["id"], "A", "A", str(self.root), "container", "screen",
+             "auto_model/urm", "image", "a" * 40, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,error,created_at,updated_at)
+               VALUES(?,?,?,?, 'observed_failed',?,?,?,?)""",
+            ("check-observed", pair["id"], "A", "a" * 40,
+             '[{"name":"verify_service","passed":false,"command":"docker compose run --rm verify","detail":"ModuleNotFoundError: app"}]',
+             "Docker 验收未全部通过", stamp, stamp),
+        )
+        with patch("pairwise_console.recording.threading.Thread.start"):
+            attempt = self.service.start_recording(pair["id"], "A")
+        self.assertEqual(attempt["status"], "starting")
+        self.assertEqual(attempt["interaction_mode"], "auto")
 
     def test_failed_artifact_is_preserved_for_gsb_without_claude_repair(self):
         self.insert_ready_task()
@@ -1589,7 +1618,7 @@ class CoreTests(unittest.TestCase):
             "observed_failed",
         )
         current = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
-        self.assertEqual(current["stage"], "gsb_ready")
+        self.assertEqual(current["stage"], "recording")
 
     def test_pending_artifact_retry_recovers_from_delivered_commit(self):
         self.insert_ready_task()

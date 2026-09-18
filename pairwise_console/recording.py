@@ -103,11 +103,11 @@ class RecordingManager:
         )
         if not check:
             raise ValueError("最终提交尚未执行 Docker 产物验收")
-        if check.get("status") != "passed":
-            raise ValueError("Docker 产物验收未通过，不能录制或生成 GSB；请先从该侧已交付提交返工")
+        if check.get("status") not in ("passed", "observed_failed"):
+            raise ValueError("Docker 产物验收尚未形成最终结论，不能录制")
         compose_value = str(check.get("compose_file") or "")
         compose = Path(compose_value) if compose_value else None
-        if not compose or not compose.is_file():
+        if check.get("status") == "passed" and (not compose or not compose.is_file()):
             raise ValueError("Docker Compose 文件不存在")
         attempt_id = "rec-attempt-" + uuid.uuid4().hex[:16]
         folder = self.root / pair_id
@@ -217,25 +217,45 @@ class RecordingManager:
             checks = json.loads(check.get("checks_json") or "[]")
         except ValueError:
             checks = []
+        failed_checks = [item for item in checks if not item.get("passed")]
+        shown_checks = failed_checks or checks[-1:]
+        fallback_commands = {
+            "compose_file": "docker compose config",
+            "dockerfile": "docker compose build",
+            "compose_config": "docker compose --profile '*' config",
+            "clean_start": "docker compose up -d --build",
+            "containers_running": "docker compose ps",
+            "verify_service": "docker compose run --rm verify",
+            "cleanup": "docker compose down -v --remove-orphans",
+        }
         blocks = []
-        for item in checks:
-            state = "通过" if item.get("passed") else "失败"
+        for item in shown_checks:
+            name = str(item.get("name") or "Docker 检查")
+            command = str(item.get("command") or fallback_commands.get(name) or "docker compose run --rm verify")
+            exit_code = item.get("exit_code")
+            outcome = (
+                "命令执行失败 · exit code %s" % exit_code
+                if exit_code is not None else "验收判定失败 · 未执行到可运行命令"
+            )
+            detail = str(item.get("detail") or check.get("error") or "无输出")[-800:]
             blocks.append(
-                "<section><h2>%s · %s</h2><pre>%s</pre></section>" % (
-                    html_escape(str(item.get("name") or "Docker 检查")), state,
-                    html_escape(str(item.get("detail") or "无输出")),
+                "<section class=\"terminal\"><div class=\"terminal-bar\"><i></i><i></i><i></i>验收终端</div>"
+                "<pre><span class=\"prompt\">$ %s</span>\n%s\n\n<span class=\"exit\">%s</span></pre></section>" % (
+                    html_escape(command), html_escape(detail), html_escape(outcome),
                 )
             )
         error = html_escape(str(check.get("error") or "Docker 产物验收未通过"))
         page = path.with_suffix(".failure.html")
         page.write_text("""<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">
-<title>Docker 失败过程</title><style>
-body{margin:0;background:#101915;color:#e8f0ea;font:18px/1.65 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif}
-main{width:1120px;margin:0 auto;padding:44px 0 100px}header{border:1px solid #8c4a43;background:#2b1818;padding:28px;border-radius:16px}
-h1{margin:0 0 10px;font-size:34px}header p{margin:5px 0;color:#f1b7ae}section{margin-top:24px;border:1px solid #365448;background:#17241f;padding:24px;border-radius:14px}
-h2{font-size:21px;margin:0 0 12px}pre{white-space:pre-wrap;word-break:break-word;background:#0a100d;padding:18px;border-radius:10px;color:#d6e5db;font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
-</style><main><header><h1>Docker 清洁验收失败</h1><p>提交：%s</p><p>工作区：%s</p><p>真实错误：%s</p></header>%s</main></html>""" % (
-            html_escape(str(check.get("commit_sha") or "未知")), html_escape(str(workspace)), error,
+<title>Docker 验收命令失败</title><style>
+body{margin:0;background:#111814;color:#eef4ef;font:17px/1.55 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif}
+main{width:1120px;margin:0 auto;padding:38px 0 80px}header{display:flex;justify-content:space-between;gap:32px;align-items:end;margin-bottom:22px}
+h1{margin:0 0 7px;font-size:32px}header p{margin:3px 0;color:#a9b9af}.result{color:#ffb4a9;font-weight:700}
+.terminal{overflow:hidden;border:1px solid #3c4b43;background:#08100c;border-radius:14px;box-shadow:0 18px 48px rgba(0,0,0,.28)}
+.terminal-bar{height:42px;display:flex;align-items:center;gap:8px;padding:0 16px;background:#243029;color:#9fb0a6;font-size:14px}.terminal-bar i{width:12px;height:12px;border-radius:50%;background:#e16b62}.terminal-bar i:nth-child(2){background:#e7b75d}.terminal-bar i:nth-child(3){background:#63bd79}.terminal-bar i:nth-child(3){margin-right:9px}
+pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-break:break-word;color:#d6e5db;font:15px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace}.prompt{color:#78d69a;font-weight:700}.exit{color:#ff8f84;font-weight:700}
+</style><main><header><div><h1>Docker 清洁验收</h1><p>提交 %s</p></div><div class=\"result\">验收失败 · 保留原始交付</div></header>%s</main></html>""" % (
+            html_escape(str(check.get("commit_sha") or "未知")[:12]),
             "".join(blocks) or "<section><h2>未生成检查步骤</h2><pre>%s</pre></section>" % error,
         ), encoding="utf-8")
         entry_url = page.resolve().as_uri()
@@ -244,8 +264,9 @@ h2{font-size:21px;margin:0 0 12px}pre{white-space:pre-wrap;word-break:break-word
         command = [str(self.config.web_dir.parent / "node_modules" / ".bin" / "node")]
         if not Path(command[0]).exists():
             command = ["node"]
+        duration = 12 + int(hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:2], 16) % 5
         command += [str(self.config.web_dir.parent / "scripts" / "browser_recorder.mjs"), entry_url,
-                    str(path), str(profile), "38", str(path) + ".stop", "failure"]
+                    str(path), str(profile), str(duration), str(path) + ".stop", "failure"]
         try:
             process = subprocess.Popen(command, cwd=str(self.config.web_dir.parent), stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True, start_new_session=True)

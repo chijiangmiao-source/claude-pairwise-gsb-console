@@ -92,19 +92,32 @@ class ArtifactChecker:
                 ["docker", "compose", "-f", str(compose), "--profile", "*", "config"],
                 cwd=workspace, check=False, timeout=60, env=compose_env,
             )
-            self._record(checks, "compose_config", config.returncode == 0, redact(config.stderr or config.stdout))
+            self._record(
+                checks, "compose_config", config.returncode == 0,
+                redact(config.stderr or config.stdout),
+                "docker compose -f %s --profile '*' config" % compose.name,
+                config.returncode,
+            )
             if config.returncode != 0:
                 raise RuntimeError("Compose 配置无效")
             base = ["docker", "compose", "-p", project, "-f", str(compose)]
             run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=compose_env)
             up = run_command(base + ["up", "-d", "--build"], cwd=workspace, check=False, timeout=1200, env=compose_env)
-            self._record(checks, "clean_start", up.returncode == 0, redact(up.stderr or up.stdout))
+            self._record(
+                checks, "clean_start", up.returncode == 0, redact(up.stderr or up.stdout),
+                "docker compose -p %s -f %s up -d --build" % (project, compose.name),
+                up.returncode,
+            )
             if up.returncode != 0:
                 raise RuntimeError("Docker Compose 清洁启动失败")
             time.sleep(3)
             ps = run_command(base + ["ps", "--format", "json"], cwd=workspace, check=False, timeout=60, env=compose_env)
             running = ps.returncode == 0 and ("running" in ps.stdout.casefold() or "healthy" in ps.stdout.casefold())
-            self._record(checks, "containers_running", running, redact(ps.stdout or ps.stderr))
+            self._record(
+                checks, "containers_running", running, redact(ps.stdout or ps.stderr),
+                "docker compose -p %s -f %s ps --format json" % (project, compose.name),
+                ps.returncode,
+            )
             services = run_command(
                 base + ["--profile", "*", "config", "--services"],
                 cwd=workspace, check=False, timeout=60, env=compose_env,
@@ -117,9 +130,18 @@ class ArtifactChecker:
                     base + ["run", "--rm", "verify"],
                     cwd=workspace, check=False, timeout=1200, env=compose_env,
                 )
-                self._record(checks, "verify_service", verify.returncode == 0, redact(verify.stdout + "\n" + verify.stderr))
+                self._record(
+                    checks, "verify_service", verify.returncode == 0,
+                    redact(verify.stdout + "\n" + verify.stderr),
+                    "docker compose -p %s -f %s run --rm verify" % (project, compose.name),
+                    verify.returncode,
+                )
             down = run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=compose_env)
-            self._record(checks, "cleanup", down.returncode == 0, redact(down.stderr or down.stdout))
+            self._record(
+                checks, "cleanup", down.returncode == 0, redact(down.stderr or down.stdout),
+                "docker compose -p %s -f %s down -v --remove-orphans" % (project, compose.name),
+                down.returncode,
+            )
             status = "passed" if all(item["passed"] for item in checks) else "failed"
             return {"status": status, "compose_file": str(compose), "checks": checks,
                     "error": "" if status == "passed" else "Docker 基线验收未全部通过"}
@@ -147,8 +169,14 @@ class ArtifactChecker:
             return int(probe.getsockname()[1])
 
     @staticmethod
-    def _record(checks: List[Dict[str, Any]], name: str, passed: bool, detail: str) -> None:
-        checks.append({"name": name, "passed": bool(passed), "detail": detail[-1200:]})
+    def _record(checks: List[Dict[str, Any]], name: str, passed: bool, detail: str,
+                command: str = "", exit_code: Any = None) -> None:
+        item = {"name": name, "passed": bool(passed), "detail": detail[-1200:]}
+        if command:
+            item["command"] = command
+        if exit_code is not None:
+            item["exit_code"] = int(exit_code)
+        checks.append(item)
 
 
 def validate_recording(path: Path) -> Dict[str, Any]:
