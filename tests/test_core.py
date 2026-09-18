@@ -71,6 +71,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("task_mix_feature"), 7)
         self.assertEqual(self.db.setting("task_mix_bugfix"), 10)
 
+    def test_service_restart_closes_stale_generation_batches(self):
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO generation_batches(id,status,requested_count,created_at,updated_at)
+               VALUES('batch-stale','running',1,?,?)""",
+            (stamp, stamp),
+        )
+        self.service._recover_interrupted_background_jobs()
+        batch = self.db.one(
+            "SELECT status,error,finished_at FROM generation_batches WHERE id='batch-stale'",
+        )
+        self.assertEqual(batch["status"], "failed")
+        self.assertIn("结束陈旧状态", batch["error"])
+        self.assertTrue(batch["finished_at"])
+
     def test_task_prompts_prejudge_minimum_necessary_complexity(self):
         validation = task_validation_prompt("task", "known", "baseline", "rejected examples")
         generated = task_generation_prompt("known", "zero_to_one")

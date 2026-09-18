@@ -100,10 +100,21 @@ class PairwiseService:
         self._quarantine_invalid_completed_pairs()
         self._queue_invalid_delivery_lineage_pairs()
         self._restore_false_completed_tasks()
+        self._recover_interrupted_background_jobs()
+
+    def _recover_interrupted_background_jobs(self) -> None:
+        """Close process-local jobs that cannot survive a service restart."""
+        stamp = now_iso()
         self.db.execute(
             """UPDATE codex_jobs SET status='failed',error='服务重启时作业仍处于运行态，已安全释放以便重新排队',
                finished_at=?,updated_at=? WHERE status='running'""",
-            (now_iso(), now_iso()),
+            (stamp, stamp),
+        )
+        self.db.execute(
+            """UPDATE generation_batches SET status='failed',
+               error='服务重启时出题批次仍处于运行态，已结束陈旧状态并允许重新补题',
+               finished_at=?,updated_at=? WHERE status='running'""",
+            (stamp, stamp),
         )
 
     def _seed_settings(self) -> None:
