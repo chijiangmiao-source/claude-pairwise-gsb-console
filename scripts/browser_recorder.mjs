@@ -175,9 +175,62 @@ async function demonstrateDirectApiWorkflow(page, selected) {
   return result;
 }
 
+async function demonstrateColdRoomAlarmWorkflow(page) {
+  const eventId = `recording-${Date.now()}`;
+  await page.evaluate((id) => {
+    document.getElementById("pairwise-device-demo")?.remove();
+    const panel = document.createElement("section");
+    panel.id = "pairwise-device-demo";
+    Object.assign(panel.style, {
+      position: "fixed", right: "28px", bottom: "28px", zIndex: "2147483000",
+      width: "300px", padding: "18px", border: "2px solid #ef4444", borderRadius: "14px",
+      background: "#fff7ed", color: "#431407", boxShadow: "0 18px 50px rgba(0,0,0,.25)",
+      font: "16px/1.45 system-ui",
+    });
+    panel.innerHTML = `<strong>设备网关真实回调</strong>
+      <p style="margin:8px 0">点击后上报一次冷库门强制开启告警。</p>
+      <button type="button" style="font-size:16px;padding:10px 16px;cursor:pointer">模拟设备告警</button>
+      <div data-result style="margin-top:8px">等待点击</div>`;
+    const result = panel.querySelector("[data-result]");
+    panel.querySelector("button").addEventListener("click", async () => {
+      result.textContent = "正在上报…";
+      try {
+        const response = await fetch("/api/events", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            event_id: id, door_id: "recording-door", kind: "FORCED_OPEN",
+            occurred_at: new Date().toISOString(),
+          }),
+        });
+        panel.dataset.status = String(response.status);
+        result.textContent = response.ok ? `上报成功 · HTTP ${response.status}` : `上报失败 · HTTP ${response.status}`;
+      } catch (error) {
+        panel.dataset.status = "0";
+        result.textContent = String(error);
+      }
+    });
+    document.body.appendChild(panel);
+  }, eventId);
+  const panel = page.locator("#pairwise-device-demo");
+  await moveAndClick(page, panel.locator("button"));
+  await page.waitForFunction(() => Boolean(document.querySelector("#pairwise-device-demo")?.dataset.status));
+  const status = Number(await panel.getAttribute("data-status") || 0);
+  if (status >= 200 && status < 300) {
+    await page.getByText(eventId, { exact: false }).first().waitFor({ state: "visible", timeout: 15000 });
+  }
+  await page.waitForTimeout(7000);
+  const result = { required: true, ok: status >= 200 && status < 300, status,
+    method: "post", path: "/api/events", workflow: "device-gateway-callback" };
+  process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
+  return result;
+}
+
 async function demonstrateGenericWorkflow(page) {
   await page.waitForTimeout(3000);
   const before = await page.locator("body").innerText();
+  if (/冷库门告警中控/.test(before)) {
+    return demonstrateColdRoomAlarmWorkflow(page);
+  }
   const clicked = [];
   const clickMatching = async (pattern) => {
     const buttons = page.locator("button:visible:not([disabled]), [role=button]:visible:not([aria-disabled=true])");
