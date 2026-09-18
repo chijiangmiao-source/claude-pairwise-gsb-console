@@ -1829,6 +1829,7 @@ class CoreTests(unittest.TestCase):
         with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
             state = self.service.claude.trace_state(arm, prompt)
         self.assertTrue(state["complete"])
+        self.assertTrue(state["prompt_matches"])
         self.assertEqual(state["result"], "Finished after internal retry")
         self.assertIn("504", state["api_error"])
         self.assertFalse(hasattr(self.service.claude, "send_continue"))
@@ -1857,6 +1858,81 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(state["complete"])
         self.assertEqual(state["completion_mode"], "native_turn_end")
         self.assertIn("Implemented", state["result"])
+
+    def test_completed_mismatched_prompt_is_visible_to_monitor_for_targeted_rerun(self):
+        prompt = "Build the requested project\n\nKeep every boundary condition."
+        observed = "Keep every boundary condition."
+        arm = {"id": "arm-mismatched-prompt", "container_name": "container-mismatched-prompt"}
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": observed}},
+            {"type": "assistant", "message": {
+                "stop_reason": "end_turn", "content": [{"type": "text", "text": "Finished"}],
+            }},
+            {"type": "system", "subtype": "turn_duration"},
+        ]
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            state = self.service.claude.trace_state(arm, prompt)
+        self.assertTrue(state["complete"])
+        self.assertFalse(state["prompt_matches"])
+        self.assertEqual(state["observed_prompt"], observed)
+
+    def test_prompt_is_sent_as_one_bracketed_paste(self):
+        arm = {"id": "arm-paste", "screen_name": "screen-paste"}
+        (self.service.claude.runtime_dir / arm["id"]).mkdir(parents=True)
+        result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch.object(self.service.claude, "_screen_running", return_value=True), \
+             patch("pairwise_console.claude_runner.run_command", return_value=result) as command, \
+             patch("pairwise_console.claude_runner.time.sleep"):
+            self.service.claude.send_prompt(arm, "第一段\n\n第二段")
+        calls = [call.args[0] for call in command.call_args_list]
+        self.assertIn("\x1b[200~", calls[0])
+        self.assertEqual(calls[1][-2:], ["readbuf", str(self.service.claude.runtime_dir / "arm-paste" / "prompt.txt")])
+        self.assertEqual(calls[2][-2:], ["paste", "."])
+        self.assertIn("\x1b[201~", calls[3])
+        self.assertEqual(calls[4][-1], "\r")
+
+    def test_monitor_routes_completed_prompt_mismatch_to_non_counting_trace_repair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?,?)""",
+            ("arm-live-mismatch", pair["id"], "A", "A", str(self.root / "A"),
+             "container-live-mismatch", "screen-live-mismatch", "auto_model/urm", "image",
+             stamp, stamp, stamp),
+        )
+        state = {
+            "complete": True, "result": "Finished", "api_error": "",
+            "prompt_matches": False, "observed_prompt": "truncated prompt",
+            "session_id": "session-mismatch", "prompt_id": "prompt-mismatch",
+        }
+        repaired = {"pairId": pair["id"], "restarted": ["A"]}
+        with patch.object(self.service.claude, "trace_state", return_value=state), \
+             patch.object(self.service, "_restart_trace_invalid_arms", return_value=repaired) as restart, \
+             patch.object(self.service.claude, "export_and_stop") as export:
+            result = self.service._monitor_arm(
+                pair["id"], "arm-live-mismatch", "Build a hard project with Docker Compose",
+            )
+        self.assertEqual(result, repaired)
+        restart.assert_called_once()
+        export.assert_not_called()
+        event = self.db.one(
+            "SELECT event_type FROM audit_events WHERE entity_id='arm-live-mismatch' ORDER BY id DESC LIMIT 1"
+        )
+        self.assertEqual(event["event_type"], "claude.live_prompt_mismatch")
 
     def test_terminal_api_error_after_visible_progress_keeps_the_session_deliverable(self):
         prompt = "Build the requested project"

@@ -2710,6 +2710,15 @@ class PairwiseService:
                 continue
             if state.get("complete"):
                 result = str(state.get("result") or "")
+                if state.get("prompt_matches") is False:
+                    issue = "%s 轨迹中没有与题面逐字一致的首轮 User Prompt" % arm.get("arm", "Arm")
+                    self.db.audit("claude.live_prompt_mismatch", "arm_run", arm_id, {
+                        "expected_length": len(prompt),
+                        "observed_length": len(str(state.get("observed_prompt") or "")),
+                        "action": "fresh_session_with_exact_database_prompt",
+                        "counts_toward_development_attempts": False,
+                    })
+                    return self._restart_trace_invalid_arms(pair_id, [arm], prompt, [issue])
                 if state.get("api_error"):
                     self.db.audit("claude.api_error_recovered", "arm_run", arm_id, {
                         "error": redact(str(state.get("api_error")))[-1000:],
@@ -2778,7 +2787,11 @@ class PairwiseService:
             """SELECT COUNT(*) count FROM arm_runs
                WHERE status IN ('queued','running','developing','waiting_retry','checkpointing')"""
         ) or {"count": 0})["count"])
-        if active_arms + len(arms) > MAX_PAIR_PROJECTS * 2:
+        replacing_active = sum(
+            1 for arm in arms
+            if str(arm.get("status") or "") in ("queued", "running", "developing", "waiting_retry", "checkpointing")
+        )
+        if active_arms - replacing_active + len(arms) > MAX_PAIR_PROJECTS * 2:
             raise RuntimeError("当前 6 个开发终端均在运行，轨迹返工需等待一个终端空位")
         stamp = now_iso()
         reason = "；".join(dict.fromkeys(str(issue) for issue in issues))[-2500:]

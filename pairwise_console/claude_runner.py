@@ -288,8 +288,13 @@ exit "$code"
             raise RuntimeError("Claude 开发终端已经关闭")
         prompt_path = self.runtime_dir / arm_run["id"] / "prompt.txt"
         prompt_path.write_text(prompt, encoding="utf-8")
+        # Claude's TUI must receive the task as one bracketed paste. Without
+        # these markers, embedded blank lines can be normalized and long
+        # multi-byte prompts can arrive as only their trailing fragment.
+        run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "stuff", "\x1b[200~"])
         run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "readbuf", str(prompt_path)])
         run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "paste", "."])
+        run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "stuff", "\x1b[201~"])
         time.sleep(0.4)
         run_command(["screen", "-S", arm_run["screen_name"], "-p", "0", "-X", "stuff", "\r"])
         self.db.execute("UPDATE arm_runs SET status='developing',prompt_sent_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_run["id"]))
@@ -453,6 +458,8 @@ exit "$code"
             except OSError:
                 continue
             start_index = None
+            fallback_start_index = None
+            observed_prompt = ""
             prompt_id = ""
             for index, event in enumerate(events):
                 if event.get("type") != "user":
@@ -460,8 +467,16 @@ exit "$code"
                 if event.get("isMeta") is True or event.get("turnCompanion") is True:
                     continue
                 content = (event.get("message") or {}).get("content") if isinstance(event.get("message"), dict) else None
+                if fallback_start_index is None and isinstance(content, str) and content.strip():
+                    fallback_start_index = index
+                    observed_prompt = content.rstrip("\r\n")
                 if start_index is None and isinstance(content, str) and content.rstrip("\r\n") == prompt.rstrip("\r\n"):
                     start_index, prompt_id = index, str(event.get("promptId") or "")
+                    observed_prompt = content.rstrip("\r\n")
+            prompt_matches = start_index is not None
+            if start_index is None and fallback_start_index is not None:
+                start_index = fallback_start_index
+                prompt_id = str(events[start_index].get("promptId") or "")
             if start_index is None:
                 continue
             final_text, final_index, visible_text, visible_index = "", None, "", None
@@ -505,6 +520,8 @@ exit "$code"
                 "api_error": api_error if api_index is not None else "",
                 "session_id": path.stem,
                 "prompt_id": prompt_id,
+                "prompt_matches": prompt_matches,
+                "observed_prompt": observed_prompt,
                 "path": str(path),
                 "followup_detected": bool(extra_user_message),
                 "followup_text": extra_user_message,
