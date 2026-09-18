@@ -414,6 +414,17 @@ class CoreTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_monitor_recovery_does_not_reactivate_a_replaced_pair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='replaced',error='already replaced' WHERE id=?",
+            (pair["id"],),
+        )
+        self.service._resume_active_monitors()
+        current = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {"status": "failed", "stage": "replaced"})
+
     def test_user_paths_and_github_credential_helper_are_portable(self):
         self.assertEqual(OLD_APP_DIR, Path.home() / "Library/Application Support/Claude Eval Console")
         with patch("pairwise_console.gitops.shutil.which", return_value="/usr/local/bin/gh"), \

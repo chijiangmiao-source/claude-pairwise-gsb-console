@@ -216,6 +216,14 @@ class PairwiseService:
         Claude runs in independent Docker/screen sessions, so a service update
         must not strand work that already received its prompt.
         """
+        # A replacement worker can finish while restart recovery is still
+        # attaching monitors. Terminal replacement stages must never be
+        # counted as active Pair capacity.
+        self.db.execute(
+            """UPDATE pairs SET status='failed',updated_at=?
+               WHERE stage IN ('replaced','replacement_failed') AND status<>'failed'""",
+            (now_iso(),),
+        )
         rows = self.db.all(
             """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
                JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
@@ -244,7 +252,12 @@ class PairwiseService:
                 row["pair_id"], row["arm_id"], row["prompt"],
             )
         for pair_id in pair_ids:
-            self.db.execute("UPDATE pairs SET status='running',error='',updated_at=? WHERE id=?", (now_iso(), pair_id))
+            self.db.execute(
+                """UPDATE pairs SET status='running',error='',updated_at=?
+                   WHERE id=? AND stage='development'
+                     AND status IN ('queued','running','review')""",
+                (now_iso(), pair_id),
+            )
 
     def _recover_pending_retry(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
         """Finish a fresh-session retry interrupted by a service restart."""
