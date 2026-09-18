@@ -479,7 +479,8 @@ class PairwiseService:
             time.sleep(5)
 
     def automation_status(self) -> Dict[str, Any]:
-        target = MAX_PAIR_PROJECTS
+        configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
+        target = max(1, min(MAX_PAIR_PROJECTS, configured))
         active = int((self.db.one(
             "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
         ) or {"count": 0})["count"])
@@ -505,13 +506,13 @@ class PairwiseService:
 
     def set_auto_pipeline(self, enabled: bool) -> Dict[str, Any]:
         self.db.set_setting("auto_pipeline_enabled", bool(enabled))
-        if enabled:
-            # The one-click mode has a fixed capacity: four Pair projects,
-            # each using two independent Claude terminals.
-            self.db.set_setting("max_pairs_parallel", MAX_PAIR_PROJECTS)
+        configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
+        target = max(1, min(MAX_PAIR_PROJECTS, configured))
+        if configured != target:
+            self.db.set_setting("max_pairs_parallel", target)
         self.db.audit(
             "automation.started" if enabled else "automation.stopped",
-            "scheduler", "full-pipeline", {"targetPairs": MAX_PAIR_PROJECTS},
+            "scheduler", "full-pipeline", {"targetPairs": target},
         )
         if enabled:
             self._schedule_auto_pipeline_once()

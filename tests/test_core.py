@@ -867,13 +867,13 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(maximum_active, 1)
 
-    def test_one_click_automation_is_persistent_and_forces_four_pair_target(self):
-        self.db.set_setting("max_pairs_parallel", 1)
+    def test_one_click_automation_is_persistent_and_keeps_configured_pair_target(self):
+        self.db.set_setting("max_pairs_parallel", 3)
         with patch.object(self.service, "_schedule_auto_pipeline_once") as schedule:
             status = self.service.set_auto_pipeline(True)
         self.assertTrue(status["enabled"])
-        self.assertEqual(status["targetPairs"], 4)
-        self.assertEqual(self.db.setting("max_pairs_parallel"), 4)
+        self.assertEqual(status["targetPairs"], 3)
+        self.assertEqual(self.db.setting("max_pairs_parallel"), 3)
         schedule.assert_called_once_with()
         stopped = self.service.set_auto_pipeline(False)
         self.assertFalse(stopped["enabled"])
