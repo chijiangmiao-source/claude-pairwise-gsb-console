@@ -2664,7 +2664,8 @@ class PairwiseService:
                 if state.get("api_error"):
                     self.db.audit("claude.api_error_recovered", "arm_run", arm_id, {
                         "error": redact(str(state.get("api_error")))[-1000:],
-                        "action": "accepted_later_native_completion_in_same_session",
+                        "action": "accepted_native_turn_end_in_same_session",
+                        "completion_mode": state.get("completion_mode", ""),
                     })
                 if int(state.get("automatic_companion_count") or 0):
                     self.db.audit("claude.automatic_companion_ignored", "arm_run", arm_id, {

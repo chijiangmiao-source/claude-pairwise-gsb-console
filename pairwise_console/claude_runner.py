@@ -464,7 +464,8 @@ exit "$code"
                     start_index, prompt_id = index, str(event.get("promptId") or "")
             if start_index is None:
                 continue
-            final_text, final_index, api_error, api_index = "", None, "", None
+            final_text, final_index, visible_text, visible_index = "", None, "", None
+            api_error, api_index = "", None
             extra_user_message = ""
             automatic_companion_messages = []
             for index in range(start_index + 1, len(events)):
@@ -485,15 +486,19 @@ exit "$code"
                 text = "\n".join(str(x.get("text") or "") for x in blocks if isinstance(x, dict) and x.get("type") == "text").strip()
                 if event.get("isApiErrorMessage") or text.startswith("API Error:"):
                     api_error, api_index = text or "API Error", index
-                elif text and message.get("stop_reason") in ("end_turn", "stop_sequence"):
-                    final_text, final_index = text, index
-            finished = bool(final_index is not None and any(
+                elif text:
+                    visible_text, visible_index = text, index
+                    if message.get("stop_reason") in ("end_turn", "stop_sequence"):
+                        final_text, final_index = text, index
+            completion_index = final_index if final_index is not None else visible_index
+            finished = bool(completion_index is not None and any(
                 e.get("type") == "last-prompt" or (e.get("type") == "system" and e.get("subtype") == "turn_duration")
-                for e in events[final_index + 1:]
+                for e in events[completion_index + 1:]
             ))
             return {
                 "complete": finished,
-                "result": final_text,
+                "result": final_text or visible_text,
+                "completion_mode": "explicit_stop" if final_index is not None else ("native_turn_end" if finished else ""),
                 # Keep API errors as visible evidence, but do not use them as
                 # a completion veto. Claude can recover inside the same native
                 # session and later emit a valid final response.

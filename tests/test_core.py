@@ -1771,6 +1771,60 @@ class CoreTests(unittest.TestCase):
         self.assertIn("504", state["api_error"])
         self.assertFalse(hasattr(self.service.claude, "send_continue"))
 
+    def test_native_turn_end_accepts_visible_progress_without_stop_reason(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-native-turn-end", "container_name": "container-native-turn-end"}
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": prompt}},
+            {"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Implemented the requested workflow and ran verification."}],
+            }},
+            {"type": "system", "subtype": "turn_duration"},
+            {"type": "last-prompt"},
+        ]
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            state = self.service.claude.trace_state(arm, prompt)
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["completion_mode"], "native_turn_end")
+        self.assertIn("Implemented", state["result"])
+
+    def test_terminal_api_error_after_visible_progress_keeps_the_session_deliverable(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-api-turn-end", "container_name": "container-api-turn-end"}
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": prompt}},
+            {"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Implemented the core flow and verified the main path."}],
+            }},
+            {"type": "assistant", "isApiErrorMessage": True, "message": {
+                "stop_reason": "stop_sequence",
+                "content": [{"type": "text", "text": "API Error: 504 Gateway Timeout"}],
+            }},
+            {"type": "system", "subtype": "turn_duration"},
+        ]
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            state = self.service.claude.trace_state(arm, prompt)
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["completion_mode"], "native_turn_end")
+        self.assertIn("504", state["api_error"])
+        self.assertIn("Implemented", state["result"])
+
     def test_monitor_does_not_restart_a_completed_session_that_contains_api_error(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
