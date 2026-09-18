@@ -28,6 +28,18 @@ class ClaudeRunner:
         self.runtime_dir = config.data_dir / "claude-runs"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def canonical_prompt(prompt: str) -> str:
+        """Return the prompt representation recorded by Claude's native TUI.
+
+        The TUI normalizes line endings and removes blank paragraph rows before
+        it writes the first user event.  Persisting and sending the same form
+        keeps the database prompt byte-for-byte comparable with that event.
+        """
+        text = str(prompt).replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\n[ \t]*\n+", "\n", text)
+        return text.rstrip("\n")
+
     def preflight(self) -> Dict[str, Any]:
         image_name = str(self.db.setting("claude_image", self.config.claude_image))
         model = str(self.db.setting("claude_model", self.config.claude_model))

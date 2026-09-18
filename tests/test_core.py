@@ -213,6 +213,39 @@ class CoreTests(unittest.TestCase):
         self.assertGreaterEqual(waited, 30)
         self.assertLessEqual(waited, 31)
 
+    def test_prompt_is_canonicalized_before_native_send(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE tasks SET prompt=? WHERE id='task-1'",
+            ("First paragraph.\r\n\r\nSecond paragraph.\n\n\nThird paragraph.\n",),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pair["id"] + "-a", pair["id"], "A", "A", str(self.root / "A"),
+             "container-A", "screen-A", "auto_model/urm", "image", "running", stamp, stamp),
+        )
+        arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm='A'", (pair["id"],))
+        with patch.object(self.service.claude, "send_prompt") as send_prompt:
+            self.service._send_prompt_with_pair_stagger(pair["id"], arm, "stale fallback")
+        expected = "First paragraph.\nSecond paragraph.\nThird paragraph."
+        self.assertEqual(send_prompt.call_args.args[1], expected)
+        task = self.db.one("SELECT prompt FROM tasks WHERE id='task-1'")
+        self.assertEqual(task["prompt"], expected)
+        audit = self.db.one(
+            "SELECT event_type FROM audit_events WHERE entity_id='task-1' ORDER BY id DESC LIMIT 1"
+        )
+        self.assertEqual(audit["event_type"], "task.prompt_canonicalized_for_native_trace")
+
+    def test_claude_prompt_canonicalization_matches_native_shape(self):
+        self.assertEqual(
+            self.service.claude.canonical_prompt("A\r\n\r\nB\n \nC\n\n\n"),
+            "A\nB\nC",
+        )
+
     def test_failed_ready_pair_cannot_be_revived_by_a_queued_start(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

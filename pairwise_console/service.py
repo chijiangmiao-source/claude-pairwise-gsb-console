@@ -296,6 +296,28 @@ class PairwiseService:
             current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             return self._handle_attempt_failure(pair_id, current, prompt, failure)
 
+    def _canonicalize_pair_prompt(self, pair_id: str, fallback: str) -> str:
+        """Persist exactly the prompt form stored by Claude's native trace."""
+        task = self.db.one(
+            """SELECT t.id,t.prompt FROM tasks t
+               JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
+            (pair_id,),
+        ) or {}
+        source = str(task.get("prompt") if task.get("prompt") is not None else fallback)
+        canonical = self.claude.canonical_prompt(source)
+        if task.get("id") and canonical != source:
+            self.db.execute(
+                "UPDATE tasks SET prompt=?,updated_at=? WHERE id=? AND prompt=?",
+                (canonical, now_iso(), task["id"], source),
+            )
+            self.db.audit("task.prompt_canonicalized_for_native_trace", "task", task["id"], {
+                "pairId": pair_id,
+                "beforeLength": len(source),
+                "afterLength": len(canonical),
+                "normalization": "line_endings_and_blank_paragraph_rows",
+            })
+        return canonical
+
     def _send_prompt_with_pair_stagger(self, pair_id: str, arm: Dict[str, Any], prompt: str) -> None:
         """Send one original prompt while keeping the two Arm sends apart.
 
@@ -304,6 +326,7 @@ class PairwiseService:
         extra second compensates for the database timestamp's second-level
         precision so the real interval never becomes shorter than configured.
         """
+        prompt = self._canonicalize_pair_prompt(pair_id, prompt)
         with self._prompt_locks_lock:
             prompt_lock = self._prompt_locks.setdefault(pair_id, threading.Lock())
         with prompt_lock:
@@ -2664,6 +2687,10 @@ class PairwiseService:
         return source_sha if re.fullmatch(r"[0-9a-f]{40}", source_sha) else ""
 
     def _monitor_arm(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
+        # Claude's native TUI removes blank paragraph rows when it records the
+        # first user event. Use and persist that representation before any
+        # exact-match check, including monitors resumed after a service update.
+        prompt = self._canonicalize_pair_prompt(pair_id, prompt)
         started = time.monotonic()
         initial = self.db.one("SELECT prompt_sent_at FROM arm_runs WHERE id=?", (arm_id,)) or {}
         try:
