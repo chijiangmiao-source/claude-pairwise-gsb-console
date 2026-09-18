@@ -41,6 +41,10 @@ class ArtifactChecker:
     def __init__(self, db: Database):
         self.db = db
 
+    def preflight(self, workspace: Path, project_key: str) -> Dict[str, Any]:
+        """Validate an existing task baseline without creating delivery evidence."""
+        return self._probe(workspace, "baseline-%s" % project_key[-16:].lower())
+
     def validate(self, pair_id: str, arm: str, workspace: Path, commit_sha: str) -> Dict[str, Any]:
         check_id = "check-" + uuid.uuid4().hex[:16]
         stamp = now_iso()
@@ -49,8 +53,30 @@ class ArtifactChecker:
                VALUES(?,?,?,?,?,?,?,?)""",
             (check_id, pair_id, arm, commit_sha, "running", stamp, stamp, stamp),
         )
+        result = self._probe(
+            workspace, "paircheck-%s-%s" % (pair_id[-8:].lower(), arm.lower()),
+        )
+        try:
+            self.db.execute(
+                """UPDATE artifact_checks SET compose_file=?,status=?,checks_json=?,error=?,
+                   finished_at=?,updated_at=? WHERE id=?""",
+                (result["compose_file"], result["status"],
+                 json.dumps(result["checks"], ensure_ascii=False), result["error"],
+                 now_iso(), now_iso(), check_id),
+            )
+            return self.db.one("SELECT * FROM artifact_checks WHERE id=?", (check_id,)) or {}
+        except Exception:
+            self.db.execute(
+                """UPDATE artifact_checks SET compose_file=?,status='failed',checks_json=?,error=?,finished_at=?,updated_at=? WHERE id=?""",
+                (result["compose_file"], json.dumps(result["checks"], ensure_ascii=False),
+                 result["error"], now_iso(), now_iso(), check_id),
+            )
+            return self.db.one("SELECT * FROM artifact_checks WHERE id=?", (check_id,)) or {}
+
+    def _probe(self, workspace: Path, project: str) -> Dict[str, Any]:
         checks: List[Dict[str, Any]] = []
         compose = self._compose_path(workspace)
+        compose_env: Dict[str, str] = {}
         try:
             self._record(checks, "compose_file", bool(compose), str(compose or "未找到 Compose 文件"))
             dockerfile = next(iter(workspace.glob("**/Dockerfile")), None)
@@ -69,7 +95,6 @@ class ArtifactChecker:
             self._record(checks, "compose_config", config.returncode == 0, redact(config.stderr or config.stdout))
             if config.returncode != 0:
                 raise RuntimeError("Compose 配置无效")
-            project = "paircheck-%s-%s" % (pair_id[-8:].lower(), arm.lower())
             base = ["docker", "compose", "-p", project, "-f", str(compose)]
             run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=compose_env)
             up = run_command(base + ["up", "-d", "--build"], cwd=workspace, check=False, timeout=1200, env=compose_env)
@@ -96,22 +121,16 @@ class ArtifactChecker:
             down = run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=compose_env)
             self._record(checks, "cleanup", down.returncode == 0, redact(down.stderr or down.stdout))
             status = "passed" if all(item["passed"] for item in checks) else "failed"
-            self.db.execute(
-                """UPDATE artifact_checks SET compose_file=?,status=?,checks_json=?,finished_at=?,updated_at=? WHERE id=?""",
-                (str(compose), status, json.dumps(checks, ensure_ascii=False), now_iso(), now_iso(), check_id),
-            )
-            return self.db.one("SELECT * FROM artifact_checks WHERE id=?", (check_id,)) or {}
+            return {"status": status, "compose_file": str(compose), "checks": checks,
+                    "error": "" if status == "passed" else "Docker 基线验收未全部通过"}
         except Exception as exc:
-            if compose and "project" in locals() and "compose_env" in locals():
+            if compose and compose_env:
                 run_command(
                     ["docker", "compose", "-p", project, "-f", str(compose), "down", "-v", "--remove-orphans"],
                     cwd=workspace, check=False, timeout=180, env=compose_env,
                 )
-            self.db.execute(
-                """UPDATE artifact_checks SET compose_file=?,status='failed',checks_json=?,error=?,finished_at=?,updated_at=? WHERE id=?""",
-                (str(compose or ""), json.dumps(checks, ensure_ascii=False), redact(str(exc)), now_iso(), now_iso(), check_id),
-            )
-            return self.db.one("SELECT * FROM artifact_checks WHERE id=?", (check_id,)) or {}
+            return {"status": "failed", "compose_file": str(compose or ""),
+                    "checks": checks, "error": redact(str(exc))}
 
     @staticmethod
     def _compose_path(workspace: Path):

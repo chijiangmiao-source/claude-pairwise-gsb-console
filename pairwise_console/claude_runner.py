@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -496,6 +497,7 @@ exit "$code"
             api_error, api_index = "", None
             extra_user_message = ""
             automatic_companion_messages = []
+            activity = []
             for index in range(start_index + 1, len(events)):
                 event = events[index]
                 if event.get("type") == "user":
@@ -511,6 +513,20 @@ exit "$code"
                 message = event.get("message") if isinstance(event.get("message"), dict) else {}
                 content = message.get("content")
                 blocks = content if isinstance(content, list) else []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        name = str(block.get("name") or "tool")
+                        value = block.get("input") if isinstance(block.get("input"), dict) else {}
+                        shape = " ".join(sorted(str(key) for key in value))
+                        activity.append("tool:%s:%s" % (name, shape))
+                    elif block.get("type") == "text" and str(block.get("text") or "").strip():
+                        normalized = re.sub(
+                            r"[0-9a-f]{8,}|\d+", "#",
+                            re.sub(r"\s+", " ", str(block.get("text") or "").casefold()),
+                        ).strip()
+                        activity.append("text:" + normalized[:180])
                 text = "\n".join(str(x.get("text") or "") for x in blocks if isinstance(x, dict) and x.get("type") == "text").strip()
                 if event.get("isApiErrorMessage") or text.startswith("API Error:"):
                     api_error, api_index = text or "API Error", index
@@ -531,6 +547,7 @@ exit "$code"
                 e.get("type") == "last-prompt" or (e.get("type") == "system" and e.get("subtype") == "turn_duration")
                 for e in events[completion_index + 1:]
             ))
+            activity_payload = activity[:80] or ["no-assistant-activity"]
             return {
                 "complete": finished,
                 "result": final_text or native_text or visible_text,
@@ -548,8 +565,14 @@ exit "$code"
                 "followup_text": extra_user_message,
                 "automatic_companion_count": len(automatic_companion_messages),
                 "automatic_companion_messages": automatic_companion_messages[:10],
+                "activity_signature": hashlib.sha256(
+                    json.dumps(activity_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "activity_summary": activity_payload[:12],
             }
-        return {"complete": False, "api_error": "", "path": ""}
+        empty_signature = hashlib.sha256(b'["no-trace-activity"]').hexdigest()
+        return {"complete": False, "api_error": "", "path": "",
+                "activity_signature": empty_signature, "activity_summary": ["no-trace-activity"]}
 
     @staticmethod
     def has_business_code(workspace: Path, baseline_sha: str = "") -> bool:

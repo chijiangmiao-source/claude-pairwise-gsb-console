@@ -32,7 +32,8 @@ const statusLabels = {
   artifact_validation: "Docker 验收", difficulty_review: "实际难度复评",
   difficulty_rejected: "难度复评未通过", starting: "正在启动项目", recording: "正在录制",
   gsb_ready: "等待 GSB", gsb_confirmation: "GSB 确认",
-  artifact_failed: "Docker 验收失败", development_failed: "开发失败",
+  artifact_failed: "Docker 验收失败", artifact_failed_evaluated: "启动失败，已完成 GSB",
+  baseline_preflight_failed: "基线预检失败", development_failed: "开发失败",
   recording_failed: "录像失败", task_replacement: "正在自动换题",
   replaced: "已自动换题", replacement_failed: "自动换题失败", completed: "已完成",
   queued: "排队中", running: "运行中", review: "待复核", developing: "开发中", stopping: "正在保存",
@@ -164,7 +165,7 @@ const pages = {
   pairs: async () => {
     const filters = state.filters.pairs, data = await api(`/api/pairs?${queryString("pairs")}`);
     $("#content").innerHTML = `<div class="card"><div class="toolbar"><div><h2>A/B 项目</h2><p class="sub">同一 main 基线，大写 A/B 分支，两个独立 Claude 容器</p></div></div>
-      ${filterBar("pairs", [["q", "search", "Pair 唯一 ID、项目编号或题目", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["difficulty", "select", "全部难度", filters.difficulty, ["中等", "困难", "地狱"]], ["stage", "select", "全部项目阶段", filters.stage, [["repository", "仓库准备"], ["ready_to_start", "等待启动"], ["development", "A/B 开发"], ["artifact_validation", "Docker 验收"], ["difficulty_review", "实际难度复评"], ["recording", "正在录制"], ["gsb_ready", "等待 GSB"], ["gsb_confirmation", "GSB 确认"], ["completed", "已完成"], ["artifact_failed", "Docker 验收失败"], ["difficulty_rejected", "难度复评未通过"], ["development_failed", "开发失败"], ["recording_failed", "录像失败"], ["task_replacement", "正在自动换题"], ["replacement_failed", "自动换题失败"]]], ["status", "select", "全部项目状态", filters.status, [["queued", "排队中"], ["running", "运行中"], ["review", "待复核"], ["completed", "已完成"], ["failed", "失败"]]]])}
+      ${filterBar("pairs", [["q", "search", "Pair 唯一 ID、项目编号或题目", filters.q], ["task_type", "select", "全部任务类型", filters.task_type, [["zero_to_one", "0–1"], ["feature", "Feature 迭代"], ["bugfix", "Bug 修复"]]], ["project_category", "select", "全部系统类型", filters.project_category, ["纯后端", "纯前端", "全栈"]], ["difficulty", "select", "全部难度", filters.difficulty, ["中等", "困难", "地狱"]], ["stage", "select", "全部项目阶段", filters.stage, [["repository", "仓库准备"], ["ready_to_start", "等待启动"], ["development", "A/B 开发"], ["artifact_validation", "Docker 验收"], ["difficulty_review", "实际难度复评"], ["recording", "正在录制"], ["gsb_ready", "等待 GSB"], ["gsb_confirmation", "GSB 确认"], ["completed", "已完成"], ["baseline_preflight_failed", "基线预检失败"], ["artifact_failed", "Docker 验收失败"], ["artifact_failed_evaluated", "启动失败，已完成 GSB"], ["difficulty_rejected", "难度复评未通过"], ["development_failed", "开发失败"], ["recording_failed", "录像失败"], ["task_replacement", "正在自动换题"], ["replacement_failed", "自动换题失败"]]], ["status", "select", "全部项目状态", filters.status, [["queued", "排队中"], ["running", "运行中"], ["review", "待复核"], ["completed", "已完成"], ["failed", "失败"]]]])}
       ${table(data.items, [
       ["项目 / Pair 唯一 ID", (row) => `<div class="title-cell"><strong>${esc(row.title)}</strong>${pairIdentity(row.id)}</div>`],
       ["类型 / 难度", (row) => `<div class="tag-stack">${taskTypeBadge(row.task_type)} ${projectCategoryBadge(row.project_category)} ${difficultyDisplay(row)}</div>`],

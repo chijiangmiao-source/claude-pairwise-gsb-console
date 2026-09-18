@@ -218,6 +218,47 @@ class CoreTests(unittest.TestCase):
             )
         self.assertEqual(self.service._next_ready_task()["task_type"], "bugfix")
 
+    def test_ready_task_selection_prefers_new_zero_to_one_and_rejects_duplicate_title(self):
+        self.db.set_setting("task_mix_started_at", "2000-01-01T00:00:00+00:00")
+        rows = [
+            ("task-used", "test", "共享标题", "已经开发过的复杂状态恢复任务", "used", "2019-01-01T00:00:00+00:00"),
+            ("task-duplicate", "test", "共享标题", "完全不同的说明也不应复用标题", "ready", "2020-01-01T00:00:00+00:00"),
+            ("task-legacy", "legacy", "旧题", "旧的复杂零到一任务", "ready", "2021-01-01T00:00:00+00:00"),
+            ("task-new", "generated", "新题", "新的复杂零到一任务", "ready", "2022-01-01T00:00:00+00:00"),
+        ]
+        for task_id, source, title, prompt, status, created_at in rows:
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+                   difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'困难','[]',?,?,?,?)""",
+                (task_id, source, "zero_to_one", title, prompt, task_id, status, created_at, created_at),
+            )
+        selected = self.service._next_ready_task()
+        self.assertEqual(selected["id"], "task-new")
+        rejected = self.db.one("SELECT status,rejection_reason FROM tasks WHERE id='task-duplicate'")
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertIn("标题", rejected["rejection_reason"])
+
+    def test_failed_pairs_still_count_toward_scheduler_mix(self):
+        stamp = now_iso()
+        self.db.set_setting("task_mix_started_at", "2000-01-01T00:00:00+00:00")
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+               fingerprint,status,created_at,updated_at)
+               VALUES('task-failed-mix','test','bugfix','失败题','复杂修复','困难','[]',
+                      'failed-mix','used',?,?)""", (stamp, stamp),
+        )
+        self.db.execute(
+            "INSERT INTO project_chains(id,root_task_id,status,created_at,updated_at) VALUES('chain-failed-mix','task-failed-mix','active',?,?)",
+            (stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
+               VALUES('pair-failed-mix','task-failed-mix','chain-failed-mix','failed','replaced',?,?)""",
+            (stamp, stamp),
+        )
+        self.assertEqual(self.service._task_mix_counts()["bugfix"], 1)
+
     def test_missing_feature_and_bug_tasks_use_real_completed_pair_sources(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
@@ -300,6 +341,45 @@ class CoreTests(unittest.TestCase):
         waited = sleep.call_args.args[0]
         self.assertGreaterEqual(waited, 30)
         self.assertLessEqual(waited, 31)
+
+    def test_baseline_preflight_rejects_feature_before_claude_launch(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        repo_root = self.root / "baseline-preflight"
+        (repo_root / "A").mkdir(parents=True)
+        self.db.execute("UPDATE tasks SET task_type='feature' WHERE id='task-1'")
+        self.db.execute(
+            "UPDATE pairs SET status='queued',stage='ready_to_start',baseline_sha=? WHERE id=?",
+            ("b" * 40, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO git_repositories(id,pair_id,owner,name,visibility,local_root,
+               main_sha,a_sha,b_sha,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'ready',?,?)""",
+            ("repo-preflight", pair["id"], "owner", "repo", "public", str(repo_root),
+             "b" * 40, "b" * 40, "b" * 40, stamp, stamp),
+        )
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)""",
+                ("arm-preflight-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image", stamp, stamp),
+            )
+        failed = {
+            "status": "failed", "error": "缺少 Docker Compose 或 Dockerfile",
+            "checks": [{"name": "compose_file", "passed": False, "detail": "未找到 Compose 文件"}],
+        }
+        with patch.object(self.service.artifacts, "preflight", return_value=failed), \
+             patch.object(self.service.claude, "launch") as launch, \
+             patch.object(self.service, "_submit") as submit:
+            result = self.service.start_pair(pair["id"])
+        launch.assert_not_called()
+        submit.assert_called_once()
+        self.assertEqual(result["stage"], "baseline_preflight_failed")
+        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-1'")["status"], "rejected")
 
     def test_prompt_is_canonicalized_before_native_send(self):
         self.insert_ready_task()
@@ -685,7 +765,7 @@ class CoreTests(unittest.TestCase):
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
                    fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (f"task-auto-{index}", "test", "zero_to_one", f"hard-auto-{index}",
-                 "Build a hard project with Docker Compose", "困难", '["跨模块状态"]',
+                 f"Build a distinct hard project number {index} with Docker Compose", "困难", '["跨模块状态"]',
                  f"fingerprint-auto-{index}", "ready", stamp, stamp),
             )
         submitted = []
@@ -705,7 +785,7 @@ class CoreTests(unittest.TestCase):
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
                    fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (f"task-cycle-{index}", "test", "zero_to_one", f"hard-cycle-{index}",
-                 "Build a hard project with Docker Compose", "困难", '["跨模块状态"]',
+                 f"Build a distinct lifecycle project number {index} with Docker Compose", "困难", '["跨模块状态"]',
                  f"fingerprint-cycle-{index}", "ready", stamp, stamp),
             )
         with patch.object(self.service, "_submit_auto", return_value=True), \
@@ -810,6 +890,45 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(review["confirmed_by"], "刘昱（按授权默认确认）")
         completed = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(completed, {"status": "completed", "stage": "completed"})
+
+    def test_gsb_records_unstartable_delivery_without_recording_or_repair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute("UPDATE pairs SET status='running',stage='gsb_ready' WHERE id=?", (pair["id"],))
+        for arm, check_status, error in (
+            ("A", "observed_failed", "Docker Compose 清洁启动失败"),
+            ("B", "passed", ""),
+        ):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-failed-gsb-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,error,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                ("check-failed-gsb-" + arm, pair["id"], arm, sha, check_status,
+                 '[{"name":"clean_start","passed":false,"detail":"dependency path missing"}]' if error else "[]",
+                 error, stamp, stamp),
+            )
+        payload = {
+            "verdict": "B better",
+            "aReason": "A 在 compose.yaml 的启动流程因依赖路径缺失而失败，清洁 Docker 无法启动，原始交付不可用。",
+            "bReason": "B 在 compose.yaml 完成相同功能并通过清洁 Docker 验收，因此相较无法启动的 A 更可靠。",
+            "evidence": ["A clean_start failed", "B Docker passed"],
+        }
+        with patch.object(self.service.codex, "run", return_value=payload) as run:
+            review = self.service.generate_gsb(pair["id"])
+        self.assertEqual(review["status"], "confirmed")
+        self.assertIn("observed_failed", run.call_args.args[1])
+        final = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(final, {"status": "failed", "stage": "artifact_failed_evaluated"})
+        delivery = self.db.one("SELECT status FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(delivery["status"], "discarded")
 
     def test_gsb_recheck_persists_split_review_suggestions(self):
         self.insert_ready_task()
@@ -1302,7 +1421,7 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Docker 产物验收未通过"):
             self.service.start_recording(pair["id"], "A")
 
-    def test_failed_artifact_restarts_only_failed_arm_before_recording(self):
+    def test_failed_artifact_is_preserved_for_gsb_without_claude_repair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -1313,21 +1432,34 @@ class CoreTests(unittest.TestCase):
                 ("arm-artifact-" + arm, pair["id"], arm, arm, str(self.root / arm), "container-" + arm,
                  "screen-" + arm, "auto_model/urm", "image", arm.lower() * 40, stamp, stamp),
             )
-        checks = [
-            {"arm": "A", "status": "failed", "error": "缺少 Docker Compose 或 Dockerfile"},
-            {"arm": "B", "status": "passed", "error": ""},
-        ]
-        restarted = {"id": "arm-artifact-A", "arm": "A", "status": "developing"}
-        with patch.object(self.service.artifacts, "validate", side_effect=checks), \
-             patch.object(self.service, "_restart_arm_from_delivered_commit", return_value=restarted) as retry, \
+        checks = {
+            "A": {"status": "failed", "error": "缺少 Docker Compose 或 Dockerfile"},
+            "B": {"status": "passed", "error": ""},
+        }
+
+        def validate(pair_id, arm, _workspace, commit_sha):
+            item = checks[arm]
+            check_id = "check-artifact-" + arm
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,error,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (check_id, pair_id, arm, commit_sha, item["status"], item["error"], stamp, stamp),
+            )
+            return self.db.one("SELECT * FROM artifact_checks WHERE id=?", (check_id,))
+
+        with patch.object(self.service.artifacts, "validate", side_effect=validate), \
+             patch.object(self.service, "_restart_arm_from_delivered_commit") as retry, \
              patch.object(self.service, "_submit_monitor") as submit:
             result = self.service._validate_pair_artifacts(pair["id"])
-        self.assertEqual(result["restarted"], ["A"])
-        self.assertIn("Docker 产物验收失败", retry.call_args.args[3])
-        submit.assert_called_once_with("monitor-arm-artifact-A", self.service._monitor_arm,
-                                       pair["id"], "arm-artifact-A", "Build a hard project with Docker Compose")
+        self.assertEqual(result["preserved"], ["A"])
+        retry.assert_not_called()
+        submit.assert_not_called()
+        self.assertEqual(
+            self.db.one("SELECT status FROM artifact_checks WHERE id='check-artifact-A'")["status"],
+            "observed_failed",
+        )
         current = self.db.one("SELECT stage FROM pairs WHERE id=?", (pair["id"],))
-        self.assertEqual(current["stage"], "development")
+        self.assertEqual(current["stage"], "gsb_ready")
 
     def test_pending_artifact_retry_recovers_from_delivered_commit(self):
         self.insert_ready_task()
@@ -2178,6 +2310,43 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(event["event_type"], "claude.api_error_recovered")
 
+    def test_monitor_replaces_task_after_second_identical_no_code_signature(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.set_setting("first_prompt_stop_minutes", 0)
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,attempt_no,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,2,?,?)""",
+            ("arm-repeat-no-code", pair["id"], "A", "A", str(self.root / "A"),
+             "container-repeat", "screen-repeat", "auto_model/urm", "image", stamp, stamp, stamp),
+        )
+        signature = "same-signature"
+        self.db.audit("claude.no_code_timeout_signature", "arm_run", "arm-repeat-no-code", {
+            "attempt": 1, "signature": signature, "summary": ["no-assistant-activity"],
+        })
+        state = {
+            "complete": False, "api_error": "", "activity_signature": signature,
+            "activity_summary": ["no-assistant-activity"],
+        }
+        with patch.object(self.service.claude, "trace_state", return_value=state), \
+             patch.object(self.service.claude, "runtime_alive", return_value=True), \
+             patch.object(self.service.claude, "has_business_code", return_value=False), \
+             patch.object(self.service, "_handle_attempt_failure", return_value={"status": "failed"}) as failure:
+            self.service._monitor_arm(
+                pair["id"], "arm-repeat-no-code", "Build a hard project with Docker Compose",
+            )
+        self.assertTrue(failure.call_args.kwargs["early_replace"])
+        self.assertIn("连续 2 次", failure.call_args.args[3])
+        latest = self.db.one(
+            "SELECT detail_json FROM audit_events WHERE entity_id='arm-repeat-no-code' ORDER BY id DESC LIMIT 1"
+        )
+        self.assertTrue(json.loads(latest["detail_json"])["matches_previous_attempt"])
+
     def test_system_turn_companion_is_not_treated_as_manual_followup(self):
         prompt = "Build the requested project"
         arm = {"id": "arm-companion", "container_name": "container-companion"}
@@ -2309,7 +2478,9 @@ class CoreTests(unittest.TestCase):
             result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", "container exited")
         self.assertEqual(result["status"], "failed")
         archive.assert_called_once()
-        replace.assert_called_once_with(pair["id"], arm["id"], "container exited")
+        replace.assert_called_once_with(
+            pair["id"], arm["id"], "container exited", "开发连续 3 次失败",
+        )
 
     def test_api_errors_never_restart_or_consume_a_development_attempt(self):
         self.insert_ready_task()

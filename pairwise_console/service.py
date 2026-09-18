@@ -816,12 +816,11 @@ class PairwiseService:
 
     def _task_mix_counts(self, include_ready: bool = False) -> Dict[str, int]:
         started_at = str(self.db.setting("task_mix_started_at", "") or "")
-        statuses = "'queued','running','review','completed'"
         rows = self.db.all(
             """SELECT t.task_type,COUNT(*) count FROM pairs p
                  JOIN tasks t ON t.id=p.task_id
-                WHERE p.created_at>=? AND p.status IN (%s)
-                GROUP BY t.task_type""" % statuses,
+                WHERE p.created_at>=?
+                GROUP BY t.task_type""",
             (started_at,),
         )
         counts = {task_type: 0 for task_type in TASK_MIX_TYPES}
@@ -855,14 +854,26 @@ class PairwiseService:
 
     def _next_ready_task(self) -> Optional[Dict[str, Any]]:
         for task_type in self._task_mix_priority():
-            task = self.db.one(
+            tasks = self.db.all(
                 """SELECT * FROM tasks WHERE status='ready'
                    AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
-                   AND task_type=? ORDER BY created_at,id LIMIT 1""",
+                   AND task_type=?
+                   ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 50""",
                 (task_type,),
             )
-            if task:
-                return task
+            for task in tasks:
+                duplicate = self._deterministic_task_duplicate(
+                    task, exclude_task_id=task["id"], selection=True,
+                )
+                if not duplicate:
+                    return task
+                self.db.execute(
+                    "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
+                    (duplicate, now_iso(), task["id"]),
+                )
+                self.db.audit("task.selection_duplicate_rejected", "task", task["id"], {
+                    "reason": duplicate, "task_type": task_type,
+                })
         return None
 
     def _schedule_task_source(self, task_type: str) -> bool:
@@ -1028,9 +1039,10 @@ class PairwiseService:
                 "key": str(row.get("id") or ""), "source": "本系统题库",
                 "title": str(row.get("title") or ""), "taskType": str(row.get("task_type") or ""),
                 "prompt": str(row.get("prompt") or ""), "status": str(row.get("status") or ""),
+                "createdAt": str(row.get("created_at") or ""),
             }
             for row in self.db.all(
-                "SELECT id,title,task_type,prompt,status FROM tasks WHERE id<>? ORDER BY created_at DESC LIMIT 1500",
+                "SELECT id,title,task_type,prompt,status,created_at FROM tasks WHERE id<>? ORDER BY created_at DESC LIMIT 1500",
                 (exclude_task_id,),
             )
         ]
@@ -1053,7 +1065,7 @@ class PairwiseService:
                                 "key": "remote-" + str(row["remote_submission_id"] or ""),
                                 "source": "历史提交题库", "title": str(row["repo_name"] or ""),
                                 "taskType": str(row["task_type"] or ""), "prompt": str(row["prompt"] or ""),
-                                "status": str(row["remote_status"] or ""),
+                                "status": str(row["remote_status"] or ""), "createdAt": "",
                             })
                 finally:
                     source.close()
@@ -1104,7 +1116,8 @@ class PairwiseService:
             for row in current + historical
         ]
 
-    def _deterministic_task_duplicate(self, task: Dict[str, Any], exclude_task_id: str = "") -> str:
+    def _deterministic_task_duplicate(self, task: Dict[str, Any], exclude_task_id: str = "",
+                                      selection: bool = False) -> str:
         prompt = str(task.get("prompt") or "")
         title = str(task.get("title") or "")
         normalized = self._normalized_task_text(prompt)
@@ -1114,6 +1127,14 @@ class PairwiseService:
         for row in self._historical_task_catalog(exclude_task_id):
             if allow_previous_period_reuse and row["source"] == "历史提交题库":
                 continue
+            if selection and row["source"] == "本系统题库" and row.get("status") != "used":
+                older_ready = (
+                    row.get("status") == "ready"
+                    and (str(row.get("createdAt") or ""), str(row.get("key") or ""))
+                    < (str(task.get("created_at") or ""), str(task.get("id") or ""))
+                )
+                if not older_ready:
+                    continue
             other_prompt = str(row.get("prompt") or "")
             other_normalized = self._normalized_task_text(other_prompt)
             score = self._task_text_similarity(prompt, other_prompt)
@@ -1121,9 +1142,13 @@ class PairwiseService:
                 self._normalized_task_text(title)
                 and self._normalized_task_text(title) == self._normalized_task_text(row.get("title"))
             )
+            if same_title:
+                return "题目标题与%s中的“%s”重复，需要更换核心问题" % (
+                    row["source"], row["title"] or row["key"],
+                )
             if normalized == other_normalized:
                 return "题面与%s中的“%s”完全重复" % (row["source"], row["title"] or row["key"])
-            if len(normalized) >= 120 and (score >= 0.86 or (same_title and score >= 0.68)):
+            if len(normalized) >= 120 and score >= 0.82:
                 return "题面与%s中的“%s”高度相似（%.0f%%），需要更换核心问题和验收机制" % (
                     row["source"], row["title"] or row["key"], score * 100,
                 )
@@ -1401,6 +1426,29 @@ class PairwiseService:
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,))
         if not repo or repo["status"] != "ready":
             raise RuntimeError("Pair 仓库尚未准备完成")
+        if task.get("task_type") != "zero_to_one":
+            baseline_check = self.artifacts.preflight(
+                Path(repo["local_root"]) / "A", pair_id,
+            )
+            if baseline_check.get("status") != "passed":
+                reason = "开发前 Docker 基线预检失败：%s" % (
+                    baseline_check.get("error") or "Compose 或依赖路径不可用"
+                )
+                if self._baseline_preflight_environment_failure(baseline_check):
+                    self.db.execute(
+                        "UPDATE pairs SET error=?,updated_at=? WHERE id=?",
+                        (reason[-3000:], now_iso(), pair_id),
+                    )
+                    self.db.audit("task.baseline_preflight_environment_error", "pair", pair_id, {
+                        "reason": reason, "checks": baseline_check.get("checks", []),
+                        "action": "retry_without_starting_claude",
+                    })
+                    raise RuntimeError(reason)
+                self._reject_pair_before_development(pair_id, reason, baseline_check)
+                return self.pair_detail(pair_id)
+            self.db.audit("task.baseline_preflight_passed", "pair", pair_id, {
+                "task_id": task.get("id"), "compose_file": baseline_check.get("compose_file", ""),
+            })
         # Also migrates pre-fix queued rows whose workspace pointed directly at
         # the non-empty canonical clone.
         for arm in ("A", "B"):
@@ -1439,6 +1487,49 @@ class PairwiseService:
             self.db.execute("UPDATE pairs SET status='failed',error=?,updated_at=? WHERE id=?", (str(exc)[-3000:], now_iso(), pair_id))
             # Never destroy a successfully started arm here. Its terminal remains available for safe export/recovery.
             raise
+
+    @staticmethod
+    def _baseline_preflight_environment_failure(check: Dict[str, Any]) -> bool:
+        text = str(check.get("error") or "") + "\n" + "\n".join(
+            str(item.get("detail") or "") for item in check.get("checks", [])
+            if not item.get("passed")
+        )
+        lowered = text.casefold()
+        return any(marker in lowered for marker in (
+            "cannot connect to the docker daemon", "is the docker daemon running",
+            "docker desktop is not running", "command not found: docker",
+            "no such file or directory: 'docker'", "context deadline exceeded",
+        ))
+
+    def _reject_pair_before_development(self, pair_id: str, reason: str,
+                                        check: Dict[str, Any]) -> None:
+        pair = self._pair(pair_id)
+        stamp = now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
+                (reason[-2000:], stamp, pair["task_id"]),
+            )
+            conn.execute(
+                """UPDATE pairs SET status='failed',stage='baseline_preflight_failed',
+                   error=?,updated_at=? WHERE id=?""",
+                (reason[-3000:], stamp, pair_id),
+            )
+            conn.execute(
+                """UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=?
+                   WHERE pair_id=? AND status='queued'""",
+                (reason[-2000:], stamp, stamp, pair_id),
+            )
+            conn.execute(
+                """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
+                   WHERE pair_id=?""",
+                (reason[-2000:], stamp, pair_id),
+            )
+        self.db.audit("task.baseline_preflight_failed", "pair", pair_id, {
+            "task_id": pair["task_id"], "reason": reason,
+            "checks": check.get("checks", []), "claude_started": False,
+        })
+        self._submit("replace-task-" + pair_id, self._start_replacement_pair, pair_id)
 
     def generate_gsb_async(self, pair_id: str) -> str:
         operation = "gsb-" + pair_id
@@ -1663,6 +1754,17 @@ class PairwiseService:
         failed = [arm for arm in ("A", "B") if (by_arm.get(arm) or {}).get("status") != "passed"]
         if failed:
             raise ValueError("A/B 必须先通过 Docker 产物验收；未通过：" + "、".join(failed))
+        return checks
+
+    def _require_evaluated_artifacts(self, pair_id: str) -> List[Dict[str, Any]]:
+        checks = self._current_artifact_checks(pair_id)
+        by_arm = {row.get("arm"): row for row in checks}
+        missing = [
+            arm for arm in ("A", "B")
+            if (by_arm.get(arm) or {}).get("status") not in ("passed", "observed_failed")
+        ]
+        if missing:
+            raise ValueError("A/B 必须先完成 Docker 产物验收；尚未完成：" + "、".join(missing))
         return checks
 
     def _difficulty_arm_evidence(self, pair: Dict[str, Any], arm: Dict[str, Any],
@@ -2011,14 +2113,22 @@ class PairwiseService:
         self.refresh_recording_stage(pair_id)
         pair = self._pair(pair_id)
         if pair["stage"] != "gsb_ready":
-            raise ValueError("A/B 两侧必须先通过 Docker 验收并完成合格录像")
-        checks = self._require_passed_artifacts(pair_id)
+            raise ValueError("A/B 两侧必须先完成 Docker 验收；可启动产物还要完成合格录像")
+        checks = self._require_evaluated_artifacts(pair_id)
+        has_observed_failure = any(row.get("status") == "observed_failed" for row in checks)
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
         recordings = self.db.all("SELECT * FROM recordings WHERE pair_id=? ORDER BY arm", (pair_id,))
         by_arm = {arm["arm"]: arm for arm in arms}
         check_by_arm = {item["arm"]: item for item in checks}
         rec_by_arm = {item["arm"]: item for item in recordings}
+        if not has_observed_failure:
+            missing_recordings = [
+                arm for arm in ("A", "B")
+                if (rec_by_arm.get(arm) or {}).get("status") != "passed"
+            ]
+            if missing_recordings:
+                raise ValueError("可启动产物必须先完成合格录像；缺少：" + "、".join(missing_recordings))
         evidence = {}
         for arm in ("A", "B"):
             evidence[arm] = {
@@ -2086,7 +2196,8 @@ class PairwiseService:
                     confirmed_by: str) -> Dict[str, Any]:
         if verdict not in ("A better", "Same", "B better"):
             raise ValueError("GSB 结论无效")
-        self._require_passed_artifacts(pair_id)
+        checks = self._require_evaluated_artifacts(pair_id)
+        has_observed_failure = any(row.get("status") == "observed_failed" for row in checks)
         clean_a = self._clean_gsb_part(a_reason, 300)
         clean_b = self._clean_gsb_part(b_reason, 300)
         if len(clean_a) < 20 or len(clean_b) < 20:
@@ -2107,28 +2218,46 @@ class PairwiseService:
             (verdict, clean, clean_a, clean_b, "", verdict, clean, evidence_version,
              confirmed_by.strip() or "人工确认", stamp, stamp, pair_id),
         )
-        self.db.execute(
-            """UPDATE pairs SET status='completed',stage='completed',winner=?,error='',
-               completed_at=?,updated_at=? WHERE id=?""",
-            (verdict, stamp, stamp, pair_id),
-        )
+        if has_observed_failure:
+            failure_arms = [row.get("arm") for row in checks if row.get("status") == "observed_failed"]
+            self.db.execute(
+                """UPDATE pairs SET status='failed',stage='artifact_failed_evaluated',winner=?,
+                   error=?,completed_at=?,updated_at=? WHERE id=?""",
+                (verdict, "Claude 原始交付无法通过 Docker 启动，已保留产物并完成 GSB：" + "、".join(failure_arms),
+                 stamp, stamp, pair_id),
+            )
+        else:
+            self.db.execute(
+                """UPDATE pairs SET status='completed',stage='completed',winner=?,error='',
+                   completed_at=?,updated_at=? WHERE id=?""",
+                (verdict, stamp, stamp, pair_id),
+            )
         pair = self._pair(pair_id)
         task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (pair["task_id"],)) or {}
-        if task.get("task_type") in ("feature", "bugfix"):
+        if not has_observed_failure and task.get("task_type") in ("feature", "bugfix"):
             self.db.execute("UPDATE project_chains SET followup_completed=1,status='completed',completed_at=?,updated_at=? WHERE id=?", (stamp, stamp, pair["chain_id"]))
         submission_id = "delivery-" + uuid.uuid4().hex[:16]
-        self.db.execute(
-            """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
-               VALUES(?,?,'ready_to_submit',?,?)
-               ON CONFLICT(pair_id) DO UPDATE SET
-                 status=CASE
-                   WHEN delivery_submissions.remote_id='' THEN 'ready_to_submit'
-                   WHEN delivery_submissions.remote_status='PENDING_FIX' THEN 'needs_fix'
-                   ELSE delivery_submissions.status
-                 END,
-                 error='',updated_at=excluded.updated_at""",
-            (submission_id, pair_id, stamp, stamp),
-        )
+        if has_observed_failure:
+            self.db.execute(
+                """INSERT INTO delivery_submissions(id,pair_id,status,error,created_at,updated_at)
+                   VALUES(?,?,'discarded','Docker 产物无法启动；保留 GSB 但不进入正式提交',?,?)
+                   ON CONFLICT(pair_id) DO UPDATE SET status='discarded',
+                     error='Docker 产物无法启动；保留 GSB 但不进入正式提交',updated_at=excluded.updated_at""",
+                (submission_id, pair_id, stamp, stamp),
+            )
+        else:
+            self.db.execute(
+                """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
+                   VALUES(?,?,'ready_to_submit',?,?)
+                   ON CONFLICT(pair_id) DO UPDATE SET
+                     status=CASE
+                       WHEN delivery_submissions.remote_id='' THEN 'ready_to_submit'
+                       WHEN delivery_submissions.remote_status='PENDING_FIX' THEN 'needs_fix'
+                       ELSE delivery_submissions.status
+                     END,
+                     error='',updated_at=excluded.updated_at""",
+                (submission_id, pair_id, stamp, stamp),
+            )
         self.db.audit("gsb.confirmed", "pair", pair_id, {"verdict": verdict, "confirmed_by": confirmed_by})
         return self.pair_detail(pair_id)
 
@@ -2822,7 +2951,7 @@ class PairwiseService:
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
 
     def _handle_attempt_failure(self, pair_id: str, arm: Dict[str, Any], prompt: str,
-                                error: str) -> Dict[str, Any]:
+                                error: str, early_replace: bool = False) -> Dict[str, Any]:
         """Retry every failed development attempt in a new session.
 
         The initial run counts as attempt one. After the third failed attempt the
@@ -2843,13 +2972,18 @@ class PairwiseService:
         count_error_retry = True
         self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
             "attempt": attempt, "maximum": maximum, "error": redact(error)[-1000:],
-            "action": "replace_task" if attempt >= maximum else "fresh_session_from_baseline",
+            "action": "replace_task" if early_replace or attempt >= maximum else "fresh_session_from_baseline",
+            "early_replace": early_replace,
             "counts_toward_development_attempts": count_development_failure,
             "counts_toward_error_retries": count_error_retry,
         })
-        if count_development_failure and attempt >= maximum:
+        if early_replace or (count_development_failure and attempt >= maximum):
             archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
-            self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error)
+            label = (
+                "同一侧连续 2 次出现相同无代码轨迹，已提前换题"
+                if early_replace else "开发连续 %d 次失败" % maximum
+            )
+            self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error, label)
             return archived
         try:
             return self._restart_arm_from_baseline(
@@ -2865,7 +2999,8 @@ class PairwiseService:
             )
 
     def _retire_pair_and_schedule_replacement(self, pair_id: str, failed_arm_id: str,
-                                              error: str) -> None:
+                                              error: str,
+                                              retire_label: str = "开发连续 3 次失败") -> None:
         stamp = now_iso()
         with self.db.transaction() as conn:
             pair = conn.execute("SELECT status,stage FROM pairs WHERE id=?", (pair_id,)).fetchone()
@@ -2873,14 +3008,14 @@ class PairwiseService:
                 return
             conn.execute(
                 "UPDATE pairs SET status='failed',stage='task_replacement',error=?,updated_at=? WHERE id=?",
-                (("开发连续 3 次失败，正在自动换题：" + redact(error))[-3000:], stamp, pair_id),
+                ((retire_label + "，正在自动换题：" + redact(error))[-3000:], stamp, pair_id),
             )
             conn.execute(
                 """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
                    WHERE pair_id=?""",
-                ("原 Pair 开发连续 3 次失败，已停止交付并正在自动换题", stamp, pair_id),
+                ("原 Pair %s，已停止交付并正在自动换题" % retire_label, stamp, pair_id),
             )
-        self._invalidate_recordings(pair_id, reason="当前 Pair 已连续失败并换题：" + error)
+        self._invalidate_recordings(pair_id, reason="当前 Pair 已换题：" + error)
         for other in self.db.all("SELECT * FROM arm_runs WHERE pair_id=? AND id<>?", (pair_id, failed_arm_id)):
             if other["status"] in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
                 try:
@@ -2893,28 +3028,25 @@ class PairwiseService:
                     })
         self.db.audit("pair.task_replacement_scheduled", "pair", pair_id, {
             "failed_arm_id": failed_arm_id, "reason": redact(error)[-1000:],
+            "retire_label": retire_label,
         })
         self._submit("replace-task-" + pair_id, self._start_replacement_pair, pair_id)
 
     def _start_replacement_pair(self, retired_pair_id: str) -> Dict[str, Any]:
-        retired = self._pair(retired_pair_id)
-        old_task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (retired["task_id"],)) or {}
-        task_type = str(old_task.get("task_type") or "zero_to_one")
         try:
-            candidate = self.db.one(
-                """SELECT * FROM tasks WHERE status='ready'
-                   AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
-                   ORDER BY CASE WHEN task_type=? THEN 0 ELSE 1 END,created_at LIMIT 1""",
-                (task_type,),
-            )
+            candidate = self._next_ready_task()
             if not candidate:
-                for _ in range(3):
-                    generated = self.generate_tasks(1, "zero_to_one")
-                    if generated.get("accepted"):
-                        candidate = self.db.one("SELECT * FROM tasks WHERE id=?", (generated["accepted"][0],))
-                        break
-            if not candidate:
-                raise RuntimeError("连续生成 3 次仍没有通过准入的困难或地狱新题")
+                self._schedule_refill_once()
+                self.db.execute(
+                    "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
+                    ("原 Pair 已废弃；题库暂无合格题，正在按 7:7:10 准备补位题目",
+                     now_iso(), retired_pair_id),
+                )
+                self.db.audit("pair.task_replacement_waiting_for_mix", "pair", retired_pair_id, {
+                    "priority": self._task_mix_priority(), "rule": "7:7:10",
+                })
+                return {"retiredPairId": retired_pair_id, "replacementPairId": "",
+                        "replacementTaskId": "", "outcome": "awaiting_mix_refill"}
             try:
                 replacement = self.create_pair(candidate["id"])
             except ValueError as exc:
@@ -2923,7 +3055,7 @@ class PairwiseService:
                 stamp = now_iso()
                 self.db.execute(
                     "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
-                    ("开发连续 3 次失败；并发空位已由自动补位使用，无需重复创建替换 Pair", stamp, retired_pair_id),
+                    ("原 Pair 已废弃；并发空位已由自动补位使用，无需重复创建替换 Pair", stamp, retired_pair_id),
                 )
                 self.db.execute(
                     """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
@@ -2940,7 +3072,7 @@ class PairwiseService:
             self.start_pair(replacement_id)
             self.db.execute(
                 "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
-                ("开发连续 3 次失败，已自动换题为 %s" % replacement_id, now_iso(), retired_pair_id),
+                ("原 Pair 已废弃，已按 7:7:10 自动换题为 %s" % replacement_id, now_iso(), retired_pair_id),
             )
             self.db.execute(
                 """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
@@ -3082,7 +3214,35 @@ class PairwiseService:
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
             if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 40)) * 60 and not has_code:
-                retried = self._handle_attempt_failure(pair_id, arm, prompt, "首轮超时且无代码产出")
+                signature = str(state.get("activity_signature") or "")
+                attempt = max(1, int(arm.get("attempt_no") or 1))
+                previous = self.db.one(
+                    """SELECT detail_json FROM audit_events
+                       WHERE event_type='claude.no_code_timeout_signature' AND entity_id=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (arm_id,),
+                ) or {}
+                try:
+                    previous_detail = json.loads(previous.get("detail_json") or "{}")
+                except ValueError:
+                    previous_detail = {}
+                repeated = bool(
+                    signature and attempt >= 2
+                    and int(previous_detail.get("attempt") or 0) == attempt - 1
+                    and previous_detail.get("signature") == signature
+                )
+                self.db.audit("claude.no_code_timeout_signature", "arm_run", arm_id, {
+                    "attempt": attempt, "signature": signature,
+                    "summary": list(state.get("activity_summary") or [])[:12],
+                    "matches_previous_attempt": repeated,
+                })
+                reason = (
+                    "同一侧连续 2 次出现完全相同的无代码轨迹特征"
+                    if repeated else "首轮超时且无代码产出"
+                )
+                retried = self._handle_attempt_failure(
+                    pair_id, arm, prompt, reason, early_replace=repeated,
+                )
                 if retried.get("status") == "failed":
                     return retried
                 started = time.monotonic()
@@ -3221,12 +3381,13 @@ class PairwiseService:
             commit_sha = str(arm.get("commit_sha") or "")
             if not commit_sha:
                 continue
-            passed = self.db.one(
+            terminal = self.db.one(
                 """SELECT id FROM artifact_checks
-                   WHERE pair_id=? AND arm=? AND commit_sha=? AND status='passed'""",
+                   WHERE pair_id=? AND arm=? AND commit_sha=?
+                     AND status IN ('passed','observed_failed')""",
                 (pair_id, arm["arm"], commit_sha),
             )
-            if passed:
+            if terminal:
                 continue
             retry_key = self._artifact_retry_key(pair_id, str(arm["arm"]))
             if time.monotonic() < self._artifact_retry_after.get(retry_key, 0.0):
@@ -3262,14 +3423,18 @@ class PairwiseService:
         for arm in selected:
             current = self.db.one(
                 """SELECT * FROM artifact_checks
-                   WHERE pair_id=? AND arm=? AND commit_sha=? AND status='passed'""",
+                   WHERE pair_id=? AND arm=? AND commit_sha=?
+                     AND status IN ('passed','observed_failed')""",
                 (pair_id, arm["arm"], arm["commit_sha"]),
             )
             reused_by_arm[str(arm["arm"])] = bool(current)
             results.append(current or self.artifacts.validate(
                 pair_id, arm["arm"], Path(arm["workspace_path"]), arm["commit_sha"],
             ))
-        failed = [item for item in results if item.get("status") != "passed"]
+        failed = [
+            item for item in results
+            if item.get("status") not in ("passed", "observed_failed")
+        ]
         if failed:
             environment_failures = [item for item in failed if self._artifact_environment_failure(item)]
             product_failures = [item for item in failed if item not in environment_failures]
@@ -3290,55 +3455,40 @@ class PairwiseService:
                     "arms": names, "preserved_commits": True, "retry_after_seconds": 30,
                 })
                 return {"pairId": pair_id, "checks": results, "reused": names, "retryScheduled": True}
-            task = self.db.one(
-                """SELECT t.prompt FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
-                (pair_id,),
-            ) or {}
-            prompt = str(task.get("prompt") or "")
-            by_arm = {arm["arm"]: arm for arm in selected}
             names = [str(item.get("arm") or "") for item in product_failures]
-            self.db.execute(
-                """UPDATE pairs SET status='running',stage='development',error=?,updated_at=? WHERE id=?""",
-                ("Docker 产物验收未通过，正在从失败侧已交付提交用新会话返工：" + "、".join(names), now_iso(), pair_id),
-            )
             for item in product_failures:
-                arm = by_arm.get(str(item.get("arm") or ""))
-                if arm:
-                    self.db.execute(
-                        "UPDATE arm_runs SET status='waiting_retry',error=?,updated_at=? WHERE id=?",
-                        ("Docker 产物验收失败，等待从该侧已交付提交返工", now_iso(), arm["id"]),
-                    )
-            restarted = []
-            for item in product_failures:
-                arm_name = str(item.get("arm") or "")
-                arm = by_arm.get(arm_name)
-                if not arm:
-                    continue
-                reason = "Docker 产物验收失败：" + str(item.get("error") or "未通过清洁 Compose 验收")
-                current = self._restart_arm_from_delivered_commit(pair_id, arm, prompt, reason)
-                pair = self._pair(pair_id)
-                if pair.get("stage") in ("task_replacement", "replaced", "replacement_failed"):
-                    return {"pairId": pair_id, "checks": results, "restarted": restarted, "retired": True}
-                if current.get("status") != "failed":
-                    restarted.append(arm_name)
-                    self._submit_monitor(
-                        "monitor-" + current["id"], self._monitor_arm,
-                        pair_id, current["id"], prompt,
-                    )
-            self.db.audit("artifact.failed_arms_restarted", "pair", pair_id, {
-                "arms": restarted, "rule": "fresh_session_from_delivered_commit",
+                self.db.execute(
+                    "UPDATE artifact_checks SET status='observed_failed',updated_at=? WHERE id=?",
+                    (now_iso(), item["id"]),
+                )
+                item["status"] = "observed_failed"
+            self.db.audit("artifact.final_failure_preserved", "pair", pair_id, {
+                "arms": names,
+                "rule": "preserve_original_delivery_and_describe_failure_in_gsb",
+                "claude_repair_started": False,
             })
-            return {"pairId": pair_id, "checks": results, "restarted": restarted}
+            if environment_failures:
+                environment_names = [str(item.get("arm") or "") for item in environment_failures]
+                self.db.execute(
+                    "UPDATE pairs SET status='running',stage='artifact_validation',error=?,updated_at=? WHERE id=?",
+                    ("Docker 验收环境冲突将在 30 秒后重验：" + "、".join(environment_names),
+                     now_iso(), pair_id),
+                )
+                return {"pairId": pair_id, "checks": results, "preserved": names,
+                        "reused": environment_names, "retryScheduled": True}
+        result_by_arm = {str(item.get("arm") or ""): item for item in results}
         for arm in selected:
             self._artifact_retry_after.pop(
                 self._artifact_retry_key(pair_id, str(arm["arm"])), None,
             )
-            self.db.audit("artifact.arm_passed", "arm_run", arm["id"], {
-                "pair_id": pair_id, "arm": arm["arm"], "commit_sha": arm["commit_sha"],
-                "reused": reused_by_arm.get(str(arm["arm"]), False),
-            })
+            if (result_by_arm.get(str(arm["arm"])) or {}).get("status") == "passed":
+                self.db.audit("artifact.arm_passed", "arm_run", arm["id"], {
+                    "pair_id": pair_id, "arm": arm["arm"], "commit_sha": arm["commit_sha"],
+                    "reused": reused_by_arm.get(str(arm["arm"]), False),
+                })
         current_arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
         passed_count = 0
+        observed_failed = []
         for arm in current_arms:
             if arm["status"] != "completed":
                 continue
@@ -3348,7 +3498,27 @@ class PairwiseService:
                 (pair_id, arm["arm"], arm["commit_sha"]),
             ):
                 passed_count += 1
-        if len(current_arms) == 2 and all(arm["status"] == "completed" for arm in current_arms) and passed_count == 2:
+            elif self.db.one(
+                """SELECT id FROM artifact_checks WHERE pair_id=? AND arm=?
+                   AND commit_sha=? AND status='observed_failed'""",
+                (pair_id, arm["arm"], arm["commit_sha"]),
+            ):
+                observed_failed.append(str(arm["arm"]))
+        all_completed = len(current_arms) == 2 and all(
+            arm["status"] == "completed" for arm in current_arms
+        )
+        if all_completed and passed_count + len(observed_failed) == 2 and observed_failed:
+            self.db.execute(
+                "UPDATE pairs SET status='running',stage='gsb_ready',error=?,updated_at=? WHERE id=?",
+                ("Claude 原始交付 Docker 验收失败，保留当前提交并直接生成 GSB：" + "、".join(observed_failed),
+                 now_iso(), pair_id),
+            )
+            self.db.audit("artifact.pair_failure_ready_for_gsb", "pair", pair_id, {
+                "failed_arms": observed_failed, "recording_required": False,
+                "difficulty_review_required": False,
+            })
+            return {"pairId": pair_id, "checks": results, "preserved": observed_failed}
+        if all_completed and passed_count == 2:
             self.db.execute(
                 "UPDATE pairs SET status='running',stage='difficulty_review',error='',updated_at=? WHERE id=?",
                 (now_iso(), pair_id),
@@ -3362,9 +3532,6 @@ class PairwiseService:
                 pair_id,
             )
         else:
-            all_completed = len(current_arms) == 2 and all(
-                arm["status"] == "completed" for arm in current_arms
-            )
             self.db.execute(
                 "UPDATE pairs SET status='running',stage=?,error='',updated_at=? WHERE id=?",
                 ("artifact_validation" if all_completed else "development", now_iso(), pair_id),
