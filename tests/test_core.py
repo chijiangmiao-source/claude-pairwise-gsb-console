@@ -355,6 +355,40 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(delivery["status"], "discarded")
         self.assertIn("低于困难/地狱", delivery["error"])
 
+    def test_actual_difficulty_review_accepts_medium_bugfix(self):
+        pair = self._prepare_pair_for_difficulty_review()
+        self.db.execute("UPDATE tasks SET task_type='bugfix' WHERE id='task-1'")
+        result = {
+            "aDifficulty": "中等", "bDifficulty": "中等", "difficulty": "中等",
+            "reason": "真实缺陷需要理解跨模块数据流并修正边界处理，但不涉及架构重设计。",
+            "evidence": ["两次清洁环境已复现", "Docker 验收覆盖原始缺陷路径"],
+        }
+        with patch.object(self.service.codex, "run", return_value=result):
+            review = self.service.reassess_actual_difficulty(pair["id"])
+        self.assertEqual(review["status"], "passed")
+        self.assertEqual(review["assessed_difficulty"], "中等")
+        self.assertEqual(
+            self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
+            {"status": "running", "stage": "recording"},
+        )
+        self.assertEqual(self.db.one("SELECT difficulty FROM tasks WHERE id='task-1'")["difficulty"], "中等")
+
+    def test_evidence_filter_finds_any_manual_rerecord_attempt(self):
+        pair = self._prepare_pair_for_difficulty_review()
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO recording_attempts(
+                 id,pair_id,arm,commit_sha,path,interaction_mode,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'manual','passed',?,?)""",
+            ("manual-rerecord", pair["id"], "A", "a" * 40, str(self.root / "manual.mp4"), stamp, stamp),
+        )
+        handler = Handler.__new__(Handler)
+        handler.server = MagicMock(db=self.db)
+        manual = handler._evidence_page({"manual_rerecorded": ["yes"], "page": ["1"], "size": ["20"]})
+        automatic = handler._evidence_page({"manual_rerecorded": ["no"], "page": ["1"], "size": ["20"]})
+        self.assertEqual([(row["arm"], row["manual_rerecorded"]) for row in manual["items"]], [("A", 1)])
+        self.assertEqual([(row["arm"], row["manual_rerecorded"]) for row in automatic["items"]], [("B", 0)])
+
     def test_full_monitor_capacity_does_not_starve_user_operations(self):
         release = threading.Event()
         started = threading.Event()

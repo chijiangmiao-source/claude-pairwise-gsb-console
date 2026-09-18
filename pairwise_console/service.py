@@ -50,6 +50,11 @@ GSB_STEP_REFERENCE = re.compile(
     r"(?:\s*[、，,及和与]\s*[一二三四五六七八九十百千万零〇\d]+)*\s*步"
 )
 TASK_MIX_TYPES = ("zero_to_one", "feature", "bugfix")
+ELIGIBLE_TASK_SQL = "(difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"
+
+
+def task_difficulty_allowed(task_type: str, difficulty: str) -> bool:
+    return difficulty in (("中等", "困难", "地狱") if task_type == "bugfix" else ("困难", "地狱"))
 
 
 class PairwiseService:
@@ -342,7 +347,7 @@ class PairwiseService:
             "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
         ) or {"count": 0})["count"])
         ready = int((self.db.one(
-            "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')"
+            "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND " + ELIGIBLE_TASK_SQL
         ) or {"count": 0})["count"])
         generating = int((self.db.one(
             "SELECT COUNT(*) count FROM generation_batches WHERE status='running'"
@@ -673,7 +678,7 @@ class PairwiseService:
         if include_ready:
             for row in self.db.all(
                 """SELECT task_type,COUNT(*) count FROM tasks
-                   WHERE status='ready' AND difficulty IN ('困难','地狱')
+                   WHERE status='ready' AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
                      AND created_at>=?
                    GROUP BY task_type""",
                 (started_at,),
@@ -698,7 +703,8 @@ class PairwiseService:
     def _next_ready_task(self) -> Optional[Dict[str, Any]]:
         for task_type in self._task_mix_priority():
             task = self.db.one(
-                """SELECT * FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')
+                """SELECT * FROM tasks WHERE status='ready'
+                   AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
                    AND task_type=? ORDER BY created_at,id LIMIT 1""",
                 (task_type,),
             )
@@ -762,7 +768,7 @@ class PairwiseService:
         raise ValueError("未知任务类型：" + task_type)
 
     def _schedule_refill_once(self) -> None:
-        ready = (self.db.one("SELECT COUNT(*) count FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')") or {"count": 0})["count"]
+        ready = (self.db.one("SELECT COUNT(*) count FROM tasks WHERE status='ready' AND " + ELIGIBLE_TASK_SQL) or {"count": 0})["count"]
         minimum = int(self.db.setting("task_pool_min_ready", 6))
         target = int(self.db.setting("task_pool_target_ready", 12))
         with self._future_lock:
@@ -773,7 +779,8 @@ class PairwiseService:
             row["task_type"]: int(row.get("count") or 0)
             for row in self.db.all(
                 """SELECT task_type,COUNT(*) count FROM tasks
-                   WHERE status='ready' AND difficulty IN ('困难','地狱') GROUP BY task_type"""
+                   WHERE status='ready' AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
+                   GROUP BY task_type"""
             )
         }
         priority = self._task_mix_priority(include_ready=True)
@@ -785,7 +792,9 @@ class PairwiseService:
             return
         needed = max(0, target - ready)
         candidates = self.db.all(
-            "SELECT id FROM tasks WHERE status='candidate' AND difficulty IN ('困难','地狱') ORDER BY created_at LIMIT ?",
+            """SELECT id FROM tasks WHERE status='candidate'
+               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
+               ORDER BY created_at LIMIT ?""",
             (min(capacity, needed),),
         )
         for row in candidates:
@@ -868,7 +877,11 @@ class PairwiseService:
             "task_validation", prompt, VALIDATION_SCHEMA,
             cwd=cwd if cwd.is_dir() else None, task_id=task_id,
         )
-        accepted = bool(result["accepted"] and not result["banned"] and not result["duplicate"] and result["baselineReady"] and result["difficulty"] in ("困难", "地狱"))
+        accepted = bool(
+            result["accepted"] and not result["banned"] and not result["duplicate"]
+            and result["baselineReady"]
+            and task_difficulty_allowed(str(task.get("task_type") or ""), str(result["difficulty"]))
+        )
         status = "ready" if accepted else "rejected"
         reason = "" if accepted else str(result.get("reason") or "未通过题目准入")
         self.db.execute(
@@ -1014,8 +1027,8 @@ class PairwiseService:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
         if not task:
             raise KeyError("任务不存在")
-        if task["status"] != "ready" or task["difficulty"] not in ("困难", "地狱"):
-            raise ValueError("只有已通过准入的困难或地狱任务才能创建 Pair")
+        if task["status"] != "ready" or not task_difficulty_allowed(task["task_type"], task["difficulty"]):
+            raise ValueError("0–1/Feature 仅允许困难或地狱；Bug 修复允许中等、困难或地狱")
         active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')") or {"count": 0})["count"]
         configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
@@ -1193,7 +1206,7 @@ class PairwiseService:
         for candidate in result["candidates"]:
             candidate_id = "bug-" + uuid.uuid4().hex[:16]
             difficulty = candidate["difficulty"]
-            status = "awaiting_reproduction" if difficulty in ("困难", "地狱") else "difficulty_rejected"
+            status = "awaiting_reproduction" if difficulty in ("中等", "困难", "地狱") else "difficulty_rejected"
             stamp = now_iso()
             self.db.execute(
                 """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
@@ -1220,7 +1233,7 @@ class PairwiseService:
         if not candidate:
             raise KeyError("Bug 候选不存在")
         if candidate["status"] == "difficulty_rejected":
-            raise ValueError("简单或中等 Bug 只保留记录，不能进入复现与 Pair")
+            raise ValueError("简单 Bug 只保留记录，不能进入复现与 Pair")
         arm = self.db.one(
             "SELECT * FROM arm_runs WHERE pair_id=? AND arm=? AND commit_sha=?",
             (candidate["source_pair_id"], candidate["source_arm"], candidate["source_sha"]),
@@ -1289,8 +1302,8 @@ class PairwiseService:
         candidate = self.db.one("SELECT * FROM bug_candidates WHERE id=?", (candidate_id,))
         if not candidate:
             raise KeyError("Bug 候选不存在")
-        if candidate["status"] != "reproduced" or candidate["reproduce_count"] < 2 or candidate["difficulty"] not in ("困难", "地狱"):
-            raise ValueError("只有双次复现且难度为困难或地狱的 Bug 才能创建任务")
+        if candidate["status"] != "reproduced" or candidate["reproduce_count"] < 2 or candidate["difficulty"] not in ("中等", "困难", "地狱"):
+            raise ValueError("只有双次复现且难度至少为中等的 Bug 才能创建任务")
         arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (candidate["source_pair_id"], candidate["source_arm"])) or {}
         source_task = self.db.one(
             """SELECT t.* FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
@@ -1454,6 +1467,7 @@ class PairwiseService:
             str(task.get("prompt") or ""), original,
             json.dumps(a_evidence, ensure_ascii=False),
             json.dumps(b_evidence, ensure_ascii=False),
+            str(task.get("task_type") or "zero_to_one"),
         )
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
         cwd = Path(str(repo.get("local_root") or arm_by_name["A"].get("workspace_path") or self.config.data_dir))
@@ -1474,7 +1488,7 @@ class PairwiseService:
             )
             raise
         assessed = str(result.get("difficulty") or "")
-        accepted = assessed in ("困难", "地狱")
+        accepted = task_difficulty_allowed(str(task.get("task_type") or ""), assessed)
         status = "passed" if accepted else "rejected"
         reason = str(result.get("reason") or "").strip()[:800]
         evidence = [str(value)[:300] for value in list(result.get("evidence") or [])[:10]]
@@ -1496,8 +1510,9 @@ class PairwiseService:
                     (stamp, pair_id),
                 )
             else:
-                message = "实际难度复评为%s，低于困难/地狱准入线，已停止当前 Pair 并等待自动补位：%s" % (
-                    assessed or "未知", reason,
+                threshold = "中等" if task.get("task_type") == "bugfix" else "困难/地狱"
+                message = "实际难度复评为%s，低于%s准入线，已停止当前 Pair 并等待自动补位：%s" % (
+                    assessed or "未知", threshold, reason,
                 )
                 conn.execute(
                     "UPDATE pairs SET status='failed',stage='difficulty_rejected',error=?,updated_at=? WHERE id=?",
@@ -2178,8 +2193,8 @@ class PairwiseService:
         if not task_type:
             issues.append("任务类型无法映射到本期 GSB 表单")
         difficulty = str(task.get("difficulty") or "")
-        if difficulty not in ("困难", "地狱"):
-            issues.append("本期只允许提交困难或地狱题目")
+        if not task_difficulty_allowed(str(task.get("task_type") or ""), difficulty):
+            issues.append("0–1/Feature 只允许困难或地狱；Bug 修复允许中等、困难或地狱")
         prompt = str(task.get("prompt") or "")
         if not prompt:
             issues.append("缺少完整 User Prompt")
@@ -2537,7 +2552,8 @@ class PairwiseService:
         task_type = str(old_task.get("task_type") or "zero_to_one")
         try:
             candidate = self.db.one(
-                """SELECT * FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')
+                """SELECT * FROM tasks WHERE status='ready'
+                   AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
                    ORDER BY CASE WHEN task_type=? THEN 0 ELSE 1 END,created_at LIMIT 1""",
                 (task_type,),
             )

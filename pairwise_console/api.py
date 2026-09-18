@@ -447,6 +447,13 @@ class Handler(BaseHTTPRequestHandler):
             value = self._query(query, key)
             if value:
                 clauses.append(column + "=?"); params.append(value)
+        manual_rerecorded = self._query(query, "manual_rerecorded")
+        manual_attempt = """EXISTS(SELECT 1 FROM recording_attempts manual
+          WHERE manual.pair_id=a.pair_id AND manual.arm=a.arm AND manual.interaction_mode='manual')"""
+        if manual_rerecorded == "yes":
+            clauses.append(manual_attempt)
+        elif manual_rerecorded == "no":
+            clauses.append("NOT " + manual_attempt)
         if self._query(query, "missing") == "1":
             clauses.append("(c.status IS NULL OR c.status<>'passed' OR r.status IS NULL OR r.status<>'passed' OR r.commit_match<>1)")
         select = """SELECT p.id pair_id,p.chain_id project_number,p.status pair_status,p.stage pair_stage,p.error pair_error,
@@ -459,6 +466,7 @@ class Handler(BaseHTTPRequestHandler):
           r.commit_match,r.review_status,r.reviewed_by,r.reviewed_at,r.error recording_error,r.capture_mode,r.entry_url,r.updated_at,
           latest.id latest_attempt_id,latest.status latest_attempt_status,latest.interaction_mode latest_interaction_mode,latest.error latest_attempt_error,
           latest.entry_url latest_attempt_url,latest.created_at latest_attempt_at,
+          CASE WHEN %s THEN 1 ELSE 0 END manual_rerecorded,
           COALESCE(d.status,'not_submitted') submission_status,d.remote_id,d.remote_status"""
         from_sql = """FROM arm_runs a JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
           LEFT JOIN artifact_checks c ON c.pair_id=a.pair_id AND c.arm=a.arm AND c.commit_sha=a.commit_sha
@@ -467,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
             WHERE x.pair_id=a.pair_id AND x.arm=a.arm ORDER BY x.created_at DESC LIMIT 1)
           LEFT JOIN difficulty_reviews dr ON dr.pair_id=p.id
           LEFT JOIN delivery_submissions d ON d.pair_id=p.id"""
-        return self._joined_page(select, from_sql, clauses, params, "p.updated_at DESC,p.id,a.arm", query)
+        return self._joined_page(select % manual_attempt, from_sql, clauses, params, "p.updated_at DESC,p.id,a.arm", query)
 
     def _reviews_page(self, query: Dict[str, list]) -> Dict[str, Any]:
         clauses, params = [], []
