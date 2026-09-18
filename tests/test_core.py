@@ -2832,6 +2832,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id=?", (task["id"],))["status"], "rejected")
         self.assertEqual(self.db.one("SELECT status FROM bug_candidates WHERE id='bug-1'")["status"], "reproduced")
 
+        with patch.object(self.service.codex, "run", return_value={
+            "prompt": natural_prompt,
+            "evidenceUsed": ["preconditions", "steps", "actual", "expected"],
+        }):
+            regenerated = self.service.convert_bug_to_task("bug-1")
+        self.assertEqual(regenerated["id"], task["id"])
+        self.assertEqual(regenerated["status"], "ready")
+        self.assertEqual(regenerated["prompt"], natural_prompt)
+
     def test_arm_delivery_is_squashed_to_one_commit_on_baseline(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

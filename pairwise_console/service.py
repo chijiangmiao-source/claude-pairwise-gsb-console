@@ -1377,7 +1377,13 @@ class PairwiseService:
                 "title", "preconditions", "actual", "expected",
             )),
         }
-        existing = self._task_duplicate_context(seed)
+        prior_task = self.db.one(
+            """SELECT id FROM tasks WHERE source='bug_discovery' AND source_id=?
+                 ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (candidate["id"],),
+        ) or {}
+        exclude_task_id = str(prior_task.get("id") or "")
+        existing = self._task_duplicate_context(seed, exclude_task_id=exclude_task_id)
         previous = ""
         correction = ""
         duplicate = ""
@@ -1401,7 +1407,7 @@ class PairwiseService:
             duplicate = self._deterministic_task_duplicate({
                 "source": "bug_discovery", "task_type": "bugfix",
                 "title": candidate.get("title"), "prompt": prompt,
-            })
+            }, exclude_task_id=exclude_task_id)
             if duplicate:
                 issues.append(duplicate)
             if not issues:
@@ -1987,10 +1993,15 @@ class PairwiseService:
             (candidate["source_pair_id"],),
         ) or {}
         prompt = self._generate_bugfix_task_prompt(candidate, arm, source_task)
+        prior_task = self.db.one(
+            """SELECT t.id,t.status,EXISTS(SELECT 1 FROM pairs p WHERE p.task_id=t.id) has_pair
+                 FROM tasks t WHERE t.source='bug_discovery' AND t.source_id=?
+                 ORDER BY created_at DESC,id DESC LIMIT 1""", (candidate_id,),
+        ) or {}
         duplicate = self._deterministic_task_duplicate({
             "source": "bug_discovery", "task_type": "bugfix",
             "title": candidate["title"], "prompt": prompt,
-        })
+        }, exclude_task_id=str(prior_task.get("id") or ""))
         if duplicate:
             stamp = now_iso()
             self.db.execute(
@@ -2004,17 +2015,30 @@ class PairwiseService:
         task_id = "task-" + uuid.uuid4().hex[:16]
         key = fingerprint("bugfix", prompt, candidate["source_sha"])
         stamp = now_iso()
-        self.db.execute(
-            """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,difficulty,difficulty_evidence_json,
-               baseline_path,baseline_sha,parent_pair_id,fingerprint,status,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (task_id, "bug_discovery", candidate_id, "bugfix", candidate["title"], prompt,
-             normalize_stack(source_task.get("stack")),
-             normalize_project_category(source_task.get("project_category"), source_task.get("stack"), source_task.get("prompt")),
-             candidate["difficulty"],
-             candidate["difficulty_evidence_json"], arm.get("workspace_path", ""), candidate["source_sha"],
-             candidate["source_pair_id"], key, "ready", stamp, stamp),
+        stack = normalize_stack(source_task.get("stack"))
+        category = normalize_project_category(
+            source_task.get("project_category"), source_task.get("stack"), source_task.get("prompt"),
         )
+        if prior_task.get("status") == "rejected" and not prior_task.get("has_pair"):
+            task_id = str(prior_task["id"])
+            self.db.execute(
+                """UPDATE tasks SET title=?,prompt=?,stack=?,project_category=?,difficulty=?,
+                   difficulty_evidence_json=?,baseline_path=?,baseline_sha=?,parent_pair_id=?,fingerprint=?,
+                   status='ready',rejection_reason='',used_at=NULL,updated_at=? WHERE id=?""",
+                (candidate["title"], prompt, stack, category, candidate["difficulty"],
+                 candidate["difficulty_evidence_json"], arm.get("workspace_path", ""), candidate["source_sha"],
+                 candidate["source_pair_id"], key, stamp, task_id),
+            )
+        else:
+            self.db.execute(
+                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,difficulty,difficulty_evidence_json,
+                   baseline_path,baseline_sha,parent_pair_id,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (task_id, "bug_discovery", candidate_id, "bugfix", candidate["title"], prompt,
+                 stack, category, candidate["difficulty"], candidate["difficulty_evidence_json"],
+                 arm.get("workspace_path", ""), candidate["source_sha"], candidate["source_pair_id"],
+                 key, "ready", stamp, stamp),
+            )
         self.db.execute("UPDATE bug_candidates SET status='converted',updated_at=? WHERE id=?", (stamp, candidate_id))
         self.db.audit("bug.converted_to_task", "bug_candidate", candidate_id, {"task_id": task_id})
         return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
