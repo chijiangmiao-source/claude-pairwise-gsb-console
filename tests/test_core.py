@@ -2825,6 +2825,12 @@ class CoreTests(unittest.TestCase):
         self.assertIn("both updates persist", task["prompt"])
         self.assertEqual(generated.call_count, 2)
         self.assertIn("上一次草稿存在的问题", generated.call_args.args[1])
+        self.assertFalse(self.service._retire_outdated_ready_bug_task(task))
+
+        self.db.execute("UPDATE tasks SET prompt=? WHERE id=?", (old_template, task["id"]))
+        self.assertEqual(self.service._retire_outdated_ready_bug_tasks(), 1)
+        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id=?", (task["id"],))["status"], "rejected")
+        self.assertEqual(self.db.one("SELECT status FROM bug_candidates WHERE id='bug-1'")["status"], "reproduced")
 
     def test_arm_delivery_is_squashed_to_one_commit_on_baseline(self):
         self.insert_ready_task()

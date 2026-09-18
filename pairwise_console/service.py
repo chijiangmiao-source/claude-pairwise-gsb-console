@@ -105,6 +105,7 @@ class PairwiseService:
         self._auto_retry_after: Dict[str, float] = {}
         self._artifact_retry_after: Dict[str, float] = {}
         self._seed_settings()
+        self._retire_outdated_ready_bug_tasks()
         self._quarantine_invalid_completed_pairs()
         self._queue_invalid_delivery_lineage_pairs()
         self._restore_false_completed_tasks()
@@ -923,6 +924,40 @@ class PairwiseService:
             ),
         )
 
+    def _retire_outdated_ready_bug_task(self, task: Dict[str, Any]) -> bool:
+        if task.get("source") != "bug_discovery" or task.get("task_type") != "bugfix":
+            return False
+        issues = self._bugfix_prompt_issues(str(task.get("prompt") or ""))
+        if not issues:
+            return False
+        stamp = now_iso()
+        reason = "旧版 Bug 题面已停用，需按原始复现证据重新生成：" + "；".join(issues)
+        with self.db.transaction() as conn:
+            changed = conn.execute(
+                "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=? AND status='ready'",
+                (reason[-2000:], stamp, task["id"]),
+            ).rowcount
+            if not changed:
+                return False
+            conn.execute(
+                """UPDATE bug_candidates SET status='reproduced',error='',updated_at=?
+                     WHERE id=? AND status='converted' AND reproduce_count>=2""",
+                (stamp, task.get("source_id") or ""),
+            )
+        self.db.audit("bug.outdated_prompt_retired", "task", task["id"], {
+            "candidate_id": task.get("source_id") or "", "reason": reason,
+        })
+        return True
+
+    def _retire_outdated_ready_bug_tasks(self) -> int:
+        retired = 0
+        for task in self.db.all(
+            """SELECT * FROM tasks WHERE source='bug_discovery'
+                 AND task_type='bugfix' AND status='ready'"""
+        ):
+            retired += int(self._retire_outdated_ready_bug_task(task))
+        return retired
+
     def _next_ready_task(self) -> Optional[Dict[str, Any]]:
         for task_type in self._task_mix_priority():
             tasks = self.db.all(
@@ -933,6 +968,8 @@ class PairwiseService:
                 (task_type,),
             )
             for task in tasks:
+                if self._retire_outdated_ready_bug_task(task):
+                    continue
                 if task_type == "feature" and self._feature_project_rank(task) > MAX_FEATURE_TASKS_PER_PROJECT:
                     reason = "同一基线项目最多保留 3 个 Feature 迭代，超出额度后应重新创建 0–1 项目"
                     self.db.execute(
