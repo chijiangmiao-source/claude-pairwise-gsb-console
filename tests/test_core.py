@@ -746,6 +746,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(active["interaction_mode"], "manual")
         self.assertEqual(active["title"], "hard-project")
 
+    def test_colloquial_api_route_starts_preview_operation(self):
+        handler = Handler.__new__(Handler)
+        service = MagicMock()
+        service.colloquialize_gsb_async.return_value = "gsb-colloquial-test"
+        handler.server = MagicMock(service=service)
+        handler._path_query = MagicMock(return_value=("/api/pairs/pair-test/gsb/colloquialize", {}))
+        source = {"verdict": "Same", "aReason": "A reason long enough for preview", "bReason": "B reason long enough for preview"}
+        handler._body = MagicMock(return_value=source)
+        handler._json = MagicMock()
+
+        handler.do_POST()
+
+        service.colloquialize_gsb_async.assert_called_once_with("pair-test", source)
+        handler._json.assert_called_once_with(202, {"operationId": "gsb-colloquial-test"})
+
     def test_full_monitor_capacity_does_not_starve_user_operations(self):
         release = threading.Event()
         started = threading.Event()
@@ -1112,6 +1127,37 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(review["a_reason"], payload["suggestedAReason"])
         self.assertEqual(review["b_reason"], payload["suggestedBReason"])
         self.assertEqual(review["status"], "confirmed")
+
+    def test_colloquial_preview_does_not_persist_until_human_confirmation(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        original_a = "A 在 merge.py 修好了保存问题，接口测试通过，不过浏览器流程没有执行。"
+        original_b = "B 在 rebase.ts 完成了页面流程，Docker 验收通过，但新增测试是否运行无法确认。"
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,a_reason,b_reason,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'confirmed',?,?)""",
+            ("gsb-colloquial-source", pair["id"], "Same",
+             self.service._compose_gsb_reason(original_a, original_b),
+             original_a, original_b, stamp, stamp),
+        )
+        rewritten = {
+            "verdict": "Same",
+            "aReason": "A 在 merge.py 把保存问题修好了，接口也实际测过，不过浏览器流程还没跑。",
+            "bReason": "B 在 rebase.ts 把页面流程接好了，Docker 验收通过，不过还不能确认新增测试是否运行。",
+        }
+        with patch("pairwise_console.service.rewrite_preview", return_value=rewritten):
+            operation = self.service.colloquialize_gsb_async(pair["id"], {
+                "verdict": "Same", "aReason": original_a, "bReason": original_b,
+            })
+            for _ in range(50):
+                result = self.service.operation(operation)
+                if result["status"] != "running":
+                    break
+                time.sleep(0.01)
+        self.assertEqual(result, {"id": operation, "status": "completed", "result": rewritten})
+        stored = self.db.one("SELECT verdict,a_reason,b_reason FROM gsb_reviews WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(stored, {"verdict": "Same", "a_reason": original_a, "b_reason": original_b})
 
     def test_gsb_recheck_cannot_pass_reasons_without_evidence_locators(self):
         self.insert_ready_task()

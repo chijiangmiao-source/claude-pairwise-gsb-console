@@ -388,8 +388,72 @@ async function reviewGsb(id) {
     const data = await api(`/api/pairs/${id}`), gsb = data.gsb; if (!gsb) throw new Error("尚未生成 GSB 草稿");
     const latest = data.gsb_rechecks?.[0], arms = Object.fromEntries(data.arms.map((item) => [item.arm, item])), recs = Object.fromEntries(data.recordings.map((item) => [item.arm, item])), issues = parseJson(latest?.issues_json, []);
     const legacy = !gsb.a_reason && !gsb.b_reason ? (gsb.reason || "") : "";
-    showDialog(`<h2>复核与人工确认</h2><p>${esc(data.task.title)}</p>${pairIdentity(data.id)}<div class="ab-review-grid"><div class="review-side"><b>A</b><small>提交 ${esc((arms.A?.commit_sha || "").slice(0, 12))}</small><small>Session ${esc(arms.A?.session_id || "缺失")}</small>${recs.A?.id ? `<button type="button" class="tiny" onclick="playRecording('${recs.A.id}','A','${esc(data.task.title)}','${data.id}')">播放 A</button>` : ""}</div><div class="review-side"><b>B</b><small>提交 ${esc((arms.B?.commit_sha || "").slice(0, 12))}</small><small>Session ${esc(arms.B?.session_id || "缺失")}</small>${recs.B?.id ? `<button type="button" class="tiny" onclick="playRecording('${recs.B.id}','B','${esc(data.task.title)}','${data.id}')">播放 B</button>` : ""}</div></div><div class="choice-row">${["A better", "Same", "B better"].map((value) => `<label class="choice"><input type="radio" name="verdict" value="${value}" ${gsb.verdict === value ? "checked" : ""}>${value}</label>`).join("")}</div><label class="review-field"><b>A 的评价</b><textarea class="review-input" id="gsb-a-reason" maxlength="300">${esc(gsb.a_reason || legacy)}</textarea></label><label class="review-field"><b>B 的评价</b><textarea class="review-input" id="gsb-b-reason" maxlength="300">${esc(gsb.b_reason || legacy)}</textarea></label><p class="sub">只保留 A、B 两段评价，选择依据自然融入两段；禁止反引号和 Markdown。</p>${latest ? `<div class="recheck-result ${esc(latest.result_status)}"><strong>最近复检：${latest.applied_at ? "已应用" : esc(statusLabels[latest.result_status] || latest.result_status)}</strong><small>${esc(latest.model)} · ${esc(latest.reasoning_effort)} · ${date(latest.created_at)}${latest.applied_at ? ` · ${date(latest.applied_at)} 应用` : ""}</small>${issues.map((issue) => `<p>${esc(issue)}</p>`).join("")}<div class="review-text"><p><b>A 建议：</b>${esc(latest.suggested_a_reason || "—")}</p><p><b>B 建议：</b>${esc(latest.suggested_b_reason || "—")}</p></div>${latest.applied_at || latest.result_status === "passed" ? "" : `<button type="button" class="secondary" onclick="applyRecheck('${id}','${latest.id}')">应用复检建议</button>`}</div>` : '<div class="recheck-result"><strong>尚未复检</strong><p>可使用高强度模型检查公开理由与证据是否一致。</p></div>'}<div class="review-actions"><button type="button" class="secondary" onclick="recheckGsb('${id}')">复检公开理由</button><input id="confirmed-by" value="${esc(gsb.confirmed_by || "刘昱")}" placeholder="确认人"><button type="button" class="primary" onclick="confirmGsb('${id}')">确认并完成</button></div>`);
+    showDialog(`<h2>复核与人工确认</h2><p>${esc(data.task.title)}</p>${pairIdentity(data.id)}<div class="ab-review-grid"><div class="review-side"><b>A</b><small>提交 ${esc((arms.A?.commit_sha || "").slice(0, 12))}</small><small>Session ${esc(arms.A?.session_id || "缺失")}</small>${recs.A?.id ? `<button type="button" class="tiny" onclick="playRecording('${recs.A.id}','A','${esc(data.task.title)}','${data.id}')">播放 A</button>` : ""}</div><div class="review-side"><b>B</b><small>提交 ${esc((arms.B?.commit_sha || "").slice(0, 12))}</small><small>Session ${esc(arms.B?.session_id || "缺失")}</small>${recs.B?.id ? `<button type="button" class="tiny" onclick="playRecording('${recs.B.id}','B','${esc(data.task.title)}','${data.id}')">播放 B</button>` : ""}</div></div><div class="choice-row">${["A better", "Same", "B better"].map((value) => `<label class="choice"><input type="radio" name="verdict" value="${value}" ${gsb.verdict === value ? "checked" : ""}>${value}</label>`).join("")}</div><label class="review-field"><b>A 的评价</b><textarea class="review-input" id="gsb-a-reason" maxlength="300">${esc(gsb.a_reason || legacy)}</textarea></label><label class="review-field"><b>B 的评价</b><textarea class="review-input" id="gsb-b-reason" maxlength="300">${esc(gsb.b_reason || legacy)}</textarea></label><p class="sub">只保留 A、B 两段评价，选择依据自然融入两段；禁止反引号和 Markdown。</p><div id="gsb-colloquial" class="recheck-result"><strong>口语化预览</strong><p class="sub">只调整当前文本的表达，不重新判断胜负，也不会自动保存。</p><button type="button" class="secondary" id="gsb-colloquial-start" onclick="colloquializeGsb('${id}')">生成口语化预览</button><div id="gsb-colloquial-preview"></div></div>${latest ? `<div class="recheck-result ${esc(latest.result_status)}"><strong>最近复检：${latest.applied_at ? "已应用" : esc(statusLabels[latest.result_status] || latest.result_status)}</strong><small>${esc(latest.model)} · ${esc(latest.reasoning_effort)} · ${date(latest.created_at)}${latest.applied_at ? ` · ${date(latest.applied_at)} 应用` : ""}</small>${issues.map((issue) => `<p>${esc(issue)}</p>`).join("")}<div class="review-text"><p><b>A 建议：</b>${esc(latest.suggested_a_reason || "—")}</p><p><b>B 建议：</b>${esc(latest.suggested_b_reason || "—")}</p></div>${latest.applied_at || latest.result_status === "passed" ? "" : `<button type="button" class="secondary" onclick="applyRecheck('${id}','${latest.id}')">应用复检建议</button>`}</div>` : '<div class="recheck-result"><strong>尚未复检</strong><p>可使用高强度模型检查公开理由与证据是否一致。</p></div>'}<div class="review-actions"><button type="button" class="secondary" onclick="recheckGsb('${id}')">复检公开理由</button><input id="confirmed-by" value="${esc(gsb.confirmed_by || "刘昱")}" placeholder="确认人"><button type="button" class="primary" onclick="confirmGsb('${id}')">确认并完成</button></div>`);
   } catch (error) { notify(error.message, true); }
+}
+function gsbEditorText() {
+  return {
+    verdict: $('input[name="verdict"]:checked')?.value || "",
+    aReason: $("#gsb-a-reason")?.value || "",
+    bReason: $("#gsb-b-reason")?.value || "",
+  };
+}
+let gsbColloquialState = null;
+function sameGsbEditor(left, right) {
+  return Boolean(left && right && left.verdict === right.verdict
+    && left.aReason === right.aReason && left.bReason === right.bReason);
+}
+async function colloquializeGsb(id) {
+  const panel = $("#gsb-colloquial"), button = $("#gsb-colloquial-start"), preview = $("#gsb-colloquial-preview");
+  if (!panel || !preview) return;
+  const source = gsbEditorText(), token = `${id}-${Date.now()}-${Math.random()}`;
+  panel._requestToken = token;
+  if (button) button.disabled = true;
+  preview.textContent = "正在生成口语化预览…";
+  try {
+    const started = await api(`/api/pairs/${id}/gsb/colloquialize`, {
+      method: "POST", body: JSON.stringify(source),
+    });
+    let rewritten = null;
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      const operation = await api(`/api/operations/${started.operationId}`);
+      if (operation.status === "completed") { rewritten = operation.result; break; }
+      if (operation.status === "failed") throw new Error(operation.error || "口语化失败");
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+    if (!rewritten) throw new Error("口语化仍在运行，请稍后重试");
+    if ($("#gsb-colloquial") !== panel || panel._requestToken !== token) return;
+    gsbColloquialState = { pairId: id, source, preview: rewritten, applied: null };
+    preview.innerHTML = `<div class="review-text"><p><b>A 预览：</b>${esc(rewritten.aReason)}</p><p><b>B 预览：</b>${esc(rewritten.bReason)}</p></div><div class="row-actions"><button type="button" class="primary" onclick="applyGsbColloquial()">应用到编辑框</button><button type="button" class="secondary" onclick="undoGsbColloquial()">撤销应用</button></div>`;
+  } catch (error) {
+    if ($("#gsb-colloquial") === panel && panel._requestToken === token) {
+      preview.textContent = `口语化失败：${error.message}`;
+      notify(error.message, true);
+    }
+  } finally {
+    if ($("#gsb-colloquial") === panel && button) button.disabled = false;
+  }
+}
+function applyGsbColloquial() {
+  const item = gsbColloquialState;
+  if (!item || !sameGsbEditor(gsbEditorText(), item.source)) {
+    return notify("评价或结论已经变化，请重新口语化后再应用", true);
+  }
+  item.applied = { before: gsbEditorText(), after: item.preview };
+  $("#gsb-a-reason").value = item.preview.aReason;
+  $("#gsb-b-reason").value = item.preview.bReason;
+  notify("口语化预览已填入编辑框，确认后才会保存");
+}
+function undoGsbColloquial() {
+  const item = gsbColloquialState;
+  if (!item?.applied) return notify("当前没有已应用的口语化内容", true);
+  if (!sameGsbEditor(gsbEditorText(), item.applied.after)) {
+    return notify("应用后已有手动调整，为避免覆盖修改，不能自动撤销", true);
+  }
+  $("#gsb-a-reason").value = item.applied.before.aReason;
+  $("#gsb-b-reason").value = item.applied.before.bReason;
+  item.applied = null;
+  notify("已撤销口语化应用");
 }
 async function confirmGsb(id) { const verdict = $('input[name="verdict"]:checked')?.value, aReason = $("#gsb-a-reason").value, bReason = $("#gsb-b-reason").value, confirmedBy = $("#confirmed-by").value; try { await api(`/api/pairs/${id}/gsb/confirm`, { method: "POST", body: JSON.stringify({ verdict, aReason, bReason, confirmedBy }) }); $("#dialog").close(); notify("GSB 已人工确认，记录进入待正式提交状态"); render(); } catch (error) { notify(error.message, true); } }
 async function recheckGsb(id) { try { if ($("#dialog")?.open) $("#dialog").close(); const data = await api(`/api/pairs/${id}/gsb/recheck`, { method: "POST", body: "{}" }); state.recheckRunning.add(id); if (state.page === "reviews") await renderReviews(); else if (state.page === "exports") await renderExports(); notify("GSB 高强度复检已启动"); monitorReviewBatch([data.operationId], [id], state.page, () => reviewGsb(id)); } catch (error) { state.recheckRunning.delete(id); notify(error.message, true); } }

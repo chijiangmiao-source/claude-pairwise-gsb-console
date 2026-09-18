@@ -146,6 +146,10 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 operation = self.app.service.recheck_gsb_async(match.group(1))
                 return self._json(202, {"operationId": operation})
+            match = re.fullmatch(r"/api/pairs/([^/]+)/gsb/colloquiali[sz]e", path)
+            if match:
+                operation = self.app.service.colloquialize_gsb_async(match.group(1), body)
+                return self._json(202, {"operationId": operation})
             if path == "/api/gsb-reviews/recheck":
                 pair_ids = self._pair_ids(body)
                 operations = [self.app.service.recheck_gsb_async(pair_id) for pair_id in pair_ids]

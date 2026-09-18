@@ -1,0 +1,55 @@
+import unittest
+from unittest.mock import MagicMock
+
+from pairwise_console.gsb_rewrite import validate_source, rewrite_preview
+from pairwise_console.service import PairwiseService
+
+
+class RewriteTests(unittest.TestCase):
+    def setUp(self):
+        self.source = validate_source(
+            "A better",
+            "A 在 merge.py 增加旧草稿校验，接口测试通过，但浏览器测试没有执行，因此略优。",
+            "B 在 rebase.ts 修好了正常页面流程，容器验收通过，但新增测试是否运行仍无法确认。",
+        )
+        self.result = dict(self.source,
+            aReason="A 在 merge.py 多加了一道旧草稿检查，接口测过了，不过浏览器测试没跑，所以稍好一些。")
+        self.runner = MagicMock()
+        self.runner.run.return_value = self.result
+
+    def rewrite(self):
+        return rewrite_preview(self.runner, self.source, "pair-test", PairwiseService._gsb_locator_issues)
+
+    def test_valid_preview_preserves_verdict_and_source(self):
+        before = dict(self.source)
+        self.assertEqual(self.rewrite(), self.result)
+        self.assertEqual(self.source, before)
+        prompt = self.runner.run.call_args.args[1]
+        self.assertIn("没有证据", prompt)
+        self.assertIn(self.source['bReason'], prompt)
+
+    def test_rejects_changed_verdict(self):
+        self.runner.run.return_value = dict(self.result, verdict="B better")
+        with self.assertRaisesRegex(ValueError, "改变了 GSB"):
+            self.rewrite()
+
+    def test_rejects_overlong_result_without_truncating_caveat(self):
+        self.runner.run.return_value = dict(self.result, aReason="A merge.py " + "测试通过" * 80 + "，但浏览器测试没有执行")
+        with self.assertRaisesRegex(ValueError, "长度"):
+            self.rewrite()
+
+    def test_rejects_lost_evidence_locator(self):
+        self.runner.run.return_value = dict(self.result, aReason="A 多加了一道旧草稿检查，接口测过了，不过浏览器测试没跑，所以稍好一些。")
+        with self.assertRaisesRegex(ValueError, "证据"):
+            self.rewrite()
+
+    def test_invalid_source_never_calls_model(self):
+        for verdict, a, b in [("invalid", "a"*20, "b"*20), ("Same", "", "b"*20), ("Same", None, "b"*20), ("Same", "a"*301, "b"*20)]:
+            with self.assertRaises(ValueError):
+                validate_source(verdict, a, b)
+        self.runner.run.assert_not_called()
+
+    def test_failure_propagates_without_replacement(self):
+        self.runner.run.side_effect = RuntimeError("模型暂不可用")
+        with self.assertRaisesRegex(RuntimeError, "模型暂不可用"):
+            self.rewrite()

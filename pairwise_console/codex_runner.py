@@ -26,6 +26,7 @@ JOB_EFFORTS = {
     "artifact_comparison": "medium",
     "difficulty_reassessment": "medium",
     "gsb_review": "medium",
+    "gsb_colloquial": "medium",
     "gsb_language_check": "medium",
     "gsb_recheck": "high",
     "next_step": "medium",

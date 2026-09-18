@@ -23,6 +23,7 @@ from .codex_runner import (
 from .config import Config, MAX_PAIR_PROJECTS
 from .db import Database, now_iso
 from .gitops import GitOps
+from .gsb_rewrite import rewrite_preview, validate_source
 from .importer import fingerprint, import_historical_tasks
 from .prompts import (
     actual_difficulty_review_prompt, bug_discovery_prompt, bugfix_task_prompt, feature_generation_prompt,
@@ -2618,6 +2619,23 @@ class PairwiseService:
     def recheck_gsb_async(self, pair_id: str) -> str:
         operation = "gsb-recheck-" + pair_id
         self._submit(operation, self._recheck_gsb, pair_id)
+        return operation
+
+    def colloquialize_gsb_async(self, pair_id: str, edits: Dict[str, Any]) -> str:
+        self._pair(pair_id)
+        review = self.db.one("SELECT verdict,a_reason,b_reason FROM gsb_reviews WHERE pair_id=?", (pair_id,))
+        if not review:
+            raise ValueError("尚未生成 GSB 草稿")
+        source = validate_source(
+            edits["verdict"] if "verdict" in edits else review.get("verdict"),
+            edits["aReason"] if "aReason" in edits else review.get("a_reason"),
+            edits["bReason"] if "bReason" in edits else review.get("b_reason"),
+        )
+        operation = "gsb-colloquial-%s-%s" % (pair_id, uuid.uuid4().hex[:10])
+        self._submit(
+            operation, rewrite_preview, self.codex, source, pair_id, self._gsb_locator_issues,
+        )
+        self.db.audit("gsb.colloquial_preview_started", "pair", pair_id, {"operation": operation})
         return operation
 
     def _recheck_gsb(self, pair_id: str) -> Dict[str, Any]:
