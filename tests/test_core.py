@@ -799,31 +799,31 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(chain["followup_required"], 1)
         self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-1'")["status"], "used")
 
-    def test_pair_parallelism_has_a_hard_ceiling_of_three(self):
+    def test_pair_parallelism_has_a_hard_ceiling_of_four(self):
         self.db.set_setting("max_pairs_parallel", 9)
         stamp = now_iso()
-        for index in range(4):
+        for index in range(5):
             self.db.execute(
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
                    fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (f"task-limit-{index}", "test", "zero_to_one", f"hard-{index}", "Build a hard project",
                  "困难", '["跨模块状态"]', f"fingerprint-limit-{index}", "ready", stamp, stamp),
             )
-        for index in range(3):
-            self.service.create_pair(f"task-limit-{index}")
-        with self.assertRaisesRegex(ValueError, "最多 3 个 Pair"):
-            self.service.create_pair("task-limit-3")
-
-    def test_concurrent_pair_creation_cannot_exceed_three(self):
-        stamp = now_iso()
         for index in range(4):
+            self.service.create_pair(f"task-limit-{index}")
+        with self.assertRaisesRegex(ValueError, "最多 4 个 Pair"):
+            self.service.create_pair("task-limit-4")
+
+    def test_concurrent_pair_creation_cannot_exceed_four(self):
+        stamp = now_iso()
+        for index in range(5):
             self.db.execute(
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
                    fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (f"task-race-{index}", "test", "zero_to_one", f"hard-race-{index}", "Build a hard project",
                  "困难", '["并发状态"]', f"fingerprint-race-{index}", "ready", stamp, stamp),
             )
-        barrier = threading.Barrier(4)
+        barrier = threading.Barrier(5)
         outcomes = []
         outcome_lock = threading.Lock()
 
@@ -837,14 +837,14 @@ class CoreTests(unittest.TestCase):
             with outcome_lock:
                 outcomes.append(outcome)
 
-        threads = [threading.Thread(target=create, args=(index,)) for index in range(4)]
+        threads = [threading.Thread(target=create, args=(index,)) for index in range(5)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(5)
-        self.assertEqual(outcomes.count("created"), 3)
-        self.assertEqual(self.db.one("SELECT COUNT(*) count FROM pairs")["count"], 3)
-        self.assertTrue(any("最多 3 个 Pair" in outcome for outcome in outcomes))
+        self.assertEqual(outcomes.count("created"), 4)
+        self.assertEqual(self.db.one("SELECT COUNT(*) count FROM pairs")["count"], 4)
+        self.assertTrue(any("最多 4 个 Pair" in outcome for outcome in outcomes))
 
     def test_concurrent_repository_preparation_is_serialized_per_pair(self):
         self.insert_ready_task()
@@ -877,20 +877,20 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(maximum_active, 1)
 
-    def test_one_click_automation_is_persistent_and_forces_three_pair_target(self):
+    def test_one_click_automation_is_persistent_and_forces_four_pair_target(self):
         self.db.set_setting("max_pairs_parallel", 1)
         with patch.object(self.service, "_schedule_auto_pipeline_once") as schedule:
             status = self.service.set_auto_pipeline(True)
         self.assertTrue(status["enabled"])
-        self.assertEqual(status["targetPairs"], 3)
-        self.assertEqual(self.db.setting("max_pairs_parallel"), 3)
+        self.assertEqual(status["targetPairs"], 4)
+        self.assertEqual(self.db.setting("max_pairs_parallel"), 4)
         schedule.assert_called_once_with()
         stopped = self.service.set_auto_pipeline(False)
         self.assertFalse(stopped["enabled"])
 
     def test_automation_consumes_existing_ready_tasks_before_refill(self):
         stamp = now_iso()
-        for index in range(3):
+        for index in range(4):
             self.db.execute(
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
                    fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
@@ -902,15 +902,15 @@ class CoreTests(unittest.TestCase):
         with patch.object(self.service, "_submit_auto", side_effect=lambda operation, fn, *args: submitted.append(operation) or True), \
              patch.object(self.service, "_schedule_refill_once") as refill:
             status = self.service._schedule_auto_pipeline_once()
-        self.assertEqual(status["activePairs"], 3)
+        self.assertEqual(status["activePairs"], 4)
         self.assertEqual(status["readyTasks"], 0)
-        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 3)
-        self.assertEqual(len([item for item in submitted if item.startswith("repo-pair-")]), 3)
+        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 4)
+        self.assertEqual(len([item for item in submitted if item.startswith("repo-pair-")]), 4)
         refill.assert_not_called()
 
     def test_automation_refills_when_a_completed_pair_releases_a_slot(self):
         stamp = now_iso()
-        for index in range(4):
+        for index in range(5):
             self.db.execute(
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
                    fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
@@ -929,8 +929,8 @@ class CoreTests(unittest.TestCase):
         with patch.object(self.service, "_submit_auto", return_value=True), \
              patch.object(self.service, "_schedule_refill_once"):
             status = self.service._schedule_auto_pipeline_once()
-        self.assertEqual(status["activePairs"], 3)
-        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 4)
+        self.assertEqual(status["activePairs"], 4)
+        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 5)
 
     def test_gsb_confirmation_strips_backticks_and_completes_pair(self):
         self.insert_ready_task()
@@ -1926,7 +1926,7 @@ class CoreTests(unittest.TestCase):
             "UPDATE pairs SET status='failed',stage='artifact_failed',error='missing Dockerfile' WHERE id=?",
             (pair["id"],),
         )
-        for index in range(3):
+        for index in range(4):
             self.db.execute(
                 """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
                    VALUES(?,?,?,'running','development',?,?)""",

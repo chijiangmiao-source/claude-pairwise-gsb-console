@@ -507,7 +507,7 @@ class PairwiseService:
     def set_auto_pipeline(self, enabled: bool) -> Dict[str, Any]:
         self.db.set_setting("auto_pipeline_enabled", bool(enabled))
         if enabled:
-            # The one-click mode has a fixed capacity: three Pair projects,
+            # The one-click mode has a fixed capacity: four Pair projects,
             # each using two independent Claude terminals.
             self.db.set_setting("max_pairs_parallel", MAX_PAIR_PROJECTS)
         self.db.audit(
@@ -545,7 +545,7 @@ class PairwiseService:
             return True
 
     def _schedule_auto_pipeline_once(self) -> Dict[str, Any]:
-        """Advance every active Pair and refill empty Pair slots up to three."""
+        """Advance every active Pair and refill empty Pair slots up to four."""
         if not self._automation_lock.acquire(blocking=False):
             return self.automation_status()
         try:
@@ -1648,7 +1648,7 @@ class PairwiseService:
         configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
         if active_count >= pair_limit:
-            raise ValueError("已达到 Pair 并发上限：最多 3 个 Pair（6 个 A/B 终端）")
+            raise ValueError("已达到 Pair 并发上限：最多 4 个 Pair（8 个 A/B 终端）")
         pair_id = "pair-" + uuid.uuid4().hex[:16]
         if task["task_type"] == "zero_to_one":
             chain_id = "chain-" + uuid.uuid4().hex[:16]
@@ -3611,7 +3611,7 @@ class PairwiseService:
             if str(arm.get("status") or "") in ("queued", "running", "developing", "waiting_retry", "checkpointing")
         )
         if active_arms - replacing_active + len(arms) > MAX_PAIR_PROJECTS * 2:
-            raise RuntimeError("当前 6 个开发终端均在运行，轨迹返工需等待一个终端空位")
+            raise RuntimeError("当前 8 个开发终端均在运行，轨迹返工需等待一个终端空位")
         stamp = now_iso()
         reason = "；".join(dict.fromkeys(str(issue) for issue in issues))[-2500:]
         prompt_mismatch = any("首轮 User Prompt" in str(issue) for issue in issues)

@@ -209,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "max_pairs_parallel" in body:
                     pair_limit = int(body["max_pairs_parallel"])
                     if pair_limit < 1 or pair_limit > MAX_PAIR_PROJECTS:
-                        raise ValueError("Pair 并发只能设置为 1–3；每个 Pair 会占用 A/B 两个终端")
+                        raise ValueError("Pair 并发只能设置为 1–4；每个 Pair 会占用 A/B 两个终端")
                 if "ab_prompt_stagger_seconds" in body:
                     prompt_stagger = int(body["ab_prompt_stagger_seconds"])
                     if prompt_stagger < 0 or prompt_stagger > 300:
