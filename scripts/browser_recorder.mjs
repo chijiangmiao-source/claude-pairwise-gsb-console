@@ -225,6 +225,41 @@ async function demonstrateColdRoomAlarmWorkflow(page) {
   return result;
 }
 
+async function prepareGenericInputs(page) {
+  const controls = page.locator(
+    'input:visible:not([disabled]):not([readonly]), textarea:visible:not([disabled]):not([readonly])',
+  );
+  const filled = [];
+  for (let index = 0; index < await controls.count(); index += 1) {
+    const control = controls.nth(index);
+    const type = String(await control.getAttribute("type") || "text").toLowerCase();
+    if (["button", "submit", "reset", "checkbox", "radio", "file", "hidden", "color", "range"].includes(type)) continue;
+    if (String(await control.inputValue().catch(() => "")).trim()) continue;
+    const hint = [
+      await control.getAttribute("name"), await control.getAttribute("placeholder"),
+      await control.getAttribute("aria-label"), await control.getAttribute("data-testid"),
+    ].filter(Boolean).join(" ").toLowerCase();
+    let value = "录像演示";
+    if (type === "email") value = "demo@example.com";
+    else if (type === "url") value = "https://example.com";
+    else if (type === "tel") value = "13800000000";
+    else if (type === "number") value = String(Math.max(1, Number(await control.getAttribute("min")) || 1));
+    else if (type === "date") value = "2030-01-01";
+    else if (type === "time") value = "10:00";
+    else if (type === "datetime-local") value = "2030-01-01T10:00";
+    else if (/scene|场次|项目|project/.test(hint)) value = "DEMO-001";
+    else if (/name|名称|姓名|标题|title/.test(hint)) value = "演示记录";
+    else if (/code|编号|标识|\bid\b/.test(hint)) value = `demo-${Date.now()}-${index + 1}`;
+    else if (/search|搜索|查询/.test(hint)) value = "演示";
+    try {
+      await control.fill(value);
+      filled.push(hint || `${type}-${index + 1}`);
+    } catch {}
+  }
+  if (filled.length) await page.waitForTimeout(700);
+  return filled;
+}
+
 async function demonstrateGenericWorkflow(page) {
   await page.waitForTimeout(3000);
   const before = await page.locator("body").innerText();
@@ -246,7 +281,10 @@ async function demonstrateGenericWorkflow(page) {
     return false;
   };
   await clickMatching(/载入|示例|样例|模板|预置|demo|sample|example/i);
-  const actionClicked = await clickMatching(/计算|运行|分析|核验|检查|生成|提交|开始|求解|solve|compute|run|inspect|check|analy/i);
+  const filled = await prepareGenericInputs(page);
+  const actionClicked = await clickMatching(
+    /计算|运行|分析|核验|检查|生成|提交|开始|求解|领取|保存|创建|新增|添加|发送|确认|更新|修订|查询|搜索|演示|测试|solve|compute|run|inspect|check|analy|submit|save|create|add|send|confirm|update|search|test/i,
+  );
   if (!clicked.length) {
     await clickMatching(/^(?!.*(?:删除|清空|取消|关闭|remove|delete|clear|cancel|close)).+/i);
   }
@@ -256,6 +294,7 @@ async function demonstrateGenericWorkflow(page) {
     required: true,
     ok: clicked.length > 0 && (visibleChange || successfulRequests.length > 0 || actionClicked),
     clicks: clicked,
+    filled,
     requests: successfulRequests.length,
     visibleChange,
     workflow: "browser-ui",
