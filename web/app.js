@@ -11,6 +11,7 @@ const state = {
   soloQaSyncRunning: new Set(),
   soloQaRepairRunning: new Set(),
   helperReady: false, helperVersion: "", helperRequests: new Map(),
+  activeRecording: null, recordingWatchToken: 0,
 };
 const titles = {
   dashboard: "数据概览", tasks: "题目池", pairs: "A/B 项目", reviews: "复核与人工确认",
@@ -305,8 +306,77 @@ async function createPair(id) { try { const data = await api("/api/pairs", { met
 async function showTask(id) { try { const data = await api("/api/tasks?page=1&size=100"), task = data.items.find((item) => item.id === id); showDialog(`<h2>${esc(task?.title || id)}</h2>${task?.locked_by ? pairIdentity(task.locked_by) : pairIdentity("")}<div class="kv"><b>任务类型</b><span>${taskTypeBadge(task?.task_type)}</span></div><div class="kv"><b>系统类型</b><span>${projectCategoryBadge(task?.project_category)}</span></div><div class="kv"><b>难度</b><span>${esc(task?.difficulty)}</span></div><div class="kv"><b>状态</b><span>${badge(task?.status)}</span></div><div class="kv"><b>题面</b><div class="wrap">${esc(task?.prompt)}</div></div><div class="kv"><b>未通过原因</b><span>${esc(task?.rejection_reason || "—")}</span></div>`); } catch (error) { notify(error.message, true); } }
 async function showPair(id) { try { const data = await api(`/api/pairs/${id}`), repo = data.repository, review = data.difficulty_review; const difficulty = review ? `<h3>实际难度复评</h3><div class="detail-grid"><div class="detail-item"><label>出题难度</label><strong>${esc(review.original_difficulty)}</strong></div><div class="detail-item"><label>A / B 实际难度</label><strong>${esc(review.a_difficulty || "复评中")} / ${esc(review.b_difficulty || "复评中")}</strong></div><div class="detail-item"><label>最终实际难度</label><strong>${esc(review.assessed_difficulty || "复评中")} ${badge(review.status)}</strong></div><div class="detail-item"><label>复评依据</label><span>${esc(review.reason || review.error || "正在读取真实改动、轨迹和 Docker 验收证据")}</span></div></div>` : ""; showDialog(`<h2>${esc(data.task.title)}</h2>${pairIdentity(data.id)}<p>${projectCategoryBadge(data.task.project_category)} ${taskTypeBadge(data.task.task_type)} ${badge(data.status)} ${badge(data.stage)}</p><div class="detail-grid"><div class="detail-item"><label>项目编号</label><strong class="code">${esc(data.chain_id)}</strong></div><div class="detail-item"><label>共同基线</label><strong class="code">${esc(data.baseline_sha || "待创建")}</strong></div><div class="detail-item"><label>远端仓库</label><strong class="code">${esc(repo?.remote_url || "待创建")}</strong></div><div class="detail-item"><label>分支</label><strong>main / A / B</strong></div></div><h3>A/B 执行</h3>${table(data.arms, [["Arm", (row) => row.arm], ["SessionID", (row) => `<span class="code">${esc(row.session_id)}</span>`], ["PromptID", (row) => `<span class="code">${esc(row.prompt_id)}</span>`], ["状态", (row) => badge(row.status)], ["提交", (row) => `<span class="code">${esc(row.commit_sha)}</span>`]])}${difficulty}<div style="margin-top:18px">${pairButtons(data)}</div>`); } catch (error) { notify(error.message, true); } }
 function pairButtons(data) { const id = data.id; if (data.stage === "repository") return `<button class="primary" onclick="pairAction('${id}','prepare')">创建 GitHub 仓库并准备 A/B</button>`; if (data.stage === "ready_to_start") return `<button class="primary" onclick="pairAction('${id}','start')">并行启动 A/B 开发</button>`; if (data.stage === "difficulty_review") return data.difficulty_review?.status === "failed" ? `<button class="primary" onclick="pairAction('${id}','difficulty/review')">重新复评实际难度</button>` : `${badge(data.difficulty_review?.status || "running")} <span>正在根据真实开发结果复评难度</span>`; if (data.stage === "recording") { const byArm = Object.fromEntries((data.recordings || []).map((item) => [item.arm, item])); return ["A", "B"].map((arm) => byArm[arm]?.status === "recording" ? `<button class="danger" onclick="recordAction('${id}','${arm}','stop')">停止 ${arm} 录像</button>` : byArm[arm]?.status === "passed" ? `<span class="badge passed">${arm} 录像默认审核通过</span>` : `<button class="primary" onclick="recordAction('${id}','${arm}','start')">录制 ${arm} 真实操作</button>`).join(" "); } if (data.stage === "gsb_ready") return `<button class="primary" onclick="pairAction('${id}','gsb')">生成并默认确认 GSB</button>`; if (data.status === "completed") return `<button class="primary" onclick="pairAction('${id}','bugs/discover')">Codex 找 Bug</button>`; return `<span class="badge ${esc(data.status)}">当前阶段：${esc(statusLabels[data.stage] || data.stage)}</span>`; }
-async function recordAction(id, arm, action, manual = false) { try { if ($("#dialog")?.open) $("#dialog").close(); if (action === "stop") notify(`${arm} 已收到停止请求，正在保存 MP4`); await api(`/api/pairs/${id}/recordings/${arm}/${action}`, { method: "POST", body: JSON.stringify({ manual }) }); if (action === "start") notify(manual ? `${arm} 项目已启动；请在独立 Chrome 中人工操作真实功能，完成后回本页停止并保存` : `${arm} 正在启动 Docker 项目并自动演示真实功能`); if (state.page === "evidence") renderEvidence(); watchRecording(id, arm); } catch (error) { notify(error.message, true); } }
-async function watchRecording(id, arm) { for (let attempt = 0; attempt < 360; attempt += 1) { await new Promise((resolve) => window.setTimeout(resolve, 2000)); try { const pair = await api(`/api/pairs/${id}`), latest = pair.recording_attempts?.find((item) => item.arm === arm); if (state.page === "evidence") await renderEvidence(); if (latest && !["starting", "recording", "stopping"].includes(latest.status)) { notify(latest.status === "passed" ? `${arm} 浏览器录像已通过并自动替换当前录像` : `${arm} 录像失败：${latest.error}`, latest.status !== "passed"); return; } } catch (error) { notify(error.message, true); return; } } }
+const activeRecordingStatuses = new Set(["starting", "recording", "stopping"]);
+function renderRecordingControl() {
+  const control = $("#recording-control"), row = state.activeRecording;
+  if (!control) return;
+  if (!row || !activeRecordingStatuses.has(row.status)) {
+    control.className = "recording-control hidden";
+    control.innerHTML = "";
+    return;
+  }
+  const mode = row.interaction_mode === "manual" ? "人工重新录制" : "自动录像";
+  const status = statusLabels[row.status] || row.status;
+  const stop = row.status === "recording"
+    ? `<button class="danger" onclick="recordAction('${row.pair_id}','${row.arm}','stop')">停止并保存</button>`
+    : `<button class="secondary" disabled>${esc(row.status === "starting" ? "项目启动中…" : "正在保存 MP4…")}</button>`;
+  control.className = "recording-control";
+  control.innerHTML = `<div><strong>${esc(mode)} · ${esc(row.arm)}</strong><small>${esc(row.pair_id)} · ${esc(status)}</small></div>${stop}`;
+}
+function setActiveRecording(row) {
+  state.activeRecording = row && activeRecordingStatuses.has(row.status) ? row : null;
+  renderRecordingControl();
+}
+async function recordAction(id, arm, action, manual = false) {
+  try {
+    if ($("#dialog")?.open) $("#dialog").close();
+    const row = await api(`/api/pairs/${id}/recordings/${arm}/${action}`, {
+      method: "POST", body: JSON.stringify({ manual }),
+    });
+    setActiveRecording(row);
+    if (action === "stop") {
+      notify(`${arm} 已收到停止请求，正在保存 MP4`);
+      return;
+    }
+    notify(manual ? `${arm} 项目已启动；固定控制条会一直保留，请完成操作后点击停止并保存` : `${arm} 正在启动 Docker 项目并自动演示真实功能`);
+    const token = ++state.recordingWatchToken;
+    watchRecording(id, arm, token);
+  } catch (error) {
+    notify(error.message, true);
+    restoreActiveRecording();
+  }
+}
+async function watchRecording(id, arm, token) {
+  for (let attempt = 0; attempt < 360 && token === state.recordingWatchToken; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    if (token !== state.recordingWatchToken) return;
+    try {
+      const pair = await api(`/api/pairs/${id}`);
+      const latest = pair.recording_attempts?.find((item) => item.arm === arm);
+      if (!latest) continue;
+      if (activeRecordingStatuses.has(latest.status)) {
+        setActiveRecording(latest);
+        continue;
+      }
+      setActiveRecording(null);
+      if (state.page === "evidence") await renderEvidence();
+      notify(latest.status === "passed" ? `${arm} 浏览器录像已通过并自动替换当前录像` : `${arm} 录像失败：${latest.error}`, latest.status !== "passed");
+      return;
+    } catch (error) {
+      notify(error.message, true);
+      return;
+    }
+  }
+}
+async function restoreActiveRecording() {
+  try {
+    const row = await api("/api/recordings/active");
+    if (!row?.id) return setActiveRecording(null);
+    setActiveRecording(row);
+    const token = ++state.recordingWatchToken;
+    watchRecording(row.pair_id, row.arm, token);
+  } catch { /* The page remains usable when no recorder is active. */ }
+}
 async function pairAction(id, action) { try { $("#dialog").close(); const data = await api(`/api/pairs/${id}/${action}`, { method: "POST", body: "{}" }); notify(`操作已启动：${data.operationId}`); poll(data.operationId); } catch (error) { notify(error.message, true); } }
 function playRecording(id, arm, title, pairId = "") { showDialog(`<h2>${esc(title)} · ${esc(arm)} 真实操作录像</h2>${pairId ? pairIdentity(pairId) : ""}<video class="recording-player" controls autoplay preload="metadata" src="/api/recordings/${encodeURIComponent(id)}/content"></video><p class="sub">支持播放、暂停、拖动进度和全屏。</p>`); }
 async function showEvidence(pairId, arm) { try { const data = await api(`/api/pairs/${pairId}`), check = data.checks.find((item) => item.arm === arm) || {}, recording = data.recordings.find((item) => item.arm === arm) || {}, attempts = (data.recording_attempts || []).filter((item) => item.arm === arm), steps = parseJson(check.checks_json, []); showDialog(`<h2>${esc(data.task.title)} · ${arm}</h2>${pairIdentity(data.id)}<div class="detail-grid"><div class="detail-item"><label>最终提交</label><strong class="code">${esc(check.commit_sha || recording.commit_sha || "—")}</strong></div><div class="detail-item"><label>Docker 验收</label><strong>${badge(check.status || "missing")}</strong></div><div class="detail-item"><label>当前录像</label><strong>${recordingFormat(recording)} · ${recording.capture_mode === "browser" ? "浏览器视口 · " : ""}${recording.width || 0}×${recording.height || 0} · ${recording.duration_seconds || 0}s</strong></div><div class="detail-item"><label>提交匹配</label><strong>${recording.commit_match ? "匹配" : "未匹配"}</strong></div></div><h3>录像历史</h3>${table(attempts, [["时间", (row) => date(row.created_at)], ["方式", (row) => `${recordingFormat(row)} · ${row.interaction_mode === "manual" ? "人工操作" : "自动操作"} · ${row.capture_mode === "browser" ? "浏览器视口" : "历史屏幕录像"}`], ["状态", (row) => badge(row.status)], ["规格", (row) => `${row.width || 0}×${row.height || 0} · ${row.duration_seconds || 0}s`], ["说明", (row) => esc(row.error || row.entry_url || "—")]])}<h3>验收步骤</h3>${table(steps, [["检查", (row) => esc(row.name)], ["结果", (row) => row.passed ? '<span class="ok">通过</span>' : '<span class="bad">失败</span>'], ["详情", (row) => `<div class="wrap log-detail">${esc(row.detail)}</div>`]])}${recording.id && recording.status === "passed" ? `<button class="primary" onclick="playRecording('${recording.id}','${arm}','${esc(data.task.title)}','${data.id}')">播放当前录像</button>` : ""}`); } catch (error) { notify(error.message, true); } }
@@ -463,5 +533,6 @@ $("#pair-locator").addEventListener("keydown", (event) => { if (event.key === "E
 window.addEventListener("hashchange", () => { loadUrl(); render(); });
 window.setInterval(() => $("#clock").textContent = new Date().toLocaleString("zh-CN"), 1000);
 render();
+restoreActiveRecording();
 api("/api/settings").then((settings) => $("#runtime-summary").textContent = `Codex ${settings.codex_model} · Claude ${settings.claude_model}`).catch(() => {});
 window.postMessage({ source: "pairwise-gsb-console", type: "PAIRWISE_GSB_BRIDGE_PING", requestId: "", payload: {} }, window.location.origin);

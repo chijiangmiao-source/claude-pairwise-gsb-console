@@ -390,6 +390,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([(row["arm"], row["manual_rerecorded"]) for row in manual["items"]], [("A", 1)])
         self.assertEqual([(row["arm"], row["manual_rerecorded"]) for row in automatic["items"]], [("B", 0)])
 
+    def test_active_recording_is_available_outside_the_current_evidence_page(self):
+        pair = self._prepare_pair_for_difficulty_review()
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO recording_attempts(
+                 id,pair_id,arm,commit_sha,path,interaction_mode,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'manual','recording',?,?)""",
+            ("manual-active", pair["id"], "A", "a" * 40, str(self.root / "manual.mp4"), stamp, stamp),
+        )
+        handler = Handler.__new__(Handler)
+        handler.server = MagicMock(db=self.db)
+
+        active = handler._active_recording()
+
+        self.assertEqual(active["id"], "manual-active")
+        self.assertEqual(active["pair_id"], pair["id"])
+        self.assertEqual(active["interaction_mode"], "manual")
+        self.assertEqual(active["title"], "hard-project")
+
     def test_full_monitor_capacity_does_not_starve_user_operations(self):
         release = threading.Event()
         started = threading.Event()

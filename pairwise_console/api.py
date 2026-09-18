@@ -70,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._page("artifact_checks", query, self._filter(query, ("status", "arm"))))
             if path == "/api/recordings":
                 return self._json(200, self._page("recordings", query, self._filter(query, ("status", "arm"))))
+            if path == "/api/recordings/active":
+                return self._json(200, self._active_recording())
             match = re.fullmatch(r"/api/recordings/([^/]+)/content", path)
             if match:
                 return self._recording_content(match.group(1))
@@ -358,6 +360,15 @@ class Handler(BaseHTTPRequestHandler):
         size = int((query.get("size") or ["20"])[0])
         where, params = condition
         return self.app.db.page(table, page, size, where, params, order)
+
+    def _active_recording(self) -> Dict[str, Any]:
+        return self.app.db.one(
+            """SELECT ra.*,t.title FROM recording_attempts ra
+                 JOIN pairs p ON p.id=ra.pair_id
+                 JOIN tasks t ON t.id=p.task_id
+                WHERE ra.status IN ('starting','recording','stopping')
+                ORDER BY ra.created_at DESC LIMIT 1"""
+        ) or {}
 
     @staticmethod
     def _filter(query: Dict[str, list], fields) -> Tuple[str, tuple]:
