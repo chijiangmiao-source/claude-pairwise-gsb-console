@@ -349,16 +349,37 @@ try {
   await context.addInitScript(() => {
     window.__pairwiseRecordingMetrics = { clicks: 0 };
     const ensureCursor = () => {
-      if (document.getElementById("pairwise-recording-cursor")) return;
+      const existing = document.getElementById("pairwise-recording-cursor");
+      if (existing) return existing;
       const cursor = document.createElement("div");
       cursor.id = "pairwise-recording-cursor";
       cursor.innerHTML = '<svg viewBox="0 0 28 36" width="28" height="36" aria-hidden="true"><path d="M2 2L2 28L9 21L14 33L20 30L15 19L25 19Z" fill="#111827" stroke="white" stroke-width="2" stroke-linejoin="round"/></svg>';
       Object.assign(cursor.style, {
         position: "fixed", left: "0", top: "0", width: "28px", height: "36px",
-        transform: "translate3d(48px,48px,0)", pointerEvents: "none", zIndex: "2147483647",
-        filter: "drop-shadow(0 1px 2px rgba(0,0,0,.7))", transition: "transform .05s linear",
+        transform: "translate3d(0,0,0)", pointerEvents: "none", zIndex: "2147483647",
+        opacity: "0", filter: "drop-shadow(0 1px 2px rgba(0,0,0,.7))",
+        transition: "opacity .08s linear", willChange: "transform,opacity",
       });
       document.documentElement.appendChild(cursor);
+      return cursor;
+    };
+    let cursorFrame = 0;
+    let cursorX = 0;
+    let cursorY = 0;
+    const hideCursor = () => {
+      const cursor = document.getElementById("pairwise-recording-cursor");
+      if (cursor) cursor.style.opacity = "0";
+    };
+    const updateCursor = (event) => {
+      cursorX = event.clientX;
+      cursorY = event.clientY;
+      if (cursorFrame) return;
+      cursorFrame = requestAnimationFrame(() => {
+        cursorFrame = 0;
+        const cursor = ensureCursor();
+        cursor.style.transform = `translate3d(${cursorX}px,${cursorY}px,0)`;
+        cursor.style.opacity = "1";
+      });
     };
     const hideOpenApiLink = () => {
       document.querySelectorAll('.swagger-ui a[href*="openapi.json"]').forEach((link) => {
@@ -374,12 +395,18 @@ try {
       ensureCursor();
     };
     document.documentElement ? observeDocument() : document.addEventListener("DOMContentLoaded", observeDocument, { once: true });
-    document.addEventListener("pointermove", (event) => {
-      ensureCursor();
-      const cursor = document.getElementById("pairwise-recording-cursor");
-      cursor.style.transform = `translate3d(${event.clientX}px,${event.clientY}px,0)`;
-    }, true);
+    // addInitScript runs in the top page and child frames. Each document owns
+    // one cursor that appears only while the real pointer is inside it, so an
+    // iframe or navigation cannot leave a frozen cursor behind. requestAnimationFrame
+    // coalesces high-frequency events and avoids slowing down heavy pages.
+    document.addEventListener("pointermove", updateCursor, true);
+    document.addEventListener("mousemove", updateCursor, true);
+    document.addEventListener("pointerleave", hideCursor, true);
+    document.addEventListener("mouseleave", hideCursor, true);
+    window.addEventListener("blur", hideCursor, true);
+    window.addEventListener("pagehide", hideCursor, true);
     document.addEventListener("pointerdown", (event) => {
+      updateCursor(event);
       window.__pairwiseRecordingMetrics.clicks += 1;
       const dot = document.createElement("div");
       Object.assign(dot.style, {
