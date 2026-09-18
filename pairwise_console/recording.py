@@ -341,7 +341,11 @@ h2{font-size:21px;margin:0 0 12px}pre{white-space:pre-wrap;word-break:break-word
                         "UPDATE delivery_submissions SET status='needs_review',updated_at=? WHERE pair_id=?",
                         (stamp, row["pair_id"]),
                     )
-                self.db.execute("UPDATE pairs SET status='running',stage='gsb_ready',winner='',completed_at=NULL,updated_at=? WHERE id=?", (stamp, row["pair_id"]))
+                self.db.execute(
+                    """UPDATE pairs SET status='running',stage='gsb_ready',winner='',error='',
+                       completed_at=NULL,updated_at=? WHERE id=?""",
+                    (stamp, row["pair_id"]),
+                )
                 lineage = self.db.one(
                     """SELECT p.chain_id,t.task_type FROM pairs p JOIN tasks t ON t.id=p.task_id WHERE p.id=?""",
                     (row["pair_id"],),

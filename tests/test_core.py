@@ -642,7 +642,10 @@ class CoreTests(unittest.TestCase):
             "INSERT INTO gsb_reviews(id,pair_id,verdict,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             ("gsb-1", pair["id"], "Same", "两边都完成了相同功能，但各有一些可以复核的实现差异。", "draft", stamp, stamp),
         )
-        self.db.execute("UPDATE pairs SET stage='recording' WHERE id=?", (pair["id"],))
+        self.db.execute(
+            "UPDATE pairs SET stage='recording',error='旧录像失败信息' WHERE id=?",
+            (pair["id"],),
+        )
         for arm in ("A", "B"):
             sha = arm.lower() * 40
             self.db.execute(
@@ -669,6 +672,7 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["stage"], "completed")
+        self.assertEqual(result["error"], "")
         self.assertEqual(result["gsb"]["confirmed_by"], "刘昱")
         self.assertEqual(result["gsb"]["draft_verdict"], "Same")
         self.assertEqual(result["gsb"]["final_verdict"], "A better")

@@ -1849,7 +1849,11 @@ class PairwiseService:
             (verdict, clean, clean_a, clean_b, "", verdict, clean, evidence_version,
              confirmed_by.strip() or "人工确认", stamp, stamp, pair_id),
         )
-        self.db.execute("UPDATE pairs SET status='completed',stage='completed',winner=?,completed_at=?,updated_at=? WHERE id=?", (verdict, stamp, stamp, pair_id))
+        self.db.execute(
+            """UPDATE pairs SET status='completed',stage='completed',winner=?,error='',
+               completed_at=?,updated_at=? WHERE id=?""",
+            (verdict, stamp, stamp, pair_id),
+        )
         pair = self._pair(pair_id)
         task = self.db.one("SELECT task_type FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         if task.get("task_type") in ("feature", "bugfix"):
