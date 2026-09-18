@@ -2243,6 +2243,41 @@ class CoreTests(unittest.TestCase):
         current = self.db.one("SELECT status,stage,completed_at FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(current, {"status": "failed", "stage": "artifact_failed", "completed_at": None})
 
+    def test_completed_pair_with_recorded_artifact_failure_survives_restart_check(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm, status in (("A", "observed_failed"), ("B", "passed")):
+            sha = arm.lower() * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-observed-complete-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-" + arm, "screen-" + arm, "auto_model/urm", "image", sha, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                ("check-observed-complete-" + arm, pair["id"], arm, sha, status, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO recordings(id,pair_id,arm,path,commit_sha,commit_match,review_status,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,1,'confirmed','passed',?,?)""",
+                ("rec-observed-complete-" + arm, pair["id"], arm,
+                 str(self.root / (arm + ".mp4")), sha, stamp, stamp),
+            )
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',completed_at=? WHERE id=?",
+            (stamp, pair["id"]),
+        )
+        self.service._quarantine_invalid_completed_pairs()
+        current = self.db.one("SELECT status,stage,completed_at FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current, {"status": "completed", "stage": "completed", "completed_at": stamp})
+        self.assertEqual(
+            int((self.db.one("SELECT COUNT(*) count FROM recordings WHERE pair_id=?", (pair["id"],)) or {}).get("count") or 0),
+            2,
+        )
+
     def test_api_error_is_kept_as_evidence_and_later_completion_is_accepted(self):
         prompt = "Build the requested project"
         arm = {"id": "arm-api-error", "container_name": "container-api-error"}

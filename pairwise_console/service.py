@@ -167,12 +167,18 @@ class PairwiseService:
             self.db.set_setting("max_pairs_parallel", MAX_PAIR_PROJECTS)
 
     def _quarantine_invalid_completed_pairs(self) -> None:
-        """Stop historical Docker failures from being presented as deliveries."""
+        """Stop unevaluated Docker failures from being presented as deliveries.
+
+        ``observed_failed`` is a final product result with recorded failure
+        evidence.  It is valid comparison data under the current workflow and
+        must survive service restarts.
+        """
         rows = self.db.all(
             """SELECT DISTINCT p.id,p.chain_id FROM pairs p
                  JOIN arm_runs a ON a.pair_id=p.id
             LEFT JOIN artifact_checks c ON c.pair_id=p.id AND c.arm=a.arm AND c.commit_sha=a.commit_sha
-                WHERE p.status='completed' AND COALESCE(c.status,'missing')<>'passed'"""
+                WHERE p.status='completed'
+                  AND COALESCE(c.status,'missing') NOT IN ('passed','observed_failed')"""
         )
         for row in rows:
             stamp = now_iso()
