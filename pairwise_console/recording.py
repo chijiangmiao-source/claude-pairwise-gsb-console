@@ -319,19 +319,28 @@ h2{font-size:21px;margin:0 0 12px}pre{white-space:pre-wrap;word-break:break-word
             if review and not review_confirmed:
                 self.db.execute("DELETE FROM gsb_rechecks WHERE pair_id=?", (row["pair_id"],))
                 self.db.execute("UPDATE gsb_reviews SET status='draft',confirmed_by='',confirmed_at=NULL,updated_at=? WHERE pair_id=?", (stamp, row["pair_id"]))
-            if review:
-                self.db.execute("UPDATE delivery_submissions SET status='needs_review',updated_at=? WHERE pair_id=?", (stamp, row["pair_id"]))
             if review_confirmed:
                 # Re-recording only replaces the media evidence for the same
                 # delivered commits.  It must make the platform submission
                 # eligible for resubmission, but it does not invalidate the
                 # already confirmed code/trace/Docker comparison.
                 self.db.execute(
+                    """UPDATE delivery_submissions SET
+                         status=CASE WHEN remote_id='' THEN 'ready_to_submit' ELSE status END,
+                         error='',updated_at=? WHERE pair_id=?""",
+                    (stamp, row["pair_id"]),
+                )
+                self.db.execute(
                     """UPDATE pairs SET status='completed',stage='completed',winner=?,
                        completed_at=COALESCE(completed_at,?),updated_at=? WHERE id=?""",
                     (review.get("verdict", ""), stamp, stamp, row["pair_id"]),
                 )
             else:
+                if review:
+                    self.db.execute(
+                        "UPDATE delivery_submissions SET status='needs_review',updated_at=? WHERE pair_id=?",
+                        (stamp, row["pair_id"]),
+                    )
                 self.db.execute("UPDATE pairs SET status='running',stage='gsb_ready',winner='',completed_at=NULL,updated_at=? WHERE id=?", (stamp, row["pair_id"]))
                 lineage = self.db.one(
                     """SELECT p.chain_id,t.task_type FROM pairs p JOIN tasks t ON t.id=p.task_id WHERE p.id=?""",

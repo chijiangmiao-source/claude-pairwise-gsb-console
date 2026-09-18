@@ -150,6 +150,16 @@ class Database:
                 if name not in delivery_columns:
                     c.execute("ALTER TABLE delivery_submissions ADD COLUMN %s %s" % (name, definition))
             c.execute(
+                """UPDATE delivery_submissions SET status='ready_to_submit',error=''
+                     WHERE status='needs_review' AND remote_id=''
+                       AND EXISTS(SELECT 1 FROM gsb_reviews g
+                                   WHERE g.pair_id=delivery_submissions.pair_id
+                                     AND g.status='confirmed')
+                       AND EXISTS(SELECT 1 FROM recording_attempts ra
+                                   WHERE ra.pair_id=delivery_submissions.pair_id
+                                     AND ra.interaction_mode='manual' AND ra.status='passed')"""
+            )
+            c.execute(
                 """UPDATE recordings SET commit_sha=COALESCE((
                      SELECT commit_sha FROM arm_runs a
                       WHERE a.pair_id=recordings.pair_id AND a.arm=recordings.arm

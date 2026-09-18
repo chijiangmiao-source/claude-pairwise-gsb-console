@@ -923,7 +923,7 @@ class CoreTests(unittest.TestCase):
         current = self.db.one("SELECT status,stage,winner FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(current, {"status": "completed", "stage": "completed", "winner": "Same"})
         delivery = self.db.one("SELECT status FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
-        self.assertEqual(delivery["status"], "needs_review")
+        self.assertEqual(delivery["status"], "ready_to_submit")
 
     def test_recording_stop_immediately_enters_saving_state(self):
         self.insert_ready_task()
