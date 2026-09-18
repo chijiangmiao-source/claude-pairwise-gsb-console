@@ -350,10 +350,22 @@ pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-b
                 self.db.execute("DELETE FROM gsb_rechecks WHERE pair_id=?", (row["pair_id"],))
                 self.db.execute("UPDATE gsb_reviews SET status='draft',confirmed_by='',confirmed_at=NULL,updated_at=? WHERE pair_id=?", (stamp, row["pair_id"]))
             if review_confirmed:
-                # Re-recording only replaces the media evidence for the same
-                # delivered commits.  It must make the platform submission
-                # eligible for resubmission, but it does not invalidate the
-                # already confirmed code/trace/Docker comparison.
+                # Re-recording or failure-evidence capture only replaces media
+                # for the same delivered commits.  It can restore submission
+                # eligibility without invalidating a confirmed comparison.
+                failed_checks = self.db.all(
+                    """SELECT c.arm FROM artifact_checks c
+                         JOIN arm_runs a ON a.pair_id=c.pair_id AND a.arm=c.arm
+                                        AND a.commit_sha=c.commit_sha
+                        WHERE c.pair_id=? AND c.status='observed_failed' ORDER BY c.arm""",
+                    (row["pair_id"],),
+                )
+                failed_arms = [str(item.get("arm") or "") for item in failed_checks]
+                completion_note = (
+                    "原始交付的 Docker/测试验收失败，已保存短录像并按轨迹完成 GSB："
+                    + "、".join(failed_arms)
+                    if failed_arms else ""
+                )
                 self.db.execute(
                     """UPDATE delivery_submissions SET
                          status=CASE WHEN remote_id='' THEN 'ready_to_submit' ELSE status END,
@@ -361,9 +373,9 @@ pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-b
                     (stamp, row["pair_id"]),
                 )
                 self.db.execute(
-                    """UPDATE pairs SET status='completed',stage='completed',winner=?,
+                    """UPDATE pairs SET status='completed',stage='completed',winner=?,error=?,
                        completed_at=COALESCE(completed_at,?),updated_at=? WHERE id=?""",
-                    (review.get("verdict", ""), stamp, stamp, row["pair_id"]),
+                    (review.get("verdict", ""), completion_note, stamp, stamp, row["pair_id"]),
                 )
             else:
                 if review:
