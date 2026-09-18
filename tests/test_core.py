@@ -1734,6 +1734,54 @@ class CoreTests(unittest.TestCase):
         self.assertIn("504", state["api_error"])
         self.assertFalse(hasattr(self.service.claude, "send_continue"))
 
+    def test_system_turn_companion_is_not_treated_as_manual_followup(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-companion", "container_name": "container-companion"}
+        companion = "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": prompt}},
+            {"type": "user", "isMeta": True, "turnCompanion": True,
+             "message": {"content": companion}},
+            {"type": "assistant", "message": {
+                "stop_reason": "end_turn", "content": [{"type": "text", "text": "Finished"}],
+            }},
+            {"type": "system", "subtype": "turn_duration"},
+        ]
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            state = self.service.claude.trace_state(arm, prompt)
+        self.assertTrue(state["complete"])
+        self.assertFalse(state["followup_detected"])
+        self.assertEqual(state["automatic_companion_count"], 1)
+        self.assertEqual(state["automatic_companion_messages"], [companion])
+
+    def test_real_user_followup_still_invalidates_session(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-followup", "container_name": "container-followup"}
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": prompt}},
+            {"type": "user", "message": {"content": "Please also change the database schema"}},
+        ]
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            state = self.service.claude.trace_state(arm, prompt)
+        self.assertTrue(state["followup_detected"])
+        self.assertEqual(state["followup_text"], "Please also change the database schema")
+
     def test_failed_trace_copy_retains_old_container_and_prepares_fresh_session(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

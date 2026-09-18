@@ -463,6 +463,8 @@ exit "$code"
             for index, event in enumerate(events):
                 if event.get("type") != "user":
                     continue
+                if event.get("isMeta") is True or event.get("turnCompanion") is True:
+                    continue
                 content = (event.get("message") or {}).get("content") if isinstance(event.get("message"), dict) else None
                 if start_index is None and isinstance(content, str) and content.rstrip("\r\n") == prompt.rstrip("\r\n"):
                     start_index, prompt_id = index, str(event.get("promptId") or "")
@@ -470,11 +472,15 @@ exit "$code"
                 continue
             final_text, final_index, api_error, api_index = "", None, "", None
             extra_user_message = ""
+            automatic_companion_messages = []
             for index in range(start_index + 1, len(events)):
                 event = events[index]
                 if event.get("type") == "user":
                     content = (event.get("message") or {}).get("content") if isinstance(event.get("message"), dict) else ""
                     if isinstance(content, str) and content.strip():
+                        if event.get("isMeta") is True or event.get("turnCompanion") is True:
+                            automatic_companion_messages.append(content.strip()[:300])
+                            continue
                         extra_user_message = content.strip()[:300]
                         break
                 if event.get("type") != "assistant":
@@ -504,6 +510,8 @@ exit "$code"
                 "path": str(path),
                 "followup_detected": bool(extra_user_message),
                 "followup_text": extra_user_message,
+                "automatic_companion_count": len(automatic_companion_messages),
+                "automatic_companion_messages": automatic_companion_messages[:10],
             }
         return {"complete": False, "api_error": "", "path": ""}
 

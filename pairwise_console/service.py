@@ -2654,6 +2654,12 @@ class PairwiseService:
                 continue
             if state.get("complete"):
                 result = str(state.get("result") or "")
+                if int(state.get("automatic_companion_count") or 0):
+                    self.db.audit("claude.automatic_companion_ignored", "arm_run", arm_id, {
+                        "count": int(state.get("automatic_companion_count") or 0),
+                        "messages": list(state.get("automatic_companion_messages") or [])[:10],
+                        "classification": "system_generated_not_manual_followup",
+                    })
                 try:
                     self.db.execute("UPDATE arm_runs SET status='checkpointing',result=?,updated_at=? WHERE id=?", (result, now_iso(), arm_id))
                     trace_dir = self.claude.export_and_stop(arm)
