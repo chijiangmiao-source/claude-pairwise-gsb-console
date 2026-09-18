@@ -543,15 +543,33 @@ exit "$code"
             # another command, not the final answer.  Treating it as complete
             # used to checkpoint an unchanged baseline as the delivered code.
             completion_index = final_index if final_index is not None else native_index
+            completion_mode = "explicit_stop" if final_index is not None else ""
+            if native_index is not None:
+                completion_mode = "native_turn_end"
             finished = bool(completion_index is not None and any(
                 e.get("type") == "last-prompt" or (e.get("type") == "system" and e.get("subtype") == "turn_duration")
                 for e in events[completion_index + 1:]
             ))
+            # Claude can finish a successful native turn immediately after a
+            # tool result, leaving only progress text whose stop_reason is
+            # tool_use. The TUI is back at its input prompt and records a
+            # turn_duration event, but there is no separate final text block.
+            # Accept that native end only when the same turn has no API error;
+            # otherwise a partially written artifact could be mistaken for a
+            # completed delivery after exhausted gateway retries.
+            if (not finished and api_index is None and visible_index is not None
+                    and any(
+                        e.get("type") == "system" and e.get("subtype") == "turn_duration"
+                        for e in events[visible_index + 1:]
+                    )):
+                completion_index = visible_index
+                completion_mode = "native_turn_end_after_tool"
+                finished = True
             activity_payload = activity[:80] or ["no-assistant-activity"]
             return {
                 "complete": finished,
                 "result": final_text or native_text or visible_text,
-                "completion_mode": "explicit_stop" if final_index is not None else ("native_turn_end" if finished else ""),
+                "completion_mode": completion_mode if finished else "",
                 # Keep API errors as visible evidence, but do not use them as
                 # a completion veto. Claude can recover inside the same native
                 # session and later emit a valid final response.
