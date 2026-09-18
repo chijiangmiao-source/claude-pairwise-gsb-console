@@ -51,7 +51,6 @@ GSB_STEP_REFERENCE = re.compile(
     r"第\s*[一二三四五六七八九十百千万零〇\d]+"
     r"(?:\s*[、，,及和与]\s*[一二三四五六七八九十百千万零〇\d]+)*\s*步"
 )
-TASK_MIX_TYPES = ("zero_to_one", "feature", "bugfix")
 ELIGIBLE_TASK_SQL = "(difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"
 MAX_FEATURE_TASKS_PER_PROJECT = 3
 A9_REJECTED_PROMPT_FRAGMENTS = (
@@ -141,10 +140,6 @@ class PairwiseService:
             "task_generation_max_parallel": self.config.task_generation_max_parallel,
             "task_pool_min_ready": 6,
             "task_pool_target_ready": 12,
-            "task_mix_zero_to_one": 7,
-            "task_mix_feature": 7,
-            "task_mix_bugfix": 10,
-            "task_mix_started_at": now_iso(),
             "auto_refill_enabled": True,
             "auto_refill_interval_seconds": 60,
             "auto_pipeline_enabled": False,
@@ -164,6 +159,10 @@ class PairwiseService:
         for key, value in defaults.items():
             if self.db.one("SELECT key FROM settings WHERE key=?", (key,)) is None:
                 self.db.set_setting(key, value)
+        self.db.execute(
+            "DELETE FROM settings WHERE key IN "
+            "('task_mix_zero_to_one','task_mix_feature','task_mix_bugfix','task_mix_started_at')"
+        )
         # Upgrade the original shipped timeout while preserving any later
         # explicit customization made by an operator.
         if int(self.db.setting("first_prompt_stop_minutes", 40)) == 25:
@@ -501,8 +500,7 @@ class PairwiseService:
             "readyTasks": ready,
             "generatingBatches": generating,
             "stages": stages,
-            "taskMixTarget": self._task_mix_weights(),
-            "taskMixProgress": self._task_mix_counts(),
+            "taskSelectionMode": "available_first",
         }
 
     def set_auto_pipeline(self, enabled: bool) -> Dict[str, Any]:
@@ -880,51 +878,6 @@ class PairwiseService:
                 return index
         return 0
 
-    def _task_mix_weights(self) -> Dict[str, int]:
-        return {
-            "zero_to_one": max(1, int(self.db.setting("task_mix_zero_to_one", 7))),
-            "feature": max(1, int(self.db.setting("task_mix_feature", 7))),
-            "bugfix": max(1, int(self.db.setting("task_mix_bugfix", 10))),
-        }
-
-    def _task_mix_counts(self, include_ready: bool = False) -> Dict[str, int]:
-        started_at = str(self.db.setting("task_mix_started_at", "") or "")
-        rows = self.db.all(
-            """SELECT t.task_type,COUNT(*) count FROM pairs p
-                 JOIN tasks t ON t.id=p.task_id
-                WHERE p.created_at>=?
-                GROUP BY t.task_type""",
-            (started_at,),
-        )
-        counts = {task_type: 0 for task_type in TASK_MIX_TYPES}
-        for row in rows:
-            if row.get("task_type") in counts:
-                counts[row["task_type"]] = int(row.get("count") or 0)
-        if include_ready:
-            for row in self.db.all(
-                """SELECT task_type,COUNT(*) count FROM tasks
-                   WHERE status='ready' AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
-                     AND created_at>=?
-                   GROUP BY task_type""",
-                (started_at,),
-            ):
-                if row.get("task_type") in counts:
-                    counts[row["task_type"]] += int(row.get("count") or 0)
-        return counts
-
-    def _task_mix_priority(self, include_ready: bool = False) -> List[str]:
-        weights = self._task_mix_weights()
-        counts = self._task_mix_counts(include_ready=include_ready)
-        total = sum(counts.values()) + 1
-        weight_total = sum(weights.values())
-        return sorted(
-            TASK_MIX_TYPES,
-            key=lambda task_type: (
-                -(total * weights[task_type] / weight_total - counts[task_type]),
-                TASK_MIX_TYPES.index(task_type),
-            ),
-        )
-
     def _retire_outdated_ready_bug_task(self, task: Dict[str, Any]) -> bool:
         if task.get("source") != "bug_discovery" or task.get("task_type") != "bugfix":
             return False
@@ -960,40 +913,84 @@ class PairwiseService:
         return retired
 
     def _next_ready_task(self) -> Optional[Dict[str, Any]]:
-        for task_type in self._task_mix_priority():
-            tasks = self.db.all(
-                """SELECT * FROM tasks WHERE status='ready'
-                   AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
-                   AND task_type=?
-                   ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 50""",
-                (task_type,),
-            )
-            for task in tasks:
-                if self._retire_outdated_ready_bug_task(task):
-                    continue
-                if task_type == "feature" and self._feature_project_rank(task) > MAX_FEATURE_TASKS_PER_PROJECT:
-                    reason = "同一基线项目最多保留 3 个 Feature 迭代，超出额度后应重新创建 0–1 项目"
-                    self.db.execute(
-                        "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
-                        (reason, now_iso(), task["id"]),
-                    )
-                    self.db.audit("feature.project_limit_rejected", "task", task["id"], {
-                        "reason": reason, "project": self._feature_project_key(task),
-                    })
-                    continue
-                duplicate = self._deterministic_task_duplicate(
-                    task, exclude_task_id=task["id"], selection=True,
-                )
-                if not duplicate:
-                    return task
+        tasks = self.db.all(
+            """SELECT * FROM tasks WHERE status='ready'
+               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
+               ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 150"""
+        )
+        for task in tasks:
+            task_type = str(task.get("task_type") or "")
+            if self._retire_outdated_ready_bug_task(task):
+                continue
+            if task_type == "feature" and self._feature_project_rank(task) > MAX_FEATURE_TASKS_PER_PROJECT:
+                reason = "同一基线项目最多保留 3 个 Feature 迭代，超出额度后应重新创建 0–1 项目"
                 self.db.execute(
                     "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
-                    (duplicate, now_iso(), task["id"]),
+                    (reason, now_iso(), task["id"]),
                 )
-                self.db.audit("task.selection_duplicate_rejected", "task", task["id"], {
-                    "reason": duplicate, "task_type": task_type,
+                self.db.audit("feature.project_limit_rejected", "task", task["id"], {
+                    "reason": reason, "project": self._feature_project_key(task),
                 })
+                continue
+            duplicate = self._deterministic_task_duplicate(
+                task, exclude_task_id=task["id"], selection=True,
+            )
+            if not duplicate:
+                return task
+            self.db.execute(
+                "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
+                (duplicate, now_iso(), task["id"]),
+            )
+            self.db.audit("task.selection_duplicate_rejected", "task", task["id"], {
+                "reason": duplicate, "task_type": task_type,
+            })
         return None
+
+    def _schedule_any_task_source(self) -> bool:
+        """Prepare an existing real task source before creating a new 0-1 task."""
+        pending_bug = self.db.one(
+            """SELECT id FROM bug_candidates
+               WHERE status IN ('reproduced','awaiting_reproduction')
+               ORDER BY CASE status WHEN 'reproduced' THEN 0 ELSE 1 END,updated_at,id LIMIT 1"""
+        )
+        if pending_bug:
+            return self._schedule_task_source("bugfix")
+        feature_sources = self.db.all(
+            """SELECT p.id,t.title,COALESCE(r.remote_url,'') baseline_repo_url
+                 FROM pairs p JOIN tasks t ON t.id=p.task_id
+            LEFT JOIN git_repositories r ON r.pair_id=p.id
+               WHERE p.status='completed' AND t.task_type='zero_to_one'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM delivery_submissions d
+                    WHERE d.pair_id=p.id AND d.status='discarded'
+                 )
+               ORDER BY p.completed_at DESC,p.id DESC"""
+        )
+        for source in feature_sources:
+            feature_count = len(self._feature_project_rows({
+                "baseline_repo_url": source.get("baseline_repo_url", ""),
+                "parent_pair_id": source["id"],
+                "title": source.get("title", ""),
+            }))
+            if feature_count < MAX_FEATURE_TASKS_PER_PROJECT:
+                return self._schedule_task_source("feature")
+        bug_source = self.db.one(
+            """SELECT p.id FROM pairs p
+               WHERE p.status='completed'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM delivery_submissions d
+                    WHERE d.pair_id=p.id AND d.status='discarded'
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM audit_events e
+                    WHERE e.event_type='bug.discovery_completed'
+                      AND e.entity_type='pair' AND e.entity_id=p.id
+                 )
+               ORDER BY p.completed_at,p.id LIMIT 1"""
+        )
+        if bug_source:
+            return self._schedule_task_source("bugfix")
+        return self._schedule_task_source("zero_to_one")
 
     def _schedule_task_source(self, task_type: str) -> bool:
         if task_type == "zero_to_one":
@@ -1068,19 +1065,6 @@ class PairwiseService:
             active = sum(1 for key, future in self._futures.items() if key.startswith("validate-") and not future.done())
             generation_active = any(key.startswith("generate-") and not future.done() for key, future in self._futures.items())
         capacity = max(0, int(self.db.setting("task_generation_max_parallel", 6)) - active)
-        ready_by_type = {
-            row["task_type"]: int(row.get("count") or 0)
-            for row in self.db.all(
-                """SELECT task_type,COUNT(*) count FROM tasks
-                   WHERE status='ready' AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
-                   GROUP BY task_type"""
-            )
-        }
-        priority = self._task_mix_priority(include_ready=True)
-        missing_type = next((task_type for task_type in priority if not ready_by_type.get(task_type)), None)
-        if capacity and not generation_active and missing_type:
-            self._schedule_task_source(missing_type)
-            return
         if ready >= minimum:
             return
         needed = max(0, target - ready)
@@ -1093,7 +1077,7 @@ class PairwiseService:
         for row in candidates:
             self.validate_task_async(row["id"])
         if needed and capacity and not candidates and not generation_active:
-            self._schedule_task_source(priority[0])
+            self._schedule_any_task_source()
 
     def preflight(self) -> Dict[str, Any]:
         return {
@@ -3377,14 +3361,14 @@ class PairwiseService:
                 self._schedule_refill_once()
                 self.db.execute(
                     "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
-                    ("原 Pair 已废弃；题库暂无合格题，正在按 7:7:10 准备补位题目",
+                    ("原 Pair 已废弃；题库暂无合格题，正在从可用来源准备补位题目",
                      now_iso(), retired_pair_id),
                 )
-                self.db.audit("pair.task_replacement_waiting_for_mix", "pair", retired_pair_id, {
-                    "priority": self._task_mix_priority(), "rule": "7:7:10",
+                self.db.audit("pair.task_replacement_waiting_for_task", "pair", retired_pair_id, {
+                    "selection": "available_first",
                 })
                 return {"retiredPairId": retired_pair_id, "replacementPairId": "",
-                        "replacementTaskId": "", "outcome": "awaiting_mix_refill"}
+                        "replacementTaskId": "", "outcome": "awaiting_task_refill"}
             try:
                 replacement = self.create_pair(candidate["id"])
             except ValueError as exc:
@@ -3410,7 +3394,7 @@ class PairwiseService:
             self.start_pair(replacement_id)
             self.db.execute(
                 "UPDATE pairs SET stage='replaced',error=?,updated_at=? WHERE id=?",
-                ("原 Pair 已废弃，已按 7:7:10 自动换题为 %s" % replacement_id, now_iso(), retired_pair_id),
+                ("原 Pair 已废弃，已使用当前可用题目自动换题为 %s" % replacement_id, now_iso(), retired_pair_id),
             )
             self.db.execute(
                 """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?

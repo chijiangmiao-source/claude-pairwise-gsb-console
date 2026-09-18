@@ -218,17 +218,8 @@ class Handler(BaseHTTPRequestHandler):
                     prompt_stagger = int(body["ab_prompt_stagger_seconds"])
                     if prompt_stagger < 0 or prompt_stagger > 300:
                         raise ValueError("A/B 题面发送间隔只能设置为 0–300 秒")
-                mix_keys = ("task_mix_zero_to_one", "task_mix_feature", "task_mix_bugfix")
-                mix_changed = False
-                for mix_key in mix_keys:
-                    if mix_key in body and int(body[mix_key]) < 1:
-                        raise ValueError("三类任务的出题配额都必须大于 0")
-                    if mix_key in body and int(body[mix_key]) != int(self.app.db.setting(mix_key, 0)):
-                        mix_changed = True
                 for key, value in body.items():
                     self.app.db.set_setting(str(key), value)
-                if mix_changed:
-                    self.app.db.set_setting("task_mix_started_at", now_iso())
                 self.app.db.audit("settings.updated", "settings", "", {"keys": list(body)})
                 return self._json(200, {"ok": True})
             match = re.fullmatch(r"/api/bug-candidates/([^/]+)/(reproduce|convert)", path)

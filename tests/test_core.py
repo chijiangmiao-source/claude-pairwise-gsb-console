@@ -67,9 +67,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
         self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 40)
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
-        self.assertEqual(self.db.setting("task_mix_zero_to_one"), 7)
-        self.assertEqual(self.db.setting("task_mix_feature"), 7)
-        self.assertEqual(self.db.setting("task_mix_bugfix"), 10)
+        self.assertIsNone(self.db.setting("task_mix_zero_to_one"))
+        self.assertIsNone(self.db.setting("task_mix_feature"))
+        self.assertIsNone(self.db.setting("task_mix_bugfix"))
 
     def test_service_restart_closes_stale_generation_batches(self):
         stamp = now_iso()
@@ -209,57 +209,23 @@ class CoreTests(unittest.TestCase):
         delivery = self.db.one("SELECT status,remote_id FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
         self.assertEqual(delivery, {"status": "needs_fix", "remote_id": "470"})
 
-    def test_task_mix_prefers_bugfix_for_seven_seven_ten_ratio(self):
-        stamp = now_iso()
-        self.db.set_setting("task_mix_started_at", "2000-01-01T00:00:00+00:00")
-        counts = {"zero_to_one": 7, "feature": 7, "bugfix": 9}
-        for task_type, count in counts.items():
-            for index in range(count):
-                task_id = "task-mix-%s-%d" % (task_type, index)
-                chain_id = "chain-mix-%s-%d" % (task_type, index)
-                pair_id = "pair-mix-%s-%d" % (task_type, index)
-                self.db.execute(
-                    """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
-                       difficulty_evidence_json,fingerprint,status,created_at,updated_at)
-                       VALUES(?,?,?,?,?,'困难','[]',?,'used',?,?)""",
-                    (task_id, "test", task_type, task_id, "hard task", task_id, stamp, stamp),
-                )
-                self.db.execute(
-                    "INSERT INTO project_chains(id,root_task_id,status,created_at,updated_at) VALUES(?,?,'active',?,?)",
-                    (chain_id, task_id, stamp, stamp),
-                )
-                self.db.execute(
-                    """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
-                       VALUES(?,?,?,'completed','completed',?,?)""",
-                    (pair_id, task_id, chain_id, stamp, stamp),
-                )
-        self.assertEqual(self.service._task_mix_priority()[0], "bugfix")
-
-    def test_task_mix_produces_exact_seven_seven_ten_cycle(self):
-        weights = {"zero_to_one": 7, "feature": 7, "bugfix": 10}
-        counts = {task_type: 0 for task_type in weights}
-        with patch.object(
-            self.service, "_task_mix_counts",
-            side_effect=lambda include_ready=False: dict(counts),
-        ):
-            for _ in range(24):
-                counts[self.service._task_mix_priority()[0]] += 1
-        self.assertEqual(counts, weights)
-
-    def test_ready_task_selection_uses_task_mix_priority(self):
-        stamp = now_iso()
+    def test_ready_task_selection_uses_oldest_available_type_without_ratio(self):
+        stamps = {
+            "feature": "2026-01-01T00:00:00+00:00",
+            "bugfix": "2026-01-02T00:00:00+00:00",
+            "zero_to_one": "2026-01-03T00:00:00+00:00",
+        }
         for task_type in ("zero_to_one", "feature", "bugfix"):
             self.db.execute(
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
                    difficulty_evidence_json,fingerprint,status,created_at,updated_at)
                    VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
                 ("task-ready-" + task_type, "test", task_type, task_type, "hard task",
-                 "ready-" + task_type, stamp, stamp),
+                 "ready-" + task_type, stamps[task_type], stamps[task_type]),
             )
-        self.assertEqual(self.service._next_ready_task()["task_type"], "bugfix")
+        self.assertEqual(self.service._next_ready_task()["task_type"], "feature")
 
     def test_ready_task_selection_prefers_new_zero_to_one_and_rejects_duplicate_title(self):
-        self.db.set_setting("task_mix_started_at", "2000-01-01T00:00:00+00:00")
         rows = [
             ("task-used", "test", "共享标题", "已经开发过的复杂状态恢复任务", "used", "2019-01-01T00:00:00+00:00"),
             ("task-duplicate", "test", "共享标题", "完全不同的说明也不应复用标题", "ready", "2020-01-01T00:00:00+00:00"),
@@ -278,26 +244,6 @@ class CoreTests(unittest.TestCase):
         rejected = self.db.one("SELECT status,rejection_reason FROM tasks WHERE id='task-duplicate'")
         self.assertEqual(rejected["status"], "rejected")
         self.assertIn("标题", rejected["rejection_reason"])
-
-    def test_failed_pairs_still_count_toward_scheduler_mix(self):
-        stamp = now_iso()
-        self.db.set_setting("task_mix_started_at", "2000-01-01T00:00:00+00:00")
-        self.db.execute(
-            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
-               fingerprint,status,created_at,updated_at)
-               VALUES('task-failed-mix','test','bugfix','失败题','复杂修复','困难','[]',
-                      'failed-mix','used',?,?)""", (stamp, stamp),
-        )
-        self.db.execute(
-            "INSERT INTO project_chains(id,root_task_id,status,created_at,updated_at) VALUES('chain-failed-mix','task-failed-mix','active',?,?)",
-            (stamp, stamp),
-        )
-        self.db.execute(
-            """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
-               VALUES('pair-failed-mix','task-failed-mix','chain-failed-mix','failed','replaced',?,?)""",
-            (stamp, stamp),
-        )
-        self.assertEqual(self.service._task_mix_counts()["bugfix"], 1)
 
     def test_missing_feature_and_bug_tasks_use_real_completed_pair_sources(self):
         self.insert_ready_task()
@@ -409,7 +355,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("最多保留 3 个 Feature", result["result"]["reason"])
         run.assert_not_called()
 
-    def test_refill_prepares_missing_mix_type_before_old_candidates(self):
+    def test_refill_does_not_generate_a_missing_type_when_ready_pool_is_healthy(self):
         stamp = now_iso()
         for index in range(6):
             self.db.execute(
@@ -426,12 +372,10 @@ class CoreTests(unittest.TestCase):
                       '困难','[]','old-candidate','candidate',?,?)""",
             (stamp, stamp),
         )
-        scheduled = []
-        with patch.object(self.service, "_task_mix_priority", return_value=["bugfix", "feature", "zero_to_one"]), \
-             patch.object(self.service, "_schedule_task_source", side_effect=lambda kind: scheduled.append(kind) or True), \
+        with patch.object(self.service, "_schedule_any_task_source") as schedule, \
              patch.object(self.service, "validate_task_async") as validate:
             self.service._schedule_refill_once()
-        self.assertEqual(scheduled, ["bugfix"])
+        schedule.assert_not_called()
         validate.assert_not_called()
 
     def test_language_framework_field_keeps_only_technology_names(self):
