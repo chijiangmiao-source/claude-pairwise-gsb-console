@@ -178,3 +178,35 @@ def bug_discovery_prompt(task: str, arm: str, commit_sha: str, docker_evidence: 
 {docker_evidence}
 
 只按 Schema输出。"""
+
+
+def bugfix_task_prompt(candidate_evidence: str, existing_tasks: str,
+                       previous_prompt: str = "", issues: str = "") -> str:
+    correction = ""
+    if previous_prompt:
+        correction = f"""
+
+上一次草稿：
+{previous_prompt}
+
+上一次草稿存在的问题：
+{issues or '没有按真实证据自然组织题面'}
+
+不要修补原句式，请根据原始证据重新组织一份全新的题面。
+"""
+    return f"""把已经在两次清洁 Docker 环境中真实复现的 Bug 整理成一份交给开发者的修复题面。
+
+题面必须忠实使用候选中的前置条件、操作、真实结果、正确行为、复现命令输出和源码位置。不得把预计结果改写成已发生事实，也不得补造接口、文件、数字、原因或测试结论。需要把触发条件、关键操作、用户可见后果和修复后的可执行验收讲清楚，并保留现有 Docker Compose 启动与验收链路。
+
+根据这个 Bug 自身的因果关系自然组织文字。不要套用固定开头、固定段落顺序或固定结尾；不要使用“前置条件：”“复现步骤：”“实际结果：”“预期结果：”四段结构，也不要写“请修复该问题，保留现有 Docker Compose 启动与验收链路，并补充覆盖复现路径的自动化验收”。可以使用自然段；只有确实有助于执行时才使用短列表。回归验收要说明真实需要执行的场景和结果，不能只写“补充测试”。
+
+避免与历史题目重复核心问题、组织骨架和验收表达。不要通过替换业务名、接口名或同义词来改写历史题。
+
+Bug 候选与两次真实复现证据：
+{candidate_evidence}
+
+相近的已有题目：
+{existing_tasks or '无'}
+{correction}
+
+只按 Schema 返回。prompt 是最终完整题面；evidenceUsed 简要列出题面实际采用的候选字段、命令输出或源码位置，供系统内部核对，不把这份列表追加进题面。"""

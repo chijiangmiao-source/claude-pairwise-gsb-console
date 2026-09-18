@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def now_iso() -> str:
@@ -77,6 +77,7 @@ class Database:
             for name, definition in (
                 ("reproduction_commands_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("reproduction_results_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("source_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if name not in bug_columns:
                     c.execute("ALTER TABLE bug_candidates ADD COLUMN %s %s" % (name, definition))
@@ -414,6 +415,7 @@ CREATE TABLE IF NOT EXISTS bug_candidates (
   reproduction_steps_json TEXT NOT NULL,
   reproduction_commands_json TEXT NOT NULL DEFAULT '[]',
   reproduction_results_json TEXT NOT NULL DEFAULT '[]',
+  source_paths_json TEXT NOT NULL DEFAULT '[]',
   actual_result TEXT NOT NULL,
   expected_result TEXT NOT NULL,
   reproduce_count INTEGER NOT NULL DEFAULT 0,

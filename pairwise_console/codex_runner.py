@@ -245,3 +245,17 @@ BUG_DISCOVERY_SCHEMA = {
         },
     },
 }
+
+
+BUG_TASK_PROMPT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["prompt", "evidenceUsed"],
+    "properties": {
+        "prompt": {"type": "string", "minLength": 200, "maxLength": 3000},
+        "evidenceUsed": {
+            "type": "array", "minItems": 3, "maxItems": 12,
+            "items": {"type": "string", "maxLength": 300},
+        },
+    },
+}

@@ -17,7 +17,7 @@ from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
 from .classification import normalize_project_category, normalize_stack
 from .codex_runner import (
-    ACTUAL_DIFFICULTY_SCHEMA, BUG_DISCOVERY_SCHEMA, CodexRunner,
+    ACTUAL_DIFFICULTY_SCHEMA, BUG_DISCOVERY_SCHEMA, BUG_TASK_PROMPT_SCHEMA, CodexRunner,
     GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA,
 )
 from .config import Config, MAX_PAIR_PROJECTS
@@ -25,7 +25,7 @@ from .db import Database, now_iso
 from .gitops import GitOps
 from .importer import fingerprint, import_historical_tasks
 from .prompts import (
-    actual_difficulty_review_prompt, bug_discovery_prompt, feature_generation_prompt,
+    actual_difficulty_review_prompt, bug_discovery_prompt, bugfix_task_prompt, feature_generation_prompt,
     gsb_prompt, gsb_recheck_prompt, task_generation_prompt, task_validation_prompt,
 )
 from .recording import RecordingManager
@@ -55,6 +55,14 @@ ELIGIBLE_TASK_SQL = "(difficulty IN ('困难','地狱') OR (task_type='bugfix' A
 MAX_FEATURE_TASKS_PER_PROJECT = 3
 A9_REJECTED_PROMPT_FRAGMENTS = (
     "请修复该问题保留现有dockercompose启动与验收链路并补充覆盖复现路径的自动化验收",
+)
+RETIRED_BUG_PROMPT_FRAGMENTS = (
+    "这个缺陷已在清洁环境中重复出现",
+    "正确性要求是",
+    "沿用项目当前的dockercompose启动方式自动化验收要重放从",
+    "修复应保持已有dockercompose启动入口可用请把",
+    "同时保留当前dockercompose启动流程新增验收需要从",
+    "不改变项目现有的dockercompose使用方式回归验收要实际执行",
 )
 
 
@@ -1264,40 +1272,120 @@ class PairwiseService:
                 )
         return ""
 
-    @staticmethod
-    def _compose_bugfix_task_prompt(candidate: Dict[str, Any]) -> str:
-        """Build a candidate-specific issue report without the retired A-9 template."""
-        title = str(candidate.get("title") or "").strip()
-        preconditions = str(candidate.get("preconditions") or "").strip()
-        actual = str(candidate.get("actual_result") or "").strip()
-        expected = str(candidate.get("expected_result") or "").strip()
-        raw_steps = json.loads(str(candidate.get("reproduction_steps_json") or "[]"))
-        steps = [str(step).strip() for step in raw_steps if str(step).strip()]
-        flow = "；随后".join(steps)
-        first_step = steps[0] if steps else preconditions
-        last_step = steps[-1] if steps else expected
-        variant = int(hashlib.sha256((title + preconditions).encode("utf-8")).hexdigest()[:2], 16) % 4
+    @classmethod
+    def _bugfix_prompt_issues(cls, prompt: str) -> List[str]:
+        text = str(prompt or "").strip()
+        normalized = cls._normalized_task_text(text)
+        issues: List[str] = []
+        if len(text) < 200:
+            issues.append("题面少于 200 字，未完整说明复现和验收")
+        if len(text) > 3000:
+            issues.append("题面超过 3000 字")
+        if re.search(r"(?m)^\s*(?:#{1,6}\s*)?(?:前置条件|复现步骤|实际结果|预期结果)\s*[：:]", text):
+            issues.append("仍在使用前置条件、复现步骤、实际结果、预期结果固定分段")
+        if re.search(r"(?m)^\s*(?:需要修复|缺陷场景)\s*[：:]", text):
+            issues.append("仍在使用已经停用的 Bug 固定开头")
+        if any(cls._normalized_task_text(fragment) in normalized for fragment in RETIRED_BUG_PROMPT_FRAGMENTS):
+            issues.append("仍在使用已经停用的 Bug 固定句式")
+        if any(fragment in normalized for fragment in A9_REJECTED_PROMPT_FRAGMENTS):
+            issues.append("仍在使用 A-9 已拒绝的固定结尾")
+        if "dockercompose" not in normalized:
+            issues.append("没有保留 Docker Compose 启动与验收链路")
+        if "自动化" not in text or not ("验收" in text or "测试" in text):
+            issues.append("没有给出可执行的自动化验收要求")
+        return issues
 
-        if variant == 0:
-            return (
-                "%s\n\n这个缺陷已在清洁环境中重复出现。触发它需要%s，操作顺序是%s。\n\n"
-                "完成这些操作后会出现%s；正确行为应是%s。\n\n"
-                "请围绕“%s”修正实现，沿用项目当前的 Docker Compose 启动方式。自动化验收要重放从“%s”到“%s”的完整路径，并确认最终得到“%s”。"
-            ) % (title, preconditions, flow, actual, expected, title, first_step, last_step, expected)
-        if variant == 1:
-            return (
-                "需要修复：%s\n\n在%s时，依次执行%s，当前会%s。业务上必须%s。\n\n"
-                "修复应保持已有 Docker Compose 启动入口可用。请把“%s”触发后的真实结果写进自动化验收，并覆盖最后的“%s”，防止同类回归。"
-            ) % (title, preconditions, flow, actual, expected, first_step, last_step)
-        if variant == 2:
-            return (
-                "%s\n\n正确性要求是%s。现在只要满足%s，再按%s操作，就会%s。\n\n"
-                "请修正造成这一结果的实现，同时保留当前 Docker Compose 启动流程。新增验收需要从“%s”开始走到“%s”，用真实结果证明上述正确性要求成立。"
-            ) % (title, expected, preconditions, flow, actual, first_step, last_step)
-        return (
-            "缺陷场景：%s\n\n%s是复现所需条件。实际操作为%s；系统随后%s，但产品需要%s。\n\n"
-            "请针对“%s”完成修复，不改变项目现有的 Docker Compose 使用方式。回归验收要实际执行“%s”，并在“%s”之后核对最终状态，而不是只检查接口可调用。"
-        ) % (title, preconditions, flow, actual, expected, title, first_step, last_step)
+    def _generate_bugfix_task_prompt(self, candidate: Dict[str, Any], arm: Dict[str, Any],
+                                     source_task: Dict[str, Any]) -> str:
+        raw_results = json.loads(str(candidate.get("reproduction_results_json") or "[]"))
+        reproduction_results = []
+        for raw_attempt in raw_results[:2] if isinstance(raw_results, list) else []:
+            if not isinstance(raw_attempt, dict):
+                continue
+            compact_attempt = {
+                "attempt": raw_attempt.get("attempt"),
+                "passed": bool(raw_attempt.get("passed")),
+                "startExitCode": raw_attempt.get("startExitCode"),
+                "commands": [],
+            }
+            for raw_command in (raw_attempt.get("commands") or [])[:8]:
+                if not isinstance(raw_command, dict):
+                    continue
+                compact_attempt["commands"].append({
+                    "composeArgs": raw_command.get("composeArgs") or [],
+                    "exitCode": raw_command.get("exitCode"),
+                    "expectedExitCode": raw_command.get("expectedExitCode"),
+                    "expectedOutputContains": raw_command.get("expectedOutputContains") or "",
+                    "matched": bool(raw_command.get("matched")),
+                    "outputTail": str(raw_command.get("output") or "")[-1800:],
+                })
+            reproduction_results.append(compact_attempt)
+        evidence = {
+            "title": candidate.get("title"),
+            "preconditions": candidate.get("preconditions"),
+            "steps": json.loads(str(candidate.get("reproduction_steps_json") or "[]")),
+            "reproductionCommands": json.loads(str(candidate.get("reproduction_commands_json") or "[]")),
+            "reproductionResults": reproduction_results,
+            "actual": candidate.get("actual_result"),
+            "expected": candidate.get("expected_result"),
+            "difficulty": candidate.get("difficulty"),
+            "difficultyEvidence": json.loads(str(candidate.get("difficulty_evidence_json") or "[]")),
+            "sourcePaths": json.loads(str(candidate.get("source_paths_json") or "[]")),
+            "sourceCommit": candidate.get("source_sha"),
+        }
+        seed = {
+            "source": "bug_discovery", "task_type": "bugfix",
+            "title": str(candidate.get("title") or ""),
+            "prompt": "\n".join(str(evidence.get(key) or "") for key in (
+                "title", "preconditions", "actual", "expected",
+            )),
+        }
+        existing = self._task_duplicate_context(seed)
+        previous = ""
+        correction = ""
+        duplicate = ""
+        workspace = Path(str(arm.get("workspace_path") or ""))
+        for attempt in (1, 2):
+            result = self.codex.run(
+                "bug_task_generation",
+                bugfix_task_prompt(
+                    json.dumps(evidence, ensure_ascii=False, indent=2),
+                    json.dumps(existing, ensure_ascii=False, indent=2),
+                    previous, correction,
+                ),
+                BUG_TASK_PROMPT_SCHEMA,
+                cwd=workspace if workspace.is_dir() else None,
+                pair_id=str(candidate.get("source_pair_id") or ""),
+                task_id=str(source_task.get("id") or ""),
+                timeout=1200,
+            )
+            prompt = str(result.get("prompt") or "").strip()
+            issues = self._bugfix_prompt_issues(prompt)
+            duplicate = self._deterministic_task_duplicate({
+                "source": "bug_discovery", "task_type": "bugfix",
+                "title": candidate.get("title"), "prompt": prompt,
+            })
+            if duplicate:
+                issues.append(duplicate)
+            if not issues:
+                self.db.audit("bug.prompt_generated", "bug_candidate", candidate["id"], {
+                    "attempt": attempt,
+                    "evidenceUsed": result.get("evidenceUsed") or [],
+                    "promptLength": len(prompt),
+                })
+                return prompt
+            previous = prompt
+            correction = "；".join(issues)
+        stamp = now_iso()
+        status = "duplicate_rejected" if duplicate else "prompt_generation_failed"
+        self.db.execute(
+            "UPDATE bug_candidates SET status=?,error=?,updated_at=? WHERE id=?",
+            (status, correction[-2000:], stamp, candidate["id"]),
+        )
+        self.db.audit("bug.prompt_generation_failed", "bug_candidate", candidate["id"], {
+            "status": status, "reason": correction,
+        })
+        raise ValueError(correction)
 
     def validate_task(self, task_id: str) -> Dict[str, Any]:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -1761,11 +1849,13 @@ class PairwiseService:
             self.db.execute(
                 """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
                    reproduction_steps_json,reproduction_commands_json,actual_result,expected_result,difficulty,
-                   difficulty_evidence_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   difficulty_evidence_json,source_paths_json,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (candidate_id, pair_id, selected, arm["commit_sha"], candidate["title"], candidate["preconditions"],
                  json.dumps(candidate["steps"], ensure_ascii=False), json.dumps(candidate["reproductionCommands"], ensure_ascii=False),
                  candidate["actual"], candidate["expected"],
-                 difficulty, json.dumps(candidate["difficultyEvidence"], ensure_ascii=False), status, stamp, stamp),
+                 difficulty, json.dumps(candidate["difficultyEvidence"], ensure_ascii=False),
+                 json.dumps(candidate["sourcePaths"], ensure_ascii=False), status, stamp, stamp),
             )
             created.append(candidate_id)
         self.db.audit("bug.discovery_completed", "pair", pair_id, {
@@ -1859,7 +1949,7 @@ class PairwiseService:
             """SELECT t.* FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
             (candidate["source_pair_id"],),
         ) or {}
-        prompt = self._compose_bugfix_task_prompt(candidate)
+        prompt = self._generate_bugfix_task_prompt(candidate, arm, source_task)
         duplicate = self._deterministic_task_duplicate({
             "source": "bug_discovery", "task_type": "bugfix",
             "title": candidate["title"], "prompt": prompt,

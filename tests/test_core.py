@@ -1209,6 +1209,8 @@ class CoreTests(unittest.TestCase):
         self.assertIn("project_category", task_columns)
         attempt_columns = {row["name"] for row in self.db.all("PRAGMA table_info(recording_attempts)")}
         self.assertIn("interaction_mode", attempt_columns)
+        bug_columns = {row["name"] for row in self.db.all("PRAGMA table_info(bug_candidates)")}
+        self.assertIn("source_paths_json", bug_columns)
         gsb_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_reviews)")}
         self.assertTrue({"draft_verdict", "final_verdict", "evidence_version", "a_reason", "b_reason", "preference_reason"} <= gsb_columns)
         recheck_columns = {row["name"] for row in self.db.all("PRAGMA table_info(gsb_rechecks)")}
@@ -2793,7 +2795,25 @@ class CoreTests(unittest.TestCase):
              '["send two requests"]', "one update disappears", "both updates persist", 2, "困难",
              '["并发事务","异常恢复"]', "reproduced", stamp, stamp),
         )
-        task = self.service.convert_bug_to_task("bug-1")
+        old_template = (
+            "Concurrent commit loses update\n\n前置条件：two clients\n\n复现步骤：send two requests\n\n"
+            "实际结果：one update disappears\n\n预期结果：both updates persist\n\n"
+            "请修复该问题，保留现有 Docker Compose 启动与验收链路，并补充覆盖复现路径的自动化验收。"
+        )
+        natural_prompt = (
+            "两个客户端从同一版本同时提交更新时，服务端目前会让后到的提交覆盖先到结果，"
+            "最终只能看到一份修改。这个现象已经用 send two requests 在两次独立环境中重复确认，"
+            "实际输出都是 one update disappears，而产品约定要求 both updates persist。\n\n"
+            "请沿着并发提交时的读取、版本判断和写入链路修正一致性处理，使两个互不冲突的更新都能保存；"
+            "发生真实字段冲突时仍需返回现有冲突响应，不能通过串行覆盖来掩盖问题。不要改变当前对外接口和"
+            "Docker Compose 启动方式。自动化验收需要在清洁环境中让两个客户端基于同一版本同步提交，"
+            "核对两次请求结果与最终持久化内容，并再次运行已有冲突场景，确认 both updates persist 且旧行为没有回退。"
+        )
+        with patch.object(self.service.codex, "run", side_effect=[
+            {"prompt": old_template, "evidenceUsed": ["preconditions", "steps", "actual"]},
+            {"prompt": natural_prompt, "evidenceUsed": ["preconditions", "steps", "actual", "expected"]},
+        ]) as generated:
+            task = self.service.convert_bug_to_task("bug-1")
         self.assertEqual(task["task_type"], "bugfix")
         self.assertEqual(task["parent_pair_id"], pair["id"])
         self.assertEqual(task["status"], "ready")
@@ -2803,6 +2823,8 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("请修复该问题，保留现有 Docker Compose", task["prompt"])
         self.assertIn("send two requests", task["prompt"])
         self.assertIn("both updates persist", task["prompt"])
+        self.assertEqual(generated.call_count, 2)
+        self.assertIn("上一次草稿存在的问题", generated.call_args.args[1])
 
     def test_arm_delivery_is_squashed_to_one_commit_on_baseline(self):
         self.insert_ready_task()
