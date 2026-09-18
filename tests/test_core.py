@@ -1626,6 +1626,38 @@ class CoreTests(unittest.TestCase):
         self.assertIn("轨迹文件校验未通过", delivery["error"])
         self.assertNotIn("题面不一致", delivery["error"])
 
+    def test_trace_repair_does_not_restart_a_replaced_pair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        arm = {
+            "id": pair["id"] + "-a", "pair_id": pair["id"], "arm": "A",
+            "status": "completed", "attempt_no": 3,
+        }
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?)""",
+            (arm["id"], pair["id"], "A", "A", str(self.root / "A"), "container-A", "screen-A",
+             "auto_model/urm", "image", stamp, stamp),
+        )
+        self.db.execute(
+            "UPDATE pairs SET status='failed',stage='replaced',error='已自动换题' WHERE id=?",
+            (pair["id"],),
+        )
+        with patch.object(self.service, "_restart_arm_from_baseline") as restart, \
+             patch.object(self.service, "_submit_monitor") as monitor:
+            result = self.service._restart_trace_invalid_arms(
+                pair["id"], [arm], "Build a hard project with Docker Compose", ["A 轨迹目录无效"],
+            )
+
+        self.assertEqual(result["skipped"], "terminal_pair")
+        restart.assert_not_called()
+        monitor.assert_not_called()
+        self.assertEqual(
+            self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
+            {"status": "failed", "stage": "replaced"},
+        )
+
     def test_retired_pair_delivery_is_discarded_instead_of_waiting_for_repair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

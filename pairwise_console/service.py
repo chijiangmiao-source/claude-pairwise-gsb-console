@@ -2396,9 +2396,40 @@ class PairwiseService:
         text = str(error or "").casefold()
         return "api error" in text or "litellm" in text
 
+    @staticmethod
+    def _pair_blocks_development_restart(pair: Dict[str, Any]) -> bool:
+        return str(pair.get("status") or "") in ("failed", "cancelled") or str(
+            pair.get("stage") or ""
+        ) in ("task_replacement", "replaced", "replacement_failed")
+
+    def _abort_development_restart(self, pair_id: str, arm_id: str,
+                                   reason: str) -> Optional[Dict[str, Any]]:
+        pair = self._pair(pair_id)
+        if not self._pair_blocks_development_restart(pair):
+            return None
+        arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+        if arm.get("status") in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
+            stamp = now_iso()
+            self.db.execute(
+                "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
+                (reason[-2000:], stamp, stamp, arm_id),
+            )
+            arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
+        arm["restart_skipped_terminal_pair"] = True
+        self.db.audit("claude.restart_skipped_terminal_pair", "arm_run", arm_id, {
+            "pair_id": pair_id, "pair_status": pair.get("status"),
+            "pair_stage": pair.get("stage"), "reason": reason[-1000:],
+        })
+        return arm
+
     def _restart_arm_from_baseline(self, pair_id: str, arm: Dict[str, Any], prompt: str,
                                    error: str, count_development_failure: bool = True,
                                    count_error_retry: bool = True) -> Dict[str, Any]:
+        blocked = self._abort_development_restart(
+            pair_id, arm["id"], "Pair 已进入换题或失败终态，取消启动新的 Claude Session",
+        )
+        if blocked:
+            return blocked
         pair = self._pair(pair_id)
         self._invalidate_recordings(pair_id, [arm.get("arm")], error)
         restarted = self.claude.archive_failed_attempt(
@@ -2414,6 +2445,11 @@ class PairwiseService:
             (redact(error)[-2000:], now_iso(), arm["id"]),
         )
         time.sleep(delay)
+        blocked = self._abort_development_restart(
+            pair_id, arm["id"], "准备重跑期间 Pair 已进入换题或失败终态，取消启动新的 Claude Session",
+        )
+        if blocked:
+            return blocked
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
         self.claude.launch(restarted)
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
@@ -2730,6 +2766,14 @@ class PairwiseService:
 
     def _restart_trace_invalid_arms(self, pair_id: str, arms: List[Dict[str, Any]],
                                     prompt: str, issues: List[str]) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        if self._pair_blocks_development_restart(pair):
+            self.db.audit("claude.trace_repair_skipped_terminal_pair", "pair", pair_id, {
+                "pair_status": pair.get("status"), "pair_stage": pair.get("stage"),
+                "issues": list(dict.fromkeys(issues)),
+            })
+            return {"pairId": pair_id, "restarted": [], "issues": list(dict.fromkeys(issues)),
+                    "skipped": "terminal_pair"}
         active_arms = int((self.db.one(
             """SELECT COUNT(*) count FROM arm_runs
                WHERE status IN ('queued','running','developing','waiting_retry','checkpointing')"""
@@ -2745,8 +2789,13 @@ class PairwiseService:
             if prompt_mismatch else
             "轨迹文件不可用，按数据库原题面重新运行"
         )
-        pair = self._pair(pair_id)
         with self.db.transaction() as conn:
+            current_pair = conn.execute(
+                "SELECT status,stage FROM pairs WHERE id=?", (pair_id,),
+            ).fetchone()
+            if not current_pair or self._pair_blocks_development_restart(dict(current_pair)):
+                return {"pairId": pair_id, "restarted": [],
+                        "issues": list(dict.fromkeys(issues)), "skipped": "terminal_pair"}
             conn.execute(
                 """UPDATE pairs SET status='running',stage='development',winner='',completed_at=NULL,
                    error=?,updated_at=? WHERE id=?""",
@@ -2781,6 +2830,8 @@ class PairwiseService:
                 retry_reason,
                 count_development_failure=False,
             )
+            if current.get("restart_skipped_terminal_pair"):
+                continue
             restarted.append(str(arm["arm"]))
             self._submit_monitor(
                 "monitor-" + current["id"], self._monitor_arm,
