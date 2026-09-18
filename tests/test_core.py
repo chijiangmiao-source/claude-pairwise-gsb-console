@@ -149,6 +149,31 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(submitted[1][0], "bugs-" + pair["id"])
         self.assertIs(submitted[1][1].__func__, self.service.discover_bugs.__func__)
 
+    def test_refill_prepares_missing_mix_type_before_old_candidates(self):
+        stamp = now_iso()
+        for index in range(6):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+                   difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
+                ("task-pool-%d" % index, "test", "zero_to_one", "ready", "hard task",
+                 "pool-%d" % index, stamp, stamp),
+            )
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+               difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+               VALUES('task-old-candidate','test','zero_to_one','candidate','hard task',
+                      '困难','[]','old-candidate','candidate',?,?)""",
+            (stamp, stamp),
+        )
+        scheduled = []
+        with patch.object(self.service, "_task_mix_priority", return_value=["bugfix", "feature", "zero_to_one"]), \
+             patch.object(self.service, "_schedule_task_source", side_effect=lambda kind: scheduled.append(kind) or True), \
+             patch.object(self.service, "validate_task_async") as validate:
+            self.service._schedule_refill_once()
+        self.assertEqual(scheduled, ["bugfix"])
+        validate.assert_not_called()
+
     def test_language_framework_field_keeps_only_technology_names(self):
         self.assertEqual(
             normalize_stack(

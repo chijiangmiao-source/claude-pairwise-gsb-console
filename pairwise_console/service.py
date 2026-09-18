@@ -769,13 +769,6 @@ class PairwiseService:
             active = sum(1 for key, future in self._futures.items() if key.startswith("validate-") and not future.done())
             generation_active = any(key.startswith("generate-") and not future.done() for key, future in self._futures.items())
         capacity = max(0, int(self.db.setting("task_generation_max_parallel", 6)) - active)
-        needed = max(0, target - ready)
-        candidates = self.db.all(
-            "SELECT id FROM tasks WHERE status='candidate' AND difficulty IN ('困难','地狱') ORDER BY created_at LIMIT ?",
-            (min(capacity, needed),),
-        )
-        for row in candidates:
-            self.validate_task_async(row["id"])
         ready_by_type = {
             row["task_type"]: int(row.get("count") or 0)
             for row in self.db.all(
@@ -785,11 +778,18 @@ class PairwiseService:
         }
         priority = self._task_mix_priority(include_ready=True)
         missing_type = next((task_type for task_type in priority if not ready_by_type.get(task_type)), None)
-        if capacity and not candidates and not generation_active and missing_type:
+        if capacity and not generation_active and missing_type:
             self._schedule_task_source(missing_type)
             return
         if ready >= minimum:
             return
+        needed = max(0, target - ready)
+        candidates = self.db.all(
+            "SELECT id FROM tasks WHERE status='candidate' AND difficulty IN ('困难','地狱') ORDER BY created_at LIMIT ?",
+            (min(capacity, needed),),
+        )
+        for row in candidates:
+            self.validate_task_async(row["id"])
         if needed and capacity and not candidates and not generation_active:
             self._schedule_task_source(priority[0])
 
