@@ -9,8 +9,8 @@ function stringSample(schema, fieldName) {
   if (/file.*name|filename/.test(name)) return "demo.bin";
   if (/id$|_id$|uuid/.test(name)) return "demo-1";
   if (schema.format === "email") return "demo@example.com";
-  if (schema.format === "date") return "2026-01-01";
-  if (schema.format === "date-time") return "2026-01-01T00:00:00Z";
+  if (schema.format === "date") return "2099-01-01";
+  if (schema.format === "date-time") return "2099-01-01T00:00:00Z";
   const minimum = Math.max(1, Number(schema.minLength || 1));
   return "demo".padEnd(minimum, "x");
 }

@@ -34,3 +34,8 @@ test("builds distinct coordinates for required paths", () => {
   }, {});
   assert.deepEqual(value.path, [[-5, 5], [15, 5]]);
 });
+
+test("uses a stable future date for expiring resources", () => {
+  assert.equal(sampleValue({ type: "string", format: "date-time" }, {}, 0, "expires_at"),
+    "2099-01-01T00:00:00Z");
+});
