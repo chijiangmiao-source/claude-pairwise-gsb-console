@@ -1,6 +1,8 @@
 BANNED_TASKS = """禁止生成或放行这些题型及换皮版本：经典小游戏与图形模拟；通用命令行、本地文件和桌面小工具；电商、订单、RBAC、库存、OA、CMS、挂号、CRM、聊天、拍卖、停车、工单、预约等通用业务 CRUD；报表、CSV 看板、记账、健身、菜谱、天气、番茄钟、习惯、播放器、旅行或观影记录等常见页面。"""
 
-DIFFICULTY_RULES = """只有困难或地狱可进入 A/B。困难必须整合多个模块或系统约束，做关键设计取舍，并处理复杂状态、兼容性、权限、并发、性能或异常链路；地狱还要求架构级判断、多步复杂调试或大量边界场景。文件多、页面多、字段多、题面长不能单独证明难度。"""
+DIFFICULTY_RULES = """只有困难或地狱可进入 A/B。困难必须整合多个模块或系统约束，做关键设计取舍，并处理复杂状态、兼容性、权限、并发、性能或异常链路；地狱还要求架构级判断、多步复杂调试或大量边界场景。文件多、页面多、字段多、题面长不能单独证明难度。
+
+必须按“满足题面所需的最小实现”预判，而不是按可能出现的最复杂实现判定。若现有架构已经提供核心状态机、事务、算法、恢复或兼容机制，任务只是增加字段、接口、条件分支、页面展示、迁移列、包装现有算法或补测试，即使跨多个文件也通常只是中等。困难任务至少要有两个相互制约且题面强制验收的高复杂度机制，例如并发一致性与兼容迁移、持久化恢复与幂等协议、性能上界与精确正确性；开发者自行增加的复杂设计不能计入。"""
 
 
 def actual_difficulty_review_prompt(task: str, original_difficulty: str,
@@ -31,7 +33,9 @@ B 的真实开发、代码与验收证据：
 只按 Schema 返回。reason 用中文说明关键复杂度与判定依据；evidence 只列真实可核对的文件、函数、命令、测试场景或结果。"""
 
 
-def task_validation_prompt(task_text: str, known_titles: str) -> str:
+def task_validation_prompt(task_text: str, known_titles: str,
+                           baseline_evidence: str = "",
+                           recent_rejections: str = "") -> str:
     return f"""你负责新系统的题目准入复核。根据给定题目判断是否可以进入 A/B 开发。
 
 {DIFFICULTY_RULES}
@@ -39,10 +43,18 @@ def task_validation_prompt(task_text: str, known_titles: str) -> str:
 
 还要检查：必须能用 Docker Compose 清洁启动；应包含可操作的功能验收；不能只是改名换皮；与已有题目不能在核心功能、交互、数据模型、验收或技术实现上高度重复。
 
+先做一次最小实现预演：列出题面不可省略的状态变化、数据边界和验收，再对照基线已有能力，判断最短正确实现是否仍需要困难级设计。Feature 或 Bug 必须检查准确基线中的现有模块；如果主要工作可以复用现有机制并通过直接扩字段、加路由、循环筛选、区间切分、调用既有算法或增加前端状态完成，应判为中等并拒绝。只有题面明确强制至少两个相互制约的复杂机制，而且验收能证明这些机制确实被实现，才能判为困难。difficultyEvidence 必须说明这些机制为何不能沿现有模式机械完成，不能只复述题面。
+
 判定应依据题面真实内容，不能用内部字段是否单独填写代替事实判断。zero_to_one 本来就是从空仓库开始，baseline_path 为空属于正确基线，baselineReady 应判为 true。历史任务的 acceptance 数组可能为空；只要原始 prompt 已经写明 Docker Compose、验证服务、接口结果或可执行验收场景，就视为具备验收条件，不能仅因 acceptance 字段为空拒绝。只有发现明确的难度不足、禁出题、实质重复、Feature/Bug 缺少准确任务前代码，或题面确实无法验收时才拒绝；不要把可由系统直接整理的元数据缺项当成阻塞。
 
 已有题目摘要：
 {known_titles or '无'}
+
+准确基线摘要；Feature/Bug 可在当前工作目录继续查看代码，并以 baseline_sha 对应提交为准：
+{baseline_evidence or '0–1 从空仓库开始，无既有实现可复用'}
+
+近期开发完成后被降为简单或中等的真实案例。待复核题目若采用同类最小实现，应直接拒绝：
+{recent_rejections or '无'}
 
 待复核题目：
 {task_text}
@@ -56,7 +68,7 @@ def task_generation_prompt(existing: str, task_type: str = "zero_to_one") -> str
 {DIFFICULTY_RULES}
 {BANNED_TASKS}
 
-直接生成困难或地狱任务，不先生成低难度再升级。projectCategory 必须明确选择纯后端、纯前端或全栈；纯后端不得创建前端，纯前端不得创建业务后端，全栈必须通过真实 API 联调。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如后端写 Python 3.13, FastAPI，前端写 TypeScript, React，全栈写 Python 3.13, FastAPI, TypeScript, React；不得写 Pydantic、SQLAlchemy、Vite、数据库、测试工具、Playwright、Docker、架构、算法、业务能力、约束或说明性句子。题面要给出明确业务背景、复杂状态或异常链路、技术约束、边界条件与验收条件；必须要求 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，并保证克隆后只依赖 Docker 即可运行。避免复述实现方案，给开发者保留关键设计取舍。
+直接生成困难或地狱任务，不先生成低难度再升级。输出前先在内部做最小实现预演，确保任务不能靠普通 CRUD、字段贯通、直接循环、既有算法包装或常规页面状态完成。题面必须强制至少两个相互制约的困难机制，并为每个机制写出能区分真实实现与表面实现的验收场景；只堆字段、边界条件、页面和测试数量不合格。projectCategory 必须明确选择纯后端、纯前端或全栈；纯后端不得创建前端，纯前端不得创建业务后端，全栈必须通过真实 API 联调。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如后端写 Python 3.13, FastAPI，前端写 TypeScript, React，全栈写 Python 3.13, FastAPI, TypeScript, React；不得写 Pydantic、SQLAlchemy、Vite、数据库、测试工具、Playwright、Docker、架构、算法、业务能力、约束或说明性句子。题面要给出明确业务背景、复杂状态或异常链路、技术约束、边界条件与验收条件；必须要求 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，并保证克隆后只依赖 Docker 即可运行。避免复述实现方案，给开发者保留关键设计取舍。
 
 已有题目标题与摘要，必须避免雷同：
 {existing or '无'}
@@ -70,7 +82,7 @@ def feature_generation_prompt(original_task: str, artifact_summary: str, existin
 {DIFFICULTY_RULES}
 {BANNED_TASKS}
 
-必须在现有产品和代码结构上增加真实的新能力，保留现有功能、接口与 Docker Compose 验收链路。projectCategory 必须保持为 {project_category or '原项目类别'}，不得把纯后端擅自改成全栈或给纯前端增加业务后端。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如后端写 Python 3.13, FastAPI，前端写 TypeScript, React，全栈写 Python 3.13, FastAPI, TypeScript, React；不得写 Pydantic、SQLAlchemy、Vite、数据库、测试工具、Playwright、Docker、架构、算法、业务能力、约束或说明性句子。直接生成困难或地狱任务，复杂度必须来自跨模块状态、性能、并发、异常恢复或兼容性等真实约束，不能靠堆字段或扩大文字。题面要明确新行为、边界条件与可执行验收，但给开发者保留实现取舍。taskType 必须为 feature。
+必须在现有产品和代码结构上增加真实的新能力，保留现有功能、接口与 Docker Compose 验收链路。先检查摘要和当前基线已经具备的状态机、事务、算法、恢复和兼容能力；这些既有能力不能再次当作新题难度。最短正确实现若只是扩字段、加接口、调用既有算法、增加条件分支或页面状态，必须放弃该候选并重新生成。新题必须强制至少两个当前不存在且相互制约的困难机制，并用并发、恢复、兼容、性能或异常链路的可执行场景验收。projectCategory 必须保持为 {project_category or '原项目类别'}，不得把纯后端擅自改成全栈或给纯前端增加业务后端。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如后端写 Python 3.13, FastAPI，前端写 TypeScript, React，全栈写 Python 3.13, FastAPI, TypeScript, React；不得写 Pydantic、SQLAlchemy、Vite、数据库、测试工具、Playwright、Docker、架构、算法、业务能力、约束或说明性句子。直接生成困难或地狱任务，复杂度必须来自跨模块状态、性能、并发、异常恢复或兼容性等真实约束，不能靠堆字段或扩大文字。题面要明确新行为、边界条件与可执行验收，但给开发者保留实现取舍。taskType 必须为 feature。
 
 原始任务：
 {original_task}

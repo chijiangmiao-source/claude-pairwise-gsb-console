@@ -49,6 +49,7 @@ GSB_STEP_REFERENCE = re.compile(
     r"第\s*[一二三四五六七八九十百千万零〇\d]+"
     r"(?:\s*[、，,及和与]\s*[一二三四五六七八九十百千万零〇\d]+)*\s*步"
 )
+TASK_MIX_TYPES = ("zero_to_one", "feature", "bugfix")
 
 
 class PairwiseService:
@@ -107,6 +108,10 @@ class PairwiseService:
             "task_generation_max_parallel": self.config.task_generation_max_parallel,
             "task_pool_min_ready": 6,
             "task_pool_target_ready": 12,
+            "task_mix_zero_to_one": 7,
+            "task_mix_feature": 7,
+            "task_mix_bugfix": 10,
+            "task_mix_started_at": now_iso(),
             "auto_refill_enabled": True,
             "auto_refill_interval_seconds": 60,
             "auto_pipeline_enabled": False,
@@ -353,6 +358,8 @@ class PairwiseService:
             "readyTasks": ready,
             "generatingBatches": generating,
             "stages": stages,
+            "taskMixTarget": self._task_mix_weights(),
+            "taskMixProgress": self._task_mix_counts(),
         }
 
     def set_auto_pipeline(self, enabled: bool) -> Dict[str, Any]:
@@ -444,10 +451,7 @@ class PairwiseService:
             if active_count < MAX_PAIR_PROJECTS and self._resume_one_reusable_pair():
                 active_count += 1
             while active_count < MAX_PAIR_PROJECTS:
-                task = self.db.one(
-                    """SELECT * FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')
-                       ORDER BY created_at,id LIMIT 1"""
-                )
+                task = self._next_ready_task()
                 if not task:
                     break
                 pair = self.create_pair(task["id"])
@@ -645,12 +649,122 @@ class PairwiseService:
         })
         return True
 
+    def _task_mix_weights(self) -> Dict[str, int]:
+        return {
+            "zero_to_one": max(1, int(self.db.setting("task_mix_zero_to_one", 7))),
+            "feature": max(1, int(self.db.setting("task_mix_feature", 7))),
+            "bugfix": max(1, int(self.db.setting("task_mix_bugfix", 10))),
+        }
+
+    def _task_mix_counts(self, include_ready: bool = False) -> Dict[str, int]:
+        started_at = str(self.db.setting("task_mix_started_at", "") or "")
+        statuses = "'queued','running','review','completed'"
+        rows = self.db.all(
+            """SELECT t.task_type,COUNT(*) count FROM pairs p
+                 JOIN tasks t ON t.id=p.task_id
+                WHERE p.created_at>=? AND p.status IN (%s)
+                GROUP BY t.task_type""" % statuses,
+            (started_at,),
+        )
+        counts = {task_type: 0 for task_type in TASK_MIX_TYPES}
+        for row in rows:
+            if row.get("task_type") in counts:
+                counts[row["task_type"]] = int(row.get("count") or 0)
+        if include_ready:
+            for row in self.db.all(
+                """SELECT task_type,COUNT(*) count FROM tasks
+                   WHERE status='ready' AND difficulty IN ('困难','地狱')
+                     AND created_at>=?
+                   GROUP BY task_type""",
+                (started_at,),
+            ):
+                if row.get("task_type") in counts:
+                    counts[row["task_type"]] += int(row.get("count") or 0)
+        return counts
+
+    def _task_mix_priority(self, include_ready: bool = False) -> List[str]:
+        weights = self._task_mix_weights()
+        counts = self._task_mix_counts(include_ready=include_ready)
+        total = sum(counts.values()) + 1
+        weight_total = sum(weights.values())
+        return sorted(
+            TASK_MIX_TYPES,
+            key=lambda task_type: (
+                -(total * weights[task_type] / weight_total - counts[task_type]),
+                TASK_MIX_TYPES.index(task_type),
+            ),
+        )
+
+    def _next_ready_task(self) -> Optional[Dict[str, Any]]:
+        for task_type in self._task_mix_priority():
+            task = self.db.one(
+                """SELECT * FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')
+                   AND task_type=? ORDER BY created_at,id LIMIT 1""",
+                (task_type,),
+            )
+            if task:
+                return task
+        return None
+
+    def _schedule_task_source(self, task_type: str) -> bool:
+        if task_type == "zero_to_one":
+            return self._submit_auto(
+                "generate-mix-zero-to-one", self.generate_tasks, 1, "zero_to_one",
+            )
+        if task_type == "feature":
+            source = self.db.one(
+                """SELECT p.id FROM pairs p JOIN tasks t ON t.id=p.task_id
+                   WHERE p.status='completed' AND t.task_type='zero_to_one'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM tasks child WHERE child.parent_pair_id=p.id
+                         AND child.task_type='feature'
+                         AND child.status IN ('candidate','ready','used','rejected')
+                     )
+                   ORDER BY p.completed_at,p.id LIMIT 1"""
+            )
+            if source:
+                return self._submit_auto(
+                    "feature-" + source["id"], self.generate_followup_feature, source["id"],
+                )
+            return self._schedule_task_source("zero_to_one")
+        if task_type == "bugfix":
+            candidate = self.db.one(
+                """SELECT id FROM bug_candidates WHERE status='reproduced'
+                   ORDER BY updated_at,id LIMIT 1"""
+            )
+            if candidate:
+                return self._submit_auto(
+                    "bug-convert-" + candidate["id"], self.convert_bug_to_task, candidate["id"],
+                )
+            candidate = self.db.one(
+                """SELECT id FROM bug_candidates WHERE status='awaiting_reproduction'
+                   ORDER BY created_at,id LIMIT 1"""
+            )
+            if candidate:
+                return self._submit_auto(
+                    "bug-reproduce-" + candidate["id"], self.reproduce_bug, candidate["id"],
+                )
+            source = self.db.one(
+                """SELECT p.id FROM pairs p
+                   WHERE p.status='completed'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM audit_events e
+                        WHERE e.event_type='bug.discovery_completed'
+                          AND e.entity_type='pair' AND e.entity_id=p.id
+                     )
+                   ORDER BY p.completed_at,p.id LIMIT 1"""
+            )
+            if source:
+                return self._submit_auto(
+                    "bugs-" + source["id"], self.discover_bugs, source["id"],
+                )
+            return self._schedule_task_source("zero_to_one")
+        raise ValueError("未知任务类型：" + task_type)
+
     def _schedule_refill_once(self) -> None:
         ready = (self.db.one("SELECT COUNT(*) count FROM tasks WHERE status='ready' AND difficulty IN ('困难','地狱')") or {"count": 0})["count"]
         minimum = int(self.db.setting("task_pool_min_ready", 6))
         target = int(self.db.setting("task_pool_target_ready", 12))
-        if ready >= minimum:
-            return
         with self._future_lock:
             active = sum(1 for key, future in self._futures.items() if key.startswith("validate-") and not future.done())
             generation_active = any(key.startswith("generate-") and not future.done() for key, future in self._futures.items())
@@ -662,8 +776,22 @@ class PairwiseService:
         )
         for row in candidates:
             self.validate_task_async(row["id"])
+        ready_by_type = {
+            row["task_type"]: int(row.get("count") or 0)
+            for row in self.db.all(
+                """SELECT task_type,COUNT(*) count FROM tasks
+                   WHERE status='ready' AND difficulty IN ('困难','地狱') GROUP BY task_type"""
+            )
+        }
+        priority = self._task_mix_priority(include_ready=True)
+        missing_type = next((task_type for task_type in priority if not ready_by_type.get(task_type)), None)
+        if capacity and not candidates and not generation_active and missing_type:
+            self._schedule_task_source(missing_type)
+            return
+        if ready >= minimum:
+            return
         if needed and capacity and not candidates and not generation_active:
-            self.generate_tasks_async(min(capacity, needed), "zero_to_one")
+            self._schedule_task_source(priority[0])
 
     def preflight(self) -> Dict[str, Any]:
         return {
@@ -682,15 +810,64 @@ class PairwiseService:
         self._submit(operation, self.validate_task, task_id)
         return operation
 
+    def _task_baseline_evidence(self, task: Dict[str, Any]) -> str:
+        if task.get("task_type") == "zero_to_one":
+            return "0–1 从空仓库开始；必须仅依据题面判断最小正确实现的必要复杂度。"
+        workspace = Path(str(task.get("baseline_path") or ""))
+        baseline = str(task.get("baseline_sha") or "")
+        if not workspace.is_dir() or not re.fullmatch(r"[0-9a-f]{40}", baseline):
+            return json.dumps({
+                "baselineReady": False,
+                "path": str(workspace),
+                "baselineSha": baseline,
+            }, ensure_ascii=False)
+        files_result = run_command(
+            ["git", "ls-tree", "-r", "--name-only", baseline], cwd=workspace,
+            check=False, timeout=60,
+        )
+        files = [line[:300] for line in files_result.stdout.splitlines()[:180]]
+        readme = ""
+        for name in ("README.md", "README"):
+            shown = run_command(
+                ["git", "show", "%s:%s" % (baseline, name)], cwd=workspace,
+                check=False, timeout=60,
+            )
+            if shown.returncode == 0 and shown.stdout.strip():
+                readme = shown.stdout[:8000]
+                break
+        return json.dumps({
+            "baselineReady": files_result.returncode == 0,
+            "baselineSha": baseline,
+            "files": files,
+            "readme": readme,
+            "instruction": "需要时直接在当前目录用 git show <baselineSha>:<path> 查看准确基线源码。",
+        }, ensure_ascii=False)
+
     def validate_task(self, task_id: str) -> Dict[str, Any]:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
         if not task:
             raise KeyError("任务不存在")
         titles = self.db.all("SELECT id,title,substr(prompt,1,180) summary FROM tasks WHERE id<>? AND status IN ('ready','used') ORDER BY created_at DESC LIMIT 80", (task_id,))
+        recent_rejections = self.db.all(
+            """SELECT t.title,t.task_type,d.assessed_difficulty,d.reason
+                 FROM difficulty_reviews d JOIN pairs p ON p.id=d.pair_id
+                 JOIN tasks t ON t.id=p.task_id
+                WHERE d.status='rejected' ORDER BY d.reviewed_at DESC LIMIT 12"""
+        )
         payload = dict(task)
         payload["acceptance"] = json.loads(task.get("acceptance_json") or "[]")
-        prompt = task_validation_prompt(json.dumps(payload, ensure_ascii=False, indent=2), json.dumps(titles, ensure_ascii=False))
-        result = self.codex.run("task_validation", prompt, VALIDATION_SCHEMA, task_id=task_id)
+        baseline_evidence = self._task_baseline_evidence(task)
+        prompt = task_validation_prompt(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            json.dumps(titles, ensure_ascii=False),
+            baseline_evidence,
+            json.dumps(recent_rejections, ensure_ascii=False),
+        )
+        cwd = Path(str(task.get("baseline_path") or ""))
+        result = self.codex.run(
+            "task_validation", prompt, VALIDATION_SCHEMA,
+            cwd=cwd if cwd.is_dir() else None, task_id=task_id,
+        )
         accepted = bool(result["accepted"] and not result["banned"] and not result["duplicate"] and result["baselineReady"] and result["difficulty"] in ("困难", "地狱"))
         status = "ready" if accepted else "rejected"
         reason = "" if accepted else str(result.get("reason") or "未通过题目准入")
@@ -718,9 +895,16 @@ class PairwiseService:
         rejected = 0
         try:
             for _ in range(count):
-                existing = self.db.all("SELECT title,substr(prompt,1,220) summary FROM tasks ORDER BY created_at DESC LIMIT 100")
+                existing = self.db.all(
+                    """SELECT title,task_type,difficulty,status,substr(prompt,1,220) summary,
+                       substr(rejection_reason,1,400) rejection_reason
+                       FROM tasks ORDER BY created_at DESC LIMIT 100"""
+                )
                 prompt = task_generation_prompt(json.dumps(existing, ensure_ascii=False), task_type)
                 result = self.codex.run("task_generation", prompt, TASK_SCHEMA)
+                if result.get("taskType") != task_type:
+                    rejected += 1
+                    continue
                 task_id = "task-" + uuid.uuid4().hex[:16]
                 key = fingerprint(result["taskType"], result["prompt"], "")
                 if self.db.one("SELECT id FROM tasks WHERE fingerprint=?", (key,)):
@@ -760,6 +944,9 @@ class PairwiseService:
         pair = self._pair(pair_id)
         if pair["status"] != "completed":
             raise ValueError("只有已完成 GSB 的 Pair 才能生成 Feature 迭代")
+        task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        if task.get("task_type") != "zero_to_one":
+            raise ValueError("Feature 迭代只能从已完成的 0–1 Pair 生成")
         existing_followup = self.db.one(
             "SELECT * FROM tasks WHERE parent_pair_id=? AND task_type='feature' AND status IN ('candidate','ready','used') ORDER BY created_at DESC LIMIT 1",
             (pair_id,),
@@ -772,7 +959,6 @@ class PairwiseService:
         if not arm or not check or not arm.get("commit_sha"):
             raise ValueError("获胜产物缺少固定提交或 Docker 验收证据")
         workspace = Path(arm["workspace_path"])
-        task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
         files = [str(path.relative_to(workspace)) for path in sorted(workspace.rglob("*"))
                  if path.is_file() and ".git" not in path.parts and not any(part in (".venv", "node_modules", "__pycache__") for part in path.parts)][:160]
         readme = next((p for p in (workspace / "README.md", workspace / "README") if p.exists()), None)

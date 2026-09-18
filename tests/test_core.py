@@ -19,7 +19,10 @@ from pairwise_console.artifact import isolated_compose_environment
 from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
-from pairwise_console.prompts import gsb_prompt, gsb_recheck_prompt
+from pairwise_console.prompts import (
+    feature_generation_prompt, gsb_prompt, gsb_recheck_prompt,
+    task_generation_prompt, task_validation_prompt,
+)
 from pairwise_console.recording import RecordingManager
 from pairwise_console.service import PairwiseService
 
@@ -63,6 +66,88 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
         self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 40)
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
+        self.assertEqual(self.db.setting("task_mix_zero_to_one"), 7)
+        self.assertEqual(self.db.setting("task_mix_feature"), 7)
+        self.assertEqual(self.db.setting("task_mix_bugfix"), 10)
+
+    def test_task_prompts_prejudge_minimum_necessary_complexity(self):
+        validation = task_validation_prompt("task", "known", "baseline", "rejected examples")
+        generated = task_generation_prompt("known", "zero_to_one")
+        feature = feature_generation_prompt("original", "artifact", "known", "全栈")
+        self.assertIn("最小实现", validation)
+        self.assertIn("准确基线", validation)
+        self.assertIn("近期开发完成后被降为", validation)
+        self.assertIn("至少两个相互制约", generated)
+        self.assertIn("当前不存在且相互制约", feature)
+
+    def test_task_mix_prefers_bugfix_for_seven_seven_ten_ratio(self):
+        stamp = now_iso()
+        self.db.set_setting("task_mix_started_at", "2000-01-01T00:00:00+00:00")
+        counts = {"zero_to_one": 7, "feature": 7, "bugfix": 9}
+        for task_type, count in counts.items():
+            for index in range(count):
+                task_id = "task-mix-%s-%d" % (task_type, index)
+                chain_id = "chain-mix-%s-%d" % (task_type, index)
+                pair_id = "pair-mix-%s-%d" % (task_type, index)
+                self.db.execute(
+                    """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+                       difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+                       VALUES(?,?,?,?,?,'困难','[]',?,'used',?,?)""",
+                    (task_id, "test", task_type, task_id, "hard task", task_id, stamp, stamp),
+                )
+                self.db.execute(
+                    "INSERT INTO project_chains(id,root_task_id,status,created_at,updated_at) VALUES(?,?,'active',?,?)",
+                    (chain_id, task_id, stamp, stamp),
+                )
+                self.db.execute(
+                    """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
+                       VALUES(?,?,?,'completed','completed',?,?)""",
+                    (pair_id, task_id, chain_id, stamp, stamp),
+                )
+        self.assertEqual(self.service._task_mix_priority()[0], "bugfix")
+
+    def test_task_mix_produces_exact_seven_seven_ten_cycle(self):
+        weights = {"zero_to_one": 7, "feature": 7, "bugfix": 10}
+        counts = {task_type: 0 for task_type in weights}
+        with patch.object(
+            self.service, "_task_mix_counts",
+            side_effect=lambda include_ready=False: dict(counts),
+        ):
+            for _ in range(24):
+                counts[self.service._task_mix_priority()[0]] += 1
+        self.assertEqual(counts, weights)
+
+    def test_ready_task_selection_uses_task_mix_priority(self):
+        stamp = now_iso()
+        for task_type in ("zero_to_one", "feature", "bugfix"):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+                   difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
+                ("task-ready-" + task_type, "test", task_type, task_type, "hard task",
+                 "ready-" + task_type, stamp, stamp),
+            )
+        self.assertEqual(self.service._next_ready_task()["task_type"], "bugfix")
+
+    def test_missing_feature_and_bug_tasks_use_real_completed_pair_sources(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',completed_at=?,updated_at=? WHERE id=?",
+            (stamp, stamp, pair["id"]),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_auto",
+            side_effect=lambda operation, fn, *args: submitted.append((operation, fn, args)) or True,
+        ):
+            self.assertTrue(self.service._schedule_task_source("feature"))
+            self.assertTrue(self.service._schedule_task_source("bugfix"))
+        self.assertEqual(submitted[0][0], "feature-" + pair["id"])
+        self.assertIs(submitted[0][1].__func__, self.service.generate_followup_feature.__func__)
+        self.assertEqual(submitted[1][0], "bugs-" + pair["id"])
+        self.assertIs(submitted[1][1].__func__, self.service.discover_bugs.__func__)
 
     def test_language_framework_field_keeps_only_technology_names(self):
         self.assertEqual(
