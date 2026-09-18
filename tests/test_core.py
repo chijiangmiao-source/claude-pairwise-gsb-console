@@ -1572,13 +1572,28 @@ class CoreTests(unittest.TestCase):
             """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,error,created_at,updated_at)
                VALUES(?,?,?,?, 'observed_failed',?,?,?,?)""",
             ("check-observed", pair["id"], "A", "a" * 40,
-             '[{"name":"verify_service","passed":false,"command":"docker compose run --rm verify","detail":"ModuleNotFoundError: app"}]',
+             '[{"name":"verify_service","passed":false,"command":"docker compose run --rm verify","exit_code":1,"detail":"ModuleNotFoundError: app"}]',
              "Docker 验收未全部通过", stamp, stamp),
         )
         with patch("pairwise_console.recording.threading.Thread.start"):
             attempt = self.service.start_recording(pair["id"], "A")
         self.assertEqual(attempt["status"], "starting")
         self.assertEqual(attempt["interaction_mode"], "auto")
+        process = MagicMock()
+        process.stdout.readline.return_value = '{"event":"ready"}'
+        check = self.db.one("SELECT * FROM artifact_checks WHERE id='check-observed'")
+        with patch("pairwise_console.recording.subprocess.Popen", return_value=process), \
+             patch.object(self.service.recordings, "_wait") as wait:
+            self.service.recordings._launch_failure_evidence(
+                attempt["id"], self.root, Path(attempt["path"]), check,
+            )
+        failure_page = Path(attempt["path"]).with_suffix(".failure.html")
+        html = failure_page.read_text(encoding="utf-8")
+        self.assertIn("docker compose run --rm verify", html)
+        self.assertIn("ModuleNotFoundError: app", html)
+        self.assertIn("exit code 1", html)
+        self.assertIn("border-radius:50%", html)
+        wait.assert_called_once()
 
     def test_failed_artifact_is_preserved_for_gsb_without_claude_repair(self):
         self.insert_ready_task()

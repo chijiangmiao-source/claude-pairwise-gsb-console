@@ -156,7 +156,16 @@ class RecordingManager:
     def _launch(self, attempt_id: str, workspace: Path, compose: Path, project: str,
                 path: Path, check: Dict[str, Any]) -> None:
         if check.get("status") != "passed":
-            self._launch_failure_evidence(attempt_id, workspace, path, check)
+            try:
+                self._launch_failure_evidence(attempt_id, workspace, path, check)
+            except Exception as exc:
+                self.db.execute(
+                    "UPDATE recording_attempts SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
+                    (redact(str(exc))[-3000:], now_iso(), now_iso(), attempt_id),
+                )
+                self.db.audit("recording.finished", "recording_attempt", attempt_id, {
+                    "status": "failed", "error": str(exc)[-1000:], "mode": "failure",
+                })
             return
         env, assigned_ports = isolated_compose_environment(compose)
         port = int(
@@ -252,7 +261,7 @@ body{margin:0;background:#111814;color:#eef4ef;font:17px/1.55 -apple-system,Blin
 main{width:1120px;margin:0 auto;padding:38px 0 80px}header{display:flex;justify-content:space-between;gap:32px;align-items:end;margin-bottom:22px}
 h1{margin:0 0 7px;font-size:32px}header p{margin:3px 0;color:#a9b9af}.result{color:#ffb4a9;font-weight:700}
 .terminal{overflow:hidden;border:1px solid #3c4b43;background:#08100c;border-radius:14px;box-shadow:0 18px 48px rgba(0,0,0,.28)}
-.terminal-bar{height:42px;display:flex;align-items:center;gap:8px;padding:0 16px;background:#243029;color:#9fb0a6;font-size:14px}.terminal-bar i{width:12px;height:12px;border-radius:50%;background:#e16b62}.terminal-bar i:nth-child(2){background:#e7b75d}.terminal-bar i:nth-child(3){background:#63bd79}.terminal-bar i:nth-child(3){margin-right:9px}
+.terminal-bar{height:42px;display:flex;align-items:center;gap:8px;padding:0 16px;background:#243029;color:#9fb0a6;font-size:14px}.terminal-bar i{width:12px;height:12px;border-radius:50%%;background:#e16b62}.terminal-bar i:nth-child(2){background:#e7b75d}.terminal-bar i:nth-child(3){background:#63bd79}.terminal-bar i:nth-child(3){margin-right:9px}
 pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-break:break-word;color:#d6e5db;font:15px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace}.prompt{color:#78d69a;font-weight:700}.exit{color:#ff8f84;font-weight:700}
 </style><main><header><div><h1>Docker 清洁验收</h1><p>提交 %s</p></div><div class=\"result\">验收失败 · 保留原始交付</div></header>%s</main></html>""" % (
             html_escape(str(check.get("commit_sha") or "未知")[:12]),
