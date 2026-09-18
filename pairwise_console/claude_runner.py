@@ -203,12 +203,6 @@ class ClaudeRunner:
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_run["id"],)) or {}
 
-    def restart_after_api_error(self, arm_run: Dict[str, Any], error: str) -> Dict[str, Any]:
-        """Backward-compatible entry point for fresh-session error recovery."""
-        return self.archive_failed_attempt(
-            arm_run, error, prepare_retry=True, count_development_failure=False,
-        )
-
     def materialize_repository(self, arm_run: Dict[str, Any], source: Path, expected_sha: str) -> None:
         """Import an exact branch snapshot after Claude accepts the empty mount."""
         destination = Path(arm_run["workspace_path"]).resolve()
@@ -497,14 +491,13 @@ exit "$code"
                 e.get("type") == "last-prompt" or (e.get("type") == "system" and e.get("subtype") == "turn_duration")
                 for e in events[final_index + 1:]
             ))
-            # Any API error makes this attempt ineligible, even when the CLI
-            # later emits a final message by retrying internally. The service
-            # archives it and replays the original prompt in a new session.
-            unresolved_error = api_index is not None
             return {
                 "complete": finished,
                 "result": final_text,
-                "api_error": api_error if unresolved_error else "",
+                # Keep API errors as visible evidence, but do not use them as
+                # a completion veto. Claude can recover inside the same native
+                # session and later emit a valid final response.
+                "api_error": api_error if api_index is not None else "",
                 "session_id": path.stem,
                 "prompt_id": prompt_id,
                 "path": str(path),

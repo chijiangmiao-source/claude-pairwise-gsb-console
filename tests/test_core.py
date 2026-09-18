@@ -76,7 +76,8 @@ class CoreTests(unittest.TestCase):
         feature = feature_generation_prompt("original", "artifact", "known", "全栈")
         self.assertIn("最小实现", validation)
         self.assertIn("准确基线", validation)
-        self.assertIn("近期开发完成后被降为", validation)
+        self.assertIn("近期开发完成后的真实难度案例", validation)
+        self.assertIn("Bug 修复可用这些案例校准难度", validation)
         self.assertIn("至少两个相互制约", generated)
         self.assertIn("当前不存在且相互制约", feature)
 
@@ -1743,7 +1744,7 @@ class CoreTests(unittest.TestCase):
         current = self.db.one("SELECT status,stage,completed_at FROM pairs WHERE id=?", (pair["id"],))
         self.assertEqual(current, {"status": "failed", "stage": "artifact_failed", "completed_at": None})
 
-    def test_api_error_invalidates_attempt_even_if_trace_later_finishes(self):
+    def test_api_error_is_kept_as_evidence_and_later_completion_is_accepted(self):
         prompt = "Build the requested project"
         arm = {"id": "arm-api-error", "container_name": "container-api-error"}
         events = [
@@ -1765,8 +1766,44 @@ class CoreTests(unittest.TestCase):
 
         with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
             state = self.service.claude.trace_state(arm, prompt)
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["result"], "Finished after internal retry")
         self.assertIn("504", state["api_error"])
         self.assertFalse(hasattr(self.service.claude, "send_continue"))
+
+    def test_monitor_does_not_restart_a_completed_session_that_contains_api_error(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?,?)""",
+            ("arm-api-recovered", pair["id"], "A", "A", str(self.root / "A"),
+             "container-api-recovered", "screen-api-recovered", "auto_model/urm", "image",
+             stamp, stamp, stamp),
+        )
+        state = {
+            "complete": True, "result": "Finished after internal retry",
+            "api_error": "API Error: 504 Gateway Timeout",
+            "session_id": "session-recovered", "prompt_id": "prompt-recovered",
+        }
+        completed = {"id": "arm-api-recovered", "status": "completed"}
+        with patch.object(self.service.claude, "trace_state", return_value=state), \
+             patch.object(self.service.claude, "export_and_stop", return_value=self.root / "trace"), \
+             patch.object(self.service, "_finish_checkpointed_arm", return_value=completed) as finish, \
+             patch.object(self.service, "_handle_attempt_failure") as retry:
+            result = self.service._monitor_arm(pair["id"], "arm-api-recovered", "Build a hard project with Docker Compose")
+        self.assertEqual(result, completed)
+        finish.assert_called_once_with(pair["id"], "arm-api-recovered")
+        retry.assert_not_called()
+        event = self.db.one(
+            "SELECT event_type FROM audit_events WHERE entity_id='arm-api-recovered' ORDER BY id DESC LIMIT 1"
+        )
+        self.assertEqual(event["event_type"], "claude.api_error_recovered")
 
     def test_system_turn_companion_is_not_treated_as_manual_followup(self):
         prompt = "Build the requested project"
@@ -1901,30 +1938,27 @@ class CoreTests(unittest.TestCase):
         archive.assert_called_once()
         replace.assert_called_once_with(pair["id"], arm["id"], "container exited")
 
-    def test_429_is_free_but_504_consumes_a_development_attempt(self):
+    def test_api_errors_never_restart_or_consume_a_development_attempt(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
         arm = {"id": "arm-transient-api", "pair_id": pair["id"], "attempt_no": 2, "arm": "A"}
         errors = (
-            ("API Error: Request rejected (429) · litellm.RateLimitError: max_parallel_requests", False, False),
-            ("API Error: 504 Gateway Timeout", True, True),
+            "API Error: Request rejected (429) · litellm.RateLimitError: max_parallel_requests",
+            "API Error: 504 Gateway Timeout",
+            "API Error: Unable to connect to API (UNKNOWN_CERTIFICATE_VERIFICATION_ERROR)",
         )
-        for error, count_development_failure, count_error_retry in errors:
+        for error in errors:
             with self.subTest(error=error), \
                  patch.object(self.service, "_restart_arm_from_baseline",
                               return_value={**arm, "status": "developing"}) as restart, \
                  patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
                 result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", error)
-            self.assertEqual(result["status"], "developing")
-            restart.assert_called_once_with(
-                pair["id"], arm, "same prompt", error,
-                count_development_failure=count_development_failure,
-                count_error_retry=count_error_retry,
-            )
+            self.assertEqual(result["id"], arm["id"])
+            restart.assert_not_called()
             replace.assert_not_called()
 
-    def test_third_504_retires_pair_and_schedules_replacement(self):
+    def test_third_504_still_keeps_the_same_pair_and_session(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
@@ -1934,9 +1968,9 @@ class CoreTests(unittest.TestCase):
                           return_value={**arm, "status": "failed"}) as archive, \
              patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
             result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", error)
-        self.assertEqual(result["status"], "failed")
-        archive.assert_called_once()
-        replace.assert_called_once_with(pair["id"], arm["id"], error)
+        self.assertEqual(result["id"], arm["id"])
+        archive.assert_not_called()
+        replace.assert_not_called()
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()

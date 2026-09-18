@@ -2379,26 +2379,9 @@ class PairwiseService:
         return pair
 
     @staticmethod
-    def _transient_claude_api_error_kind(error: str) -> str:
+    def _is_claude_api_error(error: str) -> bool:
         text = str(error or "").casefold()
-        api_context = "api error" in text or "litellm" in text
-        rate_limited = any(token in text for token in (
-            "rate limit", "rate_limit", "ratelimiterror", "too many requests",
-            "max_parallel_requests",
-        )) or bool(re.search(r"(?:^|\D)429(?:\D|$)", text))
-        gateway_timeout = "gateway timeout" in text or "gateway_timeout" in text
-        gateway_timeout = gateway_timeout or bool(re.search(r"(?:^|\D)504(?:\D|$)", text))
-        if not api_context:
-            return ""
-        if rate_limited:
-            return "rate_limit"
-        if gateway_timeout:
-            return "gateway_timeout"
-        return ""
-
-    @classmethod
-    def _is_transient_claude_api_error(cls, error: str) -> bool:
-        return bool(cls._transient_claude_api_error_kind(error))
+        return "api error" in text or "litellm" in text
 
     def _restart_arm_from_baseline(self, pair_id: str, arm: Dict[str, Any], prompt: str,
                                    error: str, count_development_failure: bool = True,
@@ -2486,14 +2469,19 @@ class PairwiseService:
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
         attempt = max(1, int(arm.get("attempt_no") or 1))
         maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
-        transient_api_error_kind = self._transient_claude_api_error_kind(error)
-        rate_limit_error = transient_api_error_kind == "rate_limit"
-        count_development_failure = not rate_limit_error
-        count_error_retry = not rate_limit_error
+        if self._is_claude_api_error(error):
+            self.db.audit("claude.api_error_ignored", "arm_run", arm["id"], {
+                "attempt": attempt, "error": redact(error)[-1000:],
+                "action": "continue_same_native_session",
+                "counts_toward_development_attempts": False,
+                "counts_toward_error_retries": False,
+            })
+            return arm
+        count_development_failure = True
+        count_error_retry = True
         self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
             "attempt": attempt, "maximum": maximum, "error": redact(error)[-1000:],
-            "action": "fresh_session_from_baseline_without_failure_count" if rate_limit_error
-                      else ("replace_task" if attempt >= maximum else "fresh_session_from_baseline"),
+            "action": "replace_task" if attempt >= maximum else "fresh_session_from_baseline",
             "counts_toward_development_attempts": count_development_failure,
             "counts_toward_error_retries": count_error_retry,
         })
@@ -2647,13 +2635,16 @@ class PairwiseService:
             try:
                 state = self.claude.trace_state(arm, prompt)
             except Exception as exc:
-                state = {"complete": False, "api_error": "轨迹监控失败：%s" % redact(str(exc))}
+                state = {"complete": False, "api_error": "", "monitor_error": "轨迹监控失败：%s" % redact(str(exc))}
             if state.get("session_id") or state.get("prompt_id"):
                 self.db.execute(
                     "UPDATE arm_runs SET session_id=?,prompt_id=?,updated_at=? WHERE id=?",
                     (state.get("session_id", ""), state.get("prompt_id", ""), now_iso(), arm_id),
                 )
-            error = str(state.get("api_error") or "")
+            # Claude API errors remain in the native trace for audit, but do
+            # not invalidate the session. The monitor keeps waiting for a
+            # normal final response or for an independent failure condition.
+            error = str(state.get("monitor_error") or "")
             if state.get("followup_detected"):
                 error = "检测到首轮后的追加消息，当前 Session 作废并从共同基线重跑：%s" % state.get("followup_text", "")
             if not error and not state.get("complete") and not self.claude.runtime_alive(arm):
@@ -2670,6 +2661,11 @@ class PairwiseService:
                 continue
             if state.get("complete"):
                 result = str(state.get("result") or "")
+                if state.get("api_error"):
+                    self.db.audit("claude.api_error_recovered", "arm_run", arm_id, {
+                        "error": redact(str(state.get("api_error")))[-1000:],
+                        "action": "accepted_later_native_completion_in_same_session",
+                    })
                 if int(state.get("automatic_companion_count") or 0):
                     self.db.audit("claude.automatic_companion_ignored", "arm_run", arm_id, {
                         "count": int(state.get("automatic_companion_count") or 0),
