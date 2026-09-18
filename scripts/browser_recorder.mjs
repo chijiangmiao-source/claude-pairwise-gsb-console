@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { automaticFinishDelayMs, finalizeInteractionEvidence } from "./recording_timing.mjs";
+import { sampleValue } from "./recording_openapi.mjs";
 
 const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`, interactionMode = "auto"] = process.argv.slice(2);
 if (!url || !outputPath || !profileDir) {
@@ -36,36 +37,6 @@ async function saveVideo(sourcePath, targetPath) {
     command.on("error", reject);
     command.on("close", (code) => code === 0 ? resolve() : reject(new Error(`MP4 转换失败：${error.slice(-2000)}`)));
   });
-}
-
-function resolveSchema(schema, spec) {
-  if (!schema?.$ref) return schema || {};
-  return schema.$ref.slice(2).split("/").reduce((value, key) => value?.[key], spec) || {};
-}
-
-function sampleValue(schema, spec, depth = 0) {
-  schema = resolveSchema(schema, spec);
-  if (schema.example !== undefined) return schema.example;
-  if (schema.default !== undefined) return schema.default;
-  if (schema.enum?.length) return schema.enum[0];
-  if (depth > 5) return null;
-  if (schema.type === "object" || schema.properties) {
-    const properties = schema.properties || {};
-    if (properties.L && properties.n && properties.distances) {
-      return { L: 10, n: 5, distances: [2, 4, 7, 10, 2, 5, 8, 3, 6, 3] };
-    }
-    return Object.fromEntries(Object.entries(properties).map(([key, value]) => [key, sampleValue(value, spec, depth + 1)]));
-  }
-  if (schema.type === "array") {
-    const count = Math.max(1, Number(schema.minItems || 1));
-    return Array.from({ length: Math.min(count, 3) }, () => sampleValue(schema.items || {}, spec, depth + 1));
-  }
-  if (schema.type === "integer" || schema.type === "number") return Math.max(1, Number(schema.minimum || 1));
-  if (schema.type === "boolean") return true;
-  if (schema.format === "email") return "demo@example.com";
-  if (schema.format === "date") return "2026-01-01";
-  if (schema.format === "date-time") return "2026-01-01T00:00:00Z";
-  return "demo";
 }
 
 function fallbackBodyForPath(path) {
