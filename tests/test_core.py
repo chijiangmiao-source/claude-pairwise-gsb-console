@@ -92,6 +92,30 @@ class CoreTests(unittest.TestCase):
         reason = self.service._deterministic_task_duplicate({"title": "换名后的扫描上传", "prompt": original})
         self.assertIn("完全重复", reason)
 
+    def test_task_duplicate_guard_rejects_a9_bug_template_and_long_shared_fragment(self):
+        retired = (
+            "旧 Bug\n\n前置条件：两个终端同时编辑\n\n复现步骤：\n1. 保存\n\n"
+            "实际结果：远端修改丢失\n\n预期结果：保留双方修改\n\n"
+            "请修复该问题，保留现有 Docker Compose 启动与验收链路，并补充覆盖复现路径的自动化验收。"
+        )
+        reason = self.service._deterministic_task_duplicate({"title": "另一个 Bug", "prompt": retired})
+        self.assertIn("A-9", reason)
+
+        stamp = now_iso()
+        shared = "这一段连续业务验收文字故意保持完全一致用于模拟低比例模板骨架重复并验证系统能够在整体相似度较低时提前拦截"
+        left_context = "".join(chr(0x4E00 + index) for index in range(80))
+        right_context = "".join(chr(0x5200 + index) for index in range(80))
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+               fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,'困难','[]',?,'used',?,?)""",
+            ("task-fragment", "test", "zero_to_one", "历史任务", left_context + shared,
+             "fragment-key", stamp, stamp),
+        )
+        reason = self.service._deterministic_task_duplicate({
+            "title": "新任务", "prompt": right_context + shared,
+        })
+        self.assertIn("重复长骨架", reason)
+
     def test_task_duplicate_context_includes_previous_submission_prompts(self):
         connection = sqlite3.connect(self.config.old_db_path)
         connection.execute(
@@ -278,6 +302,28 @@ class CoreTests(unittest.TestCase):
         self.assertIs(submitted[0][1].__func__, self.service.generate_followup_feature.__func__)
         self.assertEqual(submitted[1][0], "bugs-" + pair["id"])
         self.assertIs(submitted[1][1].__func__, self.service.discover_bugs.__func__)
+
+    def test_discarded_delivery_is_not_reused_as_feature_or_bug_source(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',completed_at=?,updated_at=? WHERE id=?",
+            (stamp, stamp, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
+               VALUES('delivery-discarded',?,'discarded',?,?)""",
+            (pair["id"], stamp, stamp),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_auto",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ):
+            self.assertTrue(self.service._schedule_task_source("feature"))
+            self.assertTrue(self.service._schedule_task_source("bugfix"))
+        self.assertEqual(submitted, ["generate-mix-zero-to-one", "generate-mix-zero-to-one"])
 
     def test_refill_prepares_missing_mix_type_before_old_candidates(self):
         stamp = now_iso()
@@ -2541,6 +2587,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(task["parent_pair_id"], pair["id"])
         self.assertEqual(task["status"], "ready")
         self.assertEqual(task["stack"], "Python 3.13, FastAPI")
+        self.assertNotIn("前置条件：", task["prompt"])
+        self.assertNotIn("复现步骤：", task["prompt"])
+        self.assertNotIn("请修复该问题，保留现有 Docker Compose", task["prompt"])
+        self.assertIn("send two requests", task["prompt"])
+        self.assertIn("both updates persist", task["prompt"])
 
     def test_arm_delivery_is_squashed_to_one_commit_on_baseline(self):
         self.insert_ready_task()

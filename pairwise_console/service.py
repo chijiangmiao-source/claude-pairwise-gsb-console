@@ -52,6 +52,9 @@ GSB_STEP_REFERENCE = re.compile(
 )
 TASK_MIX_TYPES = ("zero_to_one", "feature", "bugfix")
 ELIGIBLE_TASK_SQL = "(difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"
+A9_REJECTED_PROMPT_FRAGMENTS = (
+    "请修复该问题保留现有dockercompose启动与验收链路并补充覆盖复现路径的自动化验收",
+)
 
 
 def task_difficulty_allowed(task_type: str, difficulty: str) -> bool:
@@ -886,6 +889,10 @@ class PairwiseService:
                 """SELECT p.id FROM pairs p JOIN tasks t ON t.id=p.task_id
                    WHERE p.status='completed' AND t.task_type='zero_to_one'
                      AND NOT EXISTS (
+                       SELECT 1 FROM delivery_submissions d
+                        WHERE d.pair_id=p.id AND d.status='discarded'
+                     )
+                     AND NOT EXISTS (
                        SELECT 1 FROM tasks child WHERE child.parent_pair_id=p.id
                          AND child.task_type='feature'
                          AND child.status IN ('candidate','ready','used','rejected')
@@ -917,6 +924,10 @@ class PairwiseService:
             source = self.db.one(
                 """SELECT p.id FROM pairs p
                    WHERE p.status='completed'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM delivery_submissions d
+                        WHERE d.pair_id=p.id AND d.status='discarded'
+                     )
                      AND NOT EXISTS (
                        SELECT 1 FROM audit_events e
                         WHERE e.event_type='bug.discovery_completed'
@@ -1033,6 +1044,23 @@ class PairwiseService:
         right_parts = {right_text[index:index + width] for index in range(max(1, len(right_text) - width + 1))}
         return (2.0 * len(left_parts & right_parts)) / max(1, len(left_parts) + len(right_parts))
 
+    @classmethod
+    def _shared_prompt_fragment(cls, left: Any, right: Any, width: int = 36) -> str:
+        """Return a repeated normalized passage that whole-document similarity can hide."""
+        left_text = cls._normalized_task_text(left)
+        right_text = cls._normalized_task_text(right)
+        if len(left_text) < width or len(right_text) < width:
+            return ""
+        right_parts = {
+            right_text[index:index + width]
+            for index in range(len(right_text) - width + 1)
+        }
+        for index in range(len(left_text) - width + 1):
+            part = left_text[index:index + width]
+            if part in right_parts:
+                return part
+        return ""
+
     def _historical_task_catalog(self, exclude_task_id: str = "") -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = [
             {
@@ -1123,6 +1151,8 @@ class PairwiseService:
         normalized = self._normalized_task_text(prompt)
         if not normalized:
             return ""
+        if any(fragment in normalized for fragment in A9_REJECTED_PROMPT_FRAGMENTS):
+            return "题面沿用了已被质检平台 A-9 判定为模板换皮的 Bug 固定骨架，必须重新出题"
         allow_previous_period_reuse = str(task.get("source") or "") == "legacy"
         for row in self._historical_task_catalog(exclude_task_id):
             if allow_previous_period_reuse and row["source"] == "历史提交题库":
@@ -1148,11 +1178,54 @@ class PairwiseService:
                 )
             if normalized == other_normalized:
                 return "题面与%s中的“%s”完全重复" % (row["source"], row["title"] or row["key"])
+            shared_fragment = (
+                self._shared_prompt_fragment(prompt, other_prompt)
+                if len(normalized) >= 120 and len(other_normalized) >= 120 else ""
+            )
+            if shared_fragment:
+                return "题面与%s中的“%s”存在重复长骨架，必须改换任务组织和专用验收表达" % (
+                    row["source"], row["title"] or row["key"],
+                )
             if len(normalized) >= 120 and score >= 0.82:
                 return "题面与%s中的“%s”高度相似（%.0f%%），需要更换核心问题和验收机制" % (
                     row["source"], row["title"] or row["key"], score * 100,
                 )
         return ""
+
+    @staticmethod
+    def _compose_bugfix_task_prompt(candidate: Dict[str, Any]) -> str:
+        """Build a candidate-specific issue report without the retired A-9 template."""
+        title = str(candidate.get("title") or "").strip()
+        preconditions = str(candidate.get("preconditions") or "").strip()
+        actual = str(candidate.get("actual_result") or "").strip()
+        expected = str(candidate.get("expected_result") or "").strip()
+        raw_steps = json.loads(str(candidate.get("reproduction_steps_json") or "[]"))
+        steps = [str(step).strip() for step in raw_steps if str(step).strip()]
+        flow = "；随后".join(steps)
+        first_step = steps[0] if steps else preconditions
+        last_step = steps[-1] if steps else expected
+        variant = int(hashlib.sha256((title + preconditions).encode("utf-8")).hexdigest()[:2], 16) % 4
+
+        if variant == 0:
+            return (
+                "%s\n\n这个缺陷已在清洁环境中重复出现。触发它需要%s，操作顺序是%s。\n\n"
+                "完成这些操作后会出现%s；正确行为应是%s。\n\n"
+                "请围绕“%s”修正实现，沿用项目当前的 Docker Compose 启动方式。自动化验收要重放从“%s”到“%s”的完整路径，并确认最终得到“%s”。"
+            ) % (title, preconditions, flow, actual, expected, title, first_step, last_step, expected)
+        if variant == 1:
+            return (
+                "需要修复：%s\n\n在%s时，依次执行%s，当前会%s。业务上必须%s。\n\n"
+                "修复应保持已有 Docker Compose 启动入口可用。请把“%s”触发后的真实结果写进自动化验收，并覆盖最后的“%s”，防止同类回归。"
+            ) % (title, preconditions, flow, actual, expected, first_step, last_step)
+        if variant == 2:
+            return (
+                "%s\n\n正确性要求是%s。现在只要满足%s，再按%s操作，就会%s。\n\n"
+                "请修正造成这一结果的实现，同时保留当前 Docker Compose 启动流程。新增验收需要从“%s”开始走到“%s”，用真实结果证明上述正确性要求成立。"
+            ) % (title, expected, preconditions, flow, actual, first_step, last_step)
+        return (
+            "缺陷场景：%s\n\n%s是复现所需条件。实际操作为%s；系统随后%s，但产品需要%s。\n\n"
+            "请针对“%s”完成修复，不改变项目现有的 Docker Compose 使用方式。回归验收要实际执行“%s”，并在“%s”之后核对最终状态，而不是只检查接口可调用。"
+        ) % (title, preconditions, flow, actual, expected, title, first_step, last_step)
 
     def validate_task(self, task_id: str) -> Dict[str, Any]:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -1689,11 +1762,21 @@ class PairwiseService:
             """SELECT t.* FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
             (candidate["source_pair_id"],),
         ) or {}
-        prompt = "%s\n\n前置条件：%s\n\n复现步骤：\n%s\n\n实际结果：%s\n\n预期结果：%s\n\n请修复该问题，保留现有 Docker Compose 启动与验收链路，并补充覆盖复现路径的自动化验收。" % (
-            candidate["title"], candidate["preconditions"],
-            "\n".join("%d. %s" % (i + 1, step) for i, step in enumerate(json.loads(candidate["reproduction_steps_json"]))),
-            candidate["actual_result"], candidate["expected_result"],
-        )
+        prompt = self._compose_bugfix_task_prompt(candidate)
+        duplicate = self._deterministic_task_duplicate({
+            "source": "bug_discovery", "task_type": "bugfix",
+            "title": candidate["title"], "prompt": prompt,
+        })
+        if duplicate:
+            stamp = now_iso()
+            self.db.execute(
+                "UPDATE bug_candidates SET status='duplicate_rejected',error=?,updated_at=? WHERE id=?",
+                (duplicate[-2000:], stamp, candidate_id),
+            )
+            self.db.audit("bug.duplicate_rejected", "bug_candidate", candidate_id, {
+                "reason": duplicate, "title": candidate["title"],
+            })
+            raise ValueError(duplicate)
         task_id = "task-" + uuid.uuid4().hex[:16]
         key = fingerprint("bugfix", prompt, candidate["source_sha"])
         stamp = now_iso()
