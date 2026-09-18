@@ -1523,8 +1523,12 @@ class PairwiseService:
                 ("实际难度复评失败，将自动重试：" + error, now_iso(), pair_id),
             )
             raise
-        assessed = str(result.get("difficulty") or "")
-        accepted = task_difficulty_allowed(str(task.get("task_type") or ""), assessed)
+        raw_assessed = str(result.get("difficulty") or "")
+        task_type = str(task.get("task_type") or "")
+        accepted = task_difficulty_allowed(task_type, raw_assessed)
+        # Bug 修复仍允许以“中等”进入并完成真实复现，但通过开发后复评的
+        # 交付统一按“困难”落库，避免已通过数据继续显示或导出为中等。
+        assessed = "困难" if accepted and task_type == "bugfix" and raw_assessed == "中等" else raw_assessed
         status = "passed" if accepted else "rejected"
         reason = str(result.get("reason") or "").strip()[:800]
         evidence = [str(value)[:300] for value in list(result.get("evidence") or [])[:10]]
@@ -1563,7 +1567,7 @@ class PairwiseService:
         self.db.audit(
             "difficulty.passed" if accepted else "difficulty.rejected",
             "pair", pair_id,
-            {"original": original, "assessed": assessed, "a": result.get("aDifficulty"),
+            {"original": original, "assessed": assessed, "raw_assessed": raw_assessed, "a": result.get("aDifficulty"),
              "b": result.get("bDifficulty"), "commits": commits},
         )
         return self.db.one("SELECT * FROM difficulty_reviews WHERE pair_id=?", (pair_id,)) or {}

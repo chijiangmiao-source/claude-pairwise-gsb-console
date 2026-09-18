@@ -159,6 +159,27 @@ class Database:
                                    WHERE ra.pair_id=delivery_submissions.pair_id
                                      AND ra.interaction_mode='manual' AND ra.status='passed')"""
             )
+            # 已通过开发后难度复评的中等 Bug 修复统一作为困难交付。
+            # A/B 原始判断仍保留在 a_difficulty / b_difficulty 中供复核。
+            c.execute(
+                """UPDATE difficulty_reviews SET assessed_difficulty='困难',updated_at=?
+                     WHERE status='passed' AND assessed_difficulty='中等'
+                       AND EXISTS(
+                         SELECT 1 FROM pairs p JOIN tasks t ON t.id=p.task_id
+                          WHERE p.id=difficulty_reviews.pair_id AND t.task_type='bugfix'
+                       )""",
+                (now_iso(),),
+            )
+            c.execute(
+                """UPDATE tasks SET difficulty='困难',updated_at=?
+                     WHERE task_type='bugfix' AND difficulty='中等'
+                       AND EXISTS(
+                         SELECT 1 FROM pairs p JOIN difficulty_reviews d ON d.pair_id=p.id
+                          WHERE p.task_id=tasks.id AND d.status='passed'
+                            AND d.assessed_difficulty='困难'
+                       )""",
+                (now_iso(),),
+            )
             c.execute(
                 """UPDATE recordings SET commit_sha=COALESCE((
                      SELECT commit_sha FROM arm_runs a

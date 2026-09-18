@@ -389,7 +389,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(delivery["status"], "discarded")
         self.assertIn("低于困难/地狱", delivery["error"])
 
-    def test_actual_difficulty_review_accepts_medium_bugfix(self):
+    def test_actual_difficulty_review_promotes_passed_medium_bugfix_to_hard(self):
         pair = self._prepare_pair_for_difficulty_review()
         self.db.execute("UPDATE tasks SET task_type='bugfix' WHERE id='task-1'")
         result = {
@@ -400,12 +400,12 @@ class CoreTests(unittest.TestCase):
         with patch.object(self.service.codex, "run", return_value=result):
             review = self.service.reassess_actual_difficulty(pair["id"])
         self.assertEqual(review["status"], "passed")
-        self.assertEqual(review["assessed_difficulty"], "中等")
+        self.assertEqual(review["assessed_difficulty"], "困难")
         self.assertEqual(
             self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
             {"status": "running", "stage": "recording"},
         )
-        self.assertEqual(self.db.one("SELECT difficulty FROM tasks WHERE id='task-1'")["difficulty"], "中等")
+        self.assertEqual(self.db.one("SELECT difficulty FROM tasks WHERE id='task-1'")["difficulty"], "困难")
 
     def test_evidence_filter_finds_any_manual_rerecord_attempt(self):
         pair = self._prepare_pair_for_difficulty_review()
