@@ -559,9 +559,17 @@ class PairwiseService:
         try:
             sha = self.git.push_arm(pair_id, str(arm["arm"]))
         except Exception as exc:
+            # A scheduler tick can observe the checkpoint while another push
+            # is finishing.  If that worker has already completed the arm,
+            # this stale push failure must not overwrite the successful state
+            # with a misleading retry error.
+            current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+            if current.get("status") == "completed" and current.get("commit_sha"):
+                return current
             error = "已保留完成代码和轨迹，等待重试 Git 推送：%s" % redact(str(exc))
             self.db.execute(
-                "UPDATE arm_runs SET error=?,updated_at=? WHERE id=?",
+                """UPDATE arm_runs SET error=?,updated_at=? WHERE id=?
+                   AND status IN ('checkpointing','exported')""",
                 (error[-3000:], now_iso(), arm_id),
             )
             self.db.audit("git.completed_arm_push_deferred", "arm_run", arm_id, {

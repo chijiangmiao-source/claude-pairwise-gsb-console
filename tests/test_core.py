@@ -1158,6 +1158,39 @@ class CoreTests(unittest.TestCase):
         self.assertIn("等待重试 Git 推送", current["error"])
         self.assertTrue(workspace.is_dir())
 
+    def test_stale_checkpoint_push_failure_does_not_overwrite_completed_arm(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        traces = self.root / "completed-traces"
+        traces.mkdir()
+        delivered = "e" * 40
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,trace_path,result,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'checkpointing',?,?,?,?)""",
+            ("arm-race-A", pair["id"], "A", "A", str(self.root / "workspace-A"),
+             "container-A", "screen-A", "auto_model/urm", "image", str(traces),
+             "finished", stamp, stamp),
+        )
+
+        def stale_push(*_args):
+            self.db.execute(
+                """UPDATE arm_runs SET status='completed',commit_sha=?,error='',
+                   finished_at=?,updated_at=? WHERE id='arm-race-A'""",
+                (delivered, stamp, stamp),
+            )
+            raise RuntimeError("remote ref changed while pushing")
+
+        with patch.object(self.service.git, "push_arm", side_effect=stale_push):
+            result = self.service._finish_checkpointed_arm(pair["id"], "arm-race-A")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["commit_sha"], delivered)
+        self.assertEqual(result["error"], "")
+
     def test_compose_port_variables_are_all_isolated(self):
         compose = self.root / "docker-compose.yml"
         compose.write_text(
