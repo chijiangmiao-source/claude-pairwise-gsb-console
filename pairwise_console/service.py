@@ -3377,6 +3377,28 @@ class PairwiseService:
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
             if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 40)) * 60 and not has_code:
+                # A terminal API/gateway error is infrastructure evidence, not
+                # a development failure. Keep the native Session and its trace
+                # intact instead of letting the generic no-code timeout archive
+                # it and consume an attempt.
+                if state.get("api_error"):
+                    already_logged = self.db.one(
+                        """SELECT 1 present FROM audit_events
+                           WHERE event_type='claude.api_error_waiting_same_session'
+                             AND entity_id=? AND created_at>=?
+                           ORDER BY id DESC LIMIT 1""",
+                        (arm_id, str(arm.get("prompt_sent_at") or "")),
+                    )
+                    if not already_logged:
+                        self.db.audit("claude.api_error_waiting_same_session", "arm_run", arm_id, {
+                            "attempt": max(1, int(arm.get("attempt_no") or 1)),
+                            "error": redact(str(state.get("api_error")))[-1000:],
+                            "action": "continue_same_native_session",
+                            "counts_toward_development_attempts": False,
+                            "counts_toward_error_retries": False,
+                        })
+                    time.sleep(5)
+                    continue
                 signature = str(state.get("activity_signature") or "")
                 attempt = max(1, int(arm.get("attempt_no") or 1))
                 previous = self.db.one(

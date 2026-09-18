@@ -2425,6 +2425,54 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(event["event_type"], "claude.api_error_recovered")
 
+    def test_no_code_timeout_does_not_restart_or_count_an_api_error_session(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.set_setting("first_prompt_stop_minutes", 0)
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        workspace = self.root / "api-error-wait"
+        workspace.mkdir()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,attempt_no,error_retry_count,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,2,1,?,?)""",
+            ("arm-api-error-wait", pair["id"], "A", "A", str(workspace),
+             "container-api-wait", "screen-api-wait", "auto_model/urm", "image",
+             stamp, stamp, stamp),
+        )
+        state = {
+            "complete": False, "api_error": "API Error: 504 Gateway Timeout",
+            "activity_signature": "api-error-signature", "activity_summary": ["API Error: 504"],
+        }
+
+        def stop_after_wait(_seconds):
+            self.db.execute(
+                "UPDATE arm_runs SET status='failed' WHERE id='arm-api-error-wait'",
+            )
+
+        with patch.object(self.service.claude, "trace_state", return_value=state), \
+             patch.object(self.service.claude, "runtime_alive", return_value=True), \
+             patch.object(self.service.claude, "has_business_code", return_value=False), \
+             patch.object(self.service, "_handle_attempt_failure") as failure, \
+             patch("pairwise_console.service.time.sleep", side_effect=stop_after_wait):
+            self.service._monitor_arm(
+                pair["id"], "arm-api-error-wait", "Build a hard project with Docker Compose",
+            )
+        failure.assert_not_called()
+        arm = self.db.one("SELECT attempt_no,error_retry_count FROM arm_runs WHERE id='arm-api-error-wait'")
+        self.assertEqual(arm, {"attempt_no": 2, "error_retry_count": 1})
+        event = self.db.one(
+            """SELECT event_type,detail_json FROM audit_events
+               WHERE entity_id='arm-api-error-wait' ORDER BY id DESC LIMIT 1"""
+        )
+        self.assertEqual(event["event_type"], "claude.api_error_waiting_same_session")
+        detail = json.loads(event["detail_json"])
+        self.assertFalse(detail["counts_toward_development_attempts"])
+        self.assertFalse(detail["counts_toward_error_retries"])
+
     def test_monitor_replaces_task_after_second_identical_no_code_signature(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
