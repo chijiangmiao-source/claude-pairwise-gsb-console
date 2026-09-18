@@ -492,6 +492,7 @@ exit "$code"
             if start_index is None:
                 continue
             final_text, final_index, visible_text, visible_index = "", None, "", None
+            native_text, native_index = "", None
             api_error, api_index = "", None
             extra_user_message = ""
             automatic_companion_messages = []
@@ -515,16 +516,24 @@ exit "$code"
                     api_error, api_index = text or "API Error", index
                 elif text:
                     visible_text, visible_index = text, index
-                    if message.get("stop_reason") in ("end_turn", "stop_sequence"):
+                    stop_reason = message.get("stop_reason")
+                    if stop_reason in ("end_turn", "stop_sequence"):
                         final_text, final_index = text, index
-            completion_index = final_index if final_index is not None else visible_index
+                    elif not stop_reason and not any(
+                            isinstance(block, dict) and block.get("type") == "tool_use"
+                            for block in blocks):
+                        native_text, native_index = text, index
+            # A text block attached to stop_reason=tool_use is progress before
+            # another command, not the final answer.  Treating it as complete
+            # used to checkpoint an unchanged baseline as the delivered code.
+            completion_index = final_index if final_index is not None else native_index
             finished = bool(completion_index is not None and any(
                 e.get("type") == "last-prompt" or (e.get("type") == "system" and e.get("subtype") == "turn_duration")
                 for e in events[completion_index + 1:]
             ))
             return {
                 "complete": finished,
-                "result": final_text or visible_text,
+                "result": final_text or native_text or visible_text,
                 "completion_mode": "explicit_stop" if final_index is not None else ("native_turn_end" if finished else ""),
                 # Keep API errors as visible evidence, but do not use them as
                 # a completion veto. Claude can recover inside the same native

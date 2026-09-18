@@ -93,6 +93,7 @@ class PairwiseService:
         self._artifact_retry_after: Dict[str, float] = {}
         self._seed_settings()
         self._quarantine_invalid_completed_pairs()
+        self._queue_invalid_delivery_lineage_pairs()
         self.db.execute(
             """UPDATE codex_jobs SET status='failed',error='服务重启时作业仍处于运行态，已安全释放以便重新排队',
                finished_at=?,updated_at=? WHERE status='running'""",
@@ -182,6 +183,46 @@ class PairwiseService:
                     )
             self._invalidate_recordings(row["id"], reason=error)
             self.db.audit("artifact.invalid_delivery_quarantined", "pair", row["id"], {"error": error})
+
+    def _queue_invalid_delivery_lineage_pairs(self) -> None:
+        """Queue unsubmitted deliveries whose A/B snapshots are not children of main."""
+        rows = self.db.all(
+            """SELECT DISTINCT p.id,p.baseline_sha FROM pairs p
+                 JOIN delivery_submissions d ON d.pair_id=p.id
+                WHERE p.status='completed' AND d.remote_id=''
+                  AND d.status IN ('ready_to_submit','failed','needs_fix')"""
+        )
+        for pair in rows:
+            baseline = str(pair.get("baseline_sha") or "")
+            invalid_arms = []
+            for arm in self.db.all(
+                    "SELECT arm,commit_sha,workspace_path FROM arm_runs WHERE pair_id=? ORDER BY arm",
+                    (pair["id"],)):
+                workspace = Path(str(arm.get("workspace_path") or ""))
+                commit = str(arm.get("commit_sha") or "")
+                parent = run_command(
+                    ["git", "rev-parse", commit + "^"], cwd=workspace,
+                    check=False, timeout=15,
+                ) if commit and workspace.is_dir() else None
+                if not parent or parent.returncode != 0 or parent.stdout.strip() != baseline:
+                    invalid_arms.append(str(arm.get("arm") or "?"))
+            if not invalid_arms:
+                continue
+            stamp = now_iso()
+            error = "A/B 产物没有形成基于初始环境的有效代码提交，已排队用原题面重新开发：" + "、".join(invalid_arms)
+            with self.db.transaction() as conn:
+                conn.execute(
+                    """UPDATE pairs SET status='repair_pending',stage='lineage_repair_pending',
+                       winner='',completed_at=NULL,error=?,updated_at=? WHERE id=?""",
+                    (error, stamp, pair["id"]),
+                )
+                conn.execute(
+                    """UPDATE delivery_submissions SET status='needs_review',error=?,updated_at=?
+                       WHERE pair_id=?""", (error, stamp, pair["id"]),
+                )
+            self.db.audit("git.invalid_delivery_lineage_queued", "pair", pair["id"], {
+                "arms": invalid_arms, "baseline_sha": baseline,
+            })
 
     def _invalidate_recordings(self, pair_id: str, arms=None, reason: str = "") -> int:
         """Remove current-delivery pointers while preserving attempt history and files."""
@@ -464,6 +505,10 @@ class PairwiseService:
                         self._schedule_pending_arm_retries(pair_id)
                         self._schedule_checkpoint_pushes(pair_id)
                     self._schedule_completed_arm_validations(pair_id)
+                elif stage == "lineage_repair_pending":
+                    self._submit_auto(
+                        "lineage-repair-" + pair_id, self._run_lineage_repair, pair_id,
+                    )
                 elif stage == "difficulty_review":
                     self._submit_auto(
                         "difficulty-" + pair_id,
@@ -489,6 +534,8 @@ class PairwiseService:
             active_count = int((self.db.one(
                 "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
             ) or {"count": 0})["count"])
+            while active_count < MAX_PAIR_PROJECTS and self._resume_one_lineage_repair():
+                active_count += 1
             if active_count < MAX_PAIR_PROJECTS and self._resume_one_reusable_pair():
                 active_count += 1
             while active_count < MAX_PAIR_PROJECTS:
@@ -601,6 +648,17 @@ class PairwiseService:
         trace_path = Path(str(arm.get("trace_path") or ""))
         if not trace_path.is_dir():
             raise RuntimeError("已完成 Arm 缺少导出的原生轨迹，不能继续推送")
+        workspace = Path(str(arm.get("workspace_path") or ""))
+        comparison_sha = self._arm_comparison_sha(pair_id, str(arm.get("arm") or ""))
+        if (workspace / ".git").is_dir() and not self.claude.has_business_code(workspace, comparison_sha):
+            task = self.db.one(
+                "SELECT t.prompt FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?",
+                (pair_id,),
+            ) or {}
+            return self._handle_attempt_failure(
+                pair_id, arm, str(task.get("prompt") or ""),
+                "Claude 会话已结束，但没有形成相对初始环境的代码产出",
+            )
         try:
             sha = self.git.push_arm(pair_id, str(arm["arm"]))
         except Exception as exc:
@@ -646,6 +704,35 @@ class PairwiseService:
             if active_count >= pair_limit:
                 return False
             return self._resume_one_reusable_pair_locked()
+
+    def _resume_one_lineage_repair(self) -> bool:
+        """Use the next free Pair slot for a previously false-completed delivery."""
+        with self._pair_creation_lock:
+            row = self.db.one(
+                """SELECT id FROM pairs WHERE status='repair_pending'
+                     AND stage='lineage_repair_pending' ORDER BY updated_at,created_at LIMIT 1"""
+            )
+            if not row:
+                return False
+            stamp = now_iso()
+            self.db.execute(
+                """UPDATE pairs SET status='running',updated_at=? WHERE id=?
+                     AND status='repair_pending' AND stage='lineage_repair_pending'""",
+                (stamp, row["id"]),
+            )
+            self._submit_auto(
+                "lineage-repair-" + row["id"], self._run_lineage_repair, row["id"],
+            )
+            return True
+
+    def _run_lineage_repair(self, pair_id: str) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        task = self.db.one("SELECT prompt FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
+        return self._restart_trace_invalid_arms(
+            pair_id, arms, str(task.get("prompt") or ""),
+            ["A/B 产物没有形成基于初始环境的有效代码提交"],
+        )
 
     def _resume_one_reusable_pair_locked(self) -> bool:
         """Prefer finished code over consuming another task-pool entry.
@@ -1354,10 +1441,11 @@ class PairwiseService:
         key = fingerprint("bugfix", prompt, candidate["source_sha"])
         stamp = now_iso()
         self.db.execute(
-            """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,project_category,difficulty,difficulty_evidence_json,
+            """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,difficulty,difficulty_evidence_json,
                baseline_path,baseline_sha,parent_pair_id,fingerprint,status,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (task_id, "bug_discovery", candidate_id, "bugfix", candidate["title"], prompt,
+             normalize_stack(source_task.get("stack")),
              normalize_project_category(source_task.get("project_category"), source_task.get("stack"), source_task.get("prompt")),
              candidate["difficulty"],
              candidate["difficulty_evidence_json"], arm.get("workspace_path", ""), candidate["source_sha"],

@@ -53,6 +53,17 @@ class Database:
                 stack = normalize_stack(row[4])
                 if row[1] != category or row[4] != stack:
                     c.execute("UPDATE tasks SET project_category=?,stack=? WHERE id=?", (category, stack, row[0]))
+            # Bug tasks are created from a concrete completed Pair and must
+            # inherit its main language/framework metadata for submission.
+            c.execute(
+                """UPDATE tasks SET stack=COALESCE((
+                       SELECT source_task.stack FROM pairs source_pair
+                         JOIN tasks source_task ON source_task.id=source_pair.task_id
+                        WHERE source_pair.id=tasks.parent_pair_id
+                     ),stack)
+                     WHERE task_type='bugfix' AND stack=''
+                       AND parent_pair_id<>''"""
+            )
             columns = {row[1] for row in c.execute("PRAGMA table_info(arm_runs)")}
             for name, definition in (
                 ("result", "TEXT NOT NULL DEFAULT ''"),

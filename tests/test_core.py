@@ -1902,6 +1902,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(state["completion_mode"], "native_turn_end")
         self.assertIn("Implemented", state["result"])
 
+    def test_tool_use_progress_text_is_not_treated_as_completion(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-tool-progress", "container_name": "container-tool-progress"}
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": prompt}},
+            {"type": "assistant", "message": {
+                "stop_reason": "tool_use",
+                "content": [{"type": "text", "text": "Now let me inspect the remaining files."}],
+            }},
+            {"type": "assistant", "message": {
+                "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "app.py"}}],
+            }},
+            {"type": "last-prompt"},
+        ]
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            state = self.service.claude.trace_state(arm, prompt)
+        self.assertFalse(state["complete"])
+        self.assertEqual(state["result"], "Now let me inspect the remaining files.")
+
     def test_completed_mismatched_prompt_is_visible_to_monitor_for_targeted_rerun(self):
         prompt = "Build the requested project\n\nKeep every boundary condition."
         observed = "Keep every boundary condition."
@@ -2209,6 +2237,7 @@ class CoreTests(unittest.TestCase):
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()
+        self.db.execute("UPDATE tasks SET stack='Python 3.13, FastAPI' WHERE id='task-1'")
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
         self.db.execute(
@@ -2230,6 +2259,55 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(task["task_type"], "bugfix")
         self.assertEqual(task["parent_pair_id"], pair["id"])
         self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["stack"], "Python 3.13, FastAPI")
+
+    def test_arm_delivery_is_squashed_to_one_commit_on_baseline(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        workspace = self.root / "delivery-A"
+        remote = self.root / "delivery.git"
+        workspace.mkdir()
+        run_command(["git", "init", "-b", "A"], cwd=workspace)
+        run_command(["git", "config", "user.name", "Test"], cwd=workspace)
+        run_command(["git", "config", "user.email", "test@example.com"], cwd=workspace)
+        (workspace / "app.py").write_text("print('baseline')\n", encoding="utf-8")
+        run_command(["git", "add", "app.py"], cwd=workspace)
+        run_command(["git", "commit", "-m", "baseline"], cwd=workspace)
+        baseline = run_command(["git", "rev-parse", "HEAD"], cwd=workspace).stdout.strip()
+        (workspace / "app.py").write_text("print('first')\n", encoding="utf-8")
+        run_command(["git", "commit", "-am", "first local commit"], cwd=workspace)
+        (workspace / "feature.py").write_text("ENABLED = True\n", encoding="utf-8")
+        run_command(["git", "add", "feature.py"], cwd=workspace)
+        run_command(["git", "commit", "-m", "second local commit"], cwd=workspace)
+        run_command(["git", "init", "--bare", str(remote)])
+        run_command(["git", "remote", "add", "origin", str(remote)], cwd=workspace)
+        run_command(["git", "push", "origin", "%s:refs/heads/A" % baseline], cwd=workspace)
+        stamp = now_iso()
+        self.db.execute("UPDATE pairs SET baseline_sha=? WHERE id=?", (baseline, pair["id"]))
+        self.db.execute(
+            """INSERT INTO git_repositories(id,pair_id,owner,name,visibility,local_root,remote_url,
+               main_sha,a_sha,b_sha,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?, 'ready',?,?)""",
+            ("repo-squash", pair["id"], "owner", "repo", "public", str(self.root), str(remote),
+             baseline, baseline, baseline, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'checkpointing',?,?)""",
+            ("arm-squash-A", pair["id"], "A", "A", str(workspace), "container", "screen",
+             "auto_model/urm", "image", stamp, stamp),
+        )
+
+        def local_git(args, cwd=None, timeout=180, check=True):
+            return run_command(["git"] + list(args), cwd=cwd, timeout=timeout, check=check)
+
+        with patch.object(self.service.git, "_github_git", side_effect=local_git):
+            delivered = self.service.git.push_arm(pair["id"], "A")
+        parent = run_command(["git", "rev-parse", delivered + "^"], cwd=workspace).stdout.strip()
+        self.assertEqual(parent, baseline)
+        self.assertEqual(run_command(["git", "rev-list", "--count", baseline + ".." + delivered], cwd=workspace).stdout.strip(), "1")
+        self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "print('first')\n")
+        self.assertTrue((workspace / "feature.py").is_file())
 
     def test_arm_repository_is_imported_only_after_empty_container_start(self):
         self.insert_ready_task()

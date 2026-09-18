@@ -176,13 +176,53 @@ class GitOps:
         if not arm_run:
             raise RuntimeError("找不到 %s Arm 工作区" % arm)
         path = Path(arm_run["workspace_path"])
-        status = run_command(["git", "status", "--porcelain"], cwd=path).stdout.strip()
-        if status:
-            run_command(["git", "add", "-A"], cwd=path)
+        pair = self.db.one("SELECT baseline_sha FROM pairs WHERE id=?", (pair_id,)) or {}
+        baseline = str(pair.get("baseline_sha") or repo.get("main_sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", baseline):
+            raise RuntimeError("Pair 初始环境快照无效")
+        if run_command(["git", "merge-base", "--is-ancestor", baseline, "HEAD"], cwd=path, check=False).returncode != 0:
+            raise RuntimeError("%s 当前代码不是从初始环境快照派生" % arm)
+
+        run_command(["git", "add", "-A"], cwd=path)
+        current_sha = run_command(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
+        current_parent = run_command(
+            ["git", "rev-parse", current_sha + "^"], cwd=path, check=False,
+        )
+        clean = not run_command(["git", "status", "--porcelain"], cwd=path).stdout.strip()
+        if current_parent.returncode == 0 and current_parent.stdout.strip() == baseline and clean:
+            sha = current_sha
+        else:
+            changed = run_command(
+                ["git", "diff", "--cached", "--quiet", baseline], cwd=path, check=False,
+            )
+            if changed.returncode == 0:
+                raise RuntimeError("%s 没有相对初始环境的代码产出，不能作为交付快照" % arm)
+            if changed.returncode != 1:
+                raise RuntimeError("%s 无法核对相对初始环境的代码变更" % arm)
+            # Claude 可以在开发过程中产生任意数量的本地提交；正式 A/B
+            # 快照统一压成一个提交，使其唯一父提交始终是 main 基线。
+            run_command(["git", "reset", "--soft", baseline], cwd=path)
             run_command(["git", "commit", "-m", "Deliver %s implementation" % arm], cwd=path)
-        sha = run_command(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
-        self._github_git(["push", "origin", "HEAD:%s" % arm], cwd=path, timeout=180)
-        remote_sha = self._github_git(["ls-remote", "origin", "refs/heads/%s" % arm], cwd=path).stdout.split()[0]
+            sha = run_command(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
+        parent = run_command(["git", "rev-parse", sha + "^"], cwd=path).stdout.strip()
+        if parent != baseline:
+            raise RuntimeError("%s 产物快照的父提交不是初始环境快照" % arm)
+
+        remote = self._github_git(
+            ["ls-remote", "origin", "refs/heads/%s" % arm], cwd=path, timeout=60,
+        ).stdout.strip().split()
+        old_remote = remote[0] if remote else ""
+        if old_remote != sha:
+            if not re.fullmatch(r"[0-9a-f]{40}", old_remote):
+                raise RuntimeError("无法确认远端 %s 分支当前提交" % arm)
+            lease = "--force-with-lease=refs/heads/%s:%s" % (arm, old_remote)
+            self._github_git(
+                ["push", lease, "origin", "HEAD:refs/heads/%s" % arm], cwd=path, timeout=180,
+            )
+        verified = self._github_git(
+            ["ls-remote", "origin", "refs/heads/%s" % arm], cwd=path, timeout=60,
+        ).stdout.strip().split()
+        remote_sha = verified[0] if verified else ""
         if sha != remote_sha:
             raise RuntimeError("%s 远端 SHA 校验失败" % arm)
         column = "a_sha" if arm == "A" else "b_sha"
