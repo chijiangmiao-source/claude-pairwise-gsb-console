@@ -12,6 +12,7 @@ const STATUS_MAP = {
   PENDING_FIX: "needs_fix",
   DISCARDED: "discarded",
 };
+const activeSubmissions = new Map();
 
 function errorMessage(body, fallback) {
   if (typeof body === "string" && body.trim()) return body;
@@ -255,19 +256,39 @@ function compactRemote(item) {
     id: String(item?.id || ""), status: String(item?.status || "SUBMITTED"),
     a_session_id: firstValue(item, ["a_session_id", "A-SessionID"]),
     b_session_id: firstValue(item, ["b_session_id", "B-SessionID"]),
+    a_prompt_id: firstValue(item, ["a_prompt_id", "A-PromptID"]),
+    b_prompt_id: firstValue(item, ["b_prompt_id", "B-PromptID"]),
+    user_prompt: firstValue(item, ["user_prompt", "User Prompt"]),
     qc_summary: String(item?.qc_summary || item?.message || "").slice(0, 2000),
     submitted_at: String(item?.submitted_at || item?.created_at || "").slice(0, 128),
     updated_at: String(item?.updated_at || item?.qc_finished_at || "").slice(0, 128),
   };
 }
 async function findRemote(bundle) {
-  const session = String(bundle.values?.a_session_id || "");
-  if (!session) return null;
-  const response = await remoteJson(`/gsb/submissions?page=1&page_size=20&keyword=${encodeURIComponent(session)}`);
-  const items = Array.isArray(response.items) ? response.items : [];
-  for (const item of items) {
-    const detail = compactRemote(item);
-    if (detail.a_session_id === bundle.values.a_session_id && detail.b_session_id === bundle.values.b_session_id) return detail;
+  const values = bundle.values || {};
+  const prompt = String(values.user_prompt || "").trim();
+  const queries = [...new Set([
+    values.a_session_id, values.b_session_id, values.a_prompt_id, values.b_prompt_id,
+    prompt.slice(0, 48),
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+  const seen = new Set();
+  for (const query of queries) {
+    const response = await remoteJson(`/gsb/submissions?page=1&page_size=50&keyword=${encodeURIComponent(query)}`);
+    const items = Array.isArray(response.items) ? response.items : [];
+    for (const item of items) {
+      const id = String(item?.id || "");
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      let detail = compactRemote(item);
+      if (!detail.a_session_id || !detail.b_session_id || !detail.user_prompt) {
+        detail = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(id)}`));
+      }
+      const sameSessions = Boolean(values.a_session_id && values.b_session_id
+        && detail.a_session_id === values.a_session_id && detail.b_session_id === values.b_session_id);
+      const samePrompts = Boolean(values.a_prompt_id && values.b_prompt_id
+        && detail.a_prompt_id === values.a_prompt_id && detail.b_prompt_id === values.b_prompt_id);
+      if (sameSessions || samePrompts) return detail;
+    }
   }
   return null;
 }
@@ -299,11 +320,19 @@ async function uploadBundle(bundle, schema) {
   };
 }
 
-async function submitOne(pairId) {
+async function submitOneUnlocked(pairId) {
   const bundle = await loadBundle(pairId);
   if (!bundle.ready) throw new Error(`提交前检查未通过：${(bundle.issues || []).join("；")}`);
-  if (bundle.solo_qa?.remote_id && !["failed", "ready_to_submit"].includes(bundle.solo_qa.status)) {
-    return { pair_id: pairId, outcome: "skipped", reason: "本地已经记录为提交过" };
+  if (bundle.solo_qa?.remote_id) {
+    return { pair_id: pairId, outcome: "skipped", remote_id: String(bundle.solo_qa.remote_id), reason: "该 Pair 已绑定远端记录，只能同步状态或提交返修" };
+  }
+  if (bundle.solo_qa?.status === "submitting") {
+    const recovered = await findRemote(bundle);
+    if (recovered) {
+      await recordState(bundle, stateValues(recovered, bundle));
+      return { pair_id: pairId, outcome: "recovered", remote_id: recovered.id };
+    }
+    throw new Error("该 Pair 上一次提交仍在确认中，已拦截重复上传；请稍后同步状态");
   }
   const recoveredBefore = await findRemote(bundle);
   if (recoveredBefore) {
@@ -332,6 +361,14 @@ async function submitOne(pairId) {
     await recordState(bundle, { status: "failed", error: message });
     throw new Error(message);
   }
+}
+
+async function submitOne(pairId) {
+  if (activeSubmissions.has(pairId)) return activeSubmissions.get(pairId);
+  const pending = submitOneUnlocked(pairId);
+  activeSubmissions.set(pairId, pending);
+  try { return await pending; }
+  finally { activeSubmissions.delete(pairId); }
 }
 
 async function repairOne(pairId) {

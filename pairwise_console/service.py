@@ -3,6 +3,7 @@ import json
 import mimetypes
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -94,6 +95,7 @@ class PairwiseService:
         self._seed_settings()
         self._quarantine_invalid_completed_pairs()
         self._queue_invalid_delivery_lineage_pairs()
+        self._restore_false_completed_tasks()
         self.db.execute(
             """UPDATE codex_jobs SET status='failed',error='服务重启时作业仍处于运行态，已安全释放以便重新排队',
                finished_at=?,updated_at=? WHERE status='running'""",
@@ -222,6 +224,34 @@ class PairwiseService:
                 )
             self.db.audit("git.invalid_delivery_lineage_queued", "pair", pair["id"], {
                 "arms": invalid_arms, "baseline_sha": baseline,
+            })
+
+    def _restore_false_completed_tasks(self) -> None:
+        """Return tasks retired only because progress text was mistaken for completion."""
+        rows = self.db.all(
+            """SELECT DISTINCT t.id,p.id pair_id,t.title FROM tasks t
+                 JOIN pairs p ON p.task_id=t.id
+                 JOIN arm_runs ar ON ar.pair_id=p.id
+                 JOIN audit_events e ON e.entity_id=ar.id
+                WHERE t.status='used' AND p.status='failed'
+                  AND p.stage IN ('replaced','replacement_failed','artifact_failed','development_failed')
+                  AND e.event_type='claude.arm_completed'
+                  AND json_extract(e.detail_json,'$.commit_sha')=p.baseline_sha
+                  AND NOT EXISTS(
+                    SELECT 1 FROM pairs newer WHERE newer.task_id=t.id AND newer.id<>p.id
+                      AND newer.status IN ('queued','running','review','completed','repair_pending')
+                  )
+                ORDER BY p.updated_at"""
+        )
+        for row in rows:
+            stamp = now_iso()
+            self.db.execute(
+                """UPDATE tasks SET status='ready',used_at=NULL,rejection_reason='',updated_at=?
+                   WHERE id=? AND status='used'""", (stamp, row["id"]),
+            )
+            self.db.audit("task.false_completion_restored", "task", row["id"], {
+                "retired_pair_id": row["pair_id"],
+                "reason": "historical_tool_use_progress_was_mistaken_for_completion",
             })
 
     def _invalidate_recordings(self, pair_id: str, arms=None, reason: str = "") -> int:
@@ -975,11 +1005,135 @@ class PairwiseService:
             "instruction": "需要时直接在当前目录用 git show <baselineSha>:<path> 查看准确基线源码。",
         }, ensure_ascii=False)
 
+    @staticmethod
+    def _normalized_task_text(value: Any) -> str:
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+    @classmethod
+    def _task_text_similarity(cls, left: Any, right: Any) -> float:
+        left_text = cls._normalized_task_text(left)
+        right_text = cls._normalized_task_text(right)
+        if not left_text or not right_text:
+            return 0.0
+        if left_text == right_text:
+            return 1.0
+        width = 3
+        left_parts = {left_text[index:index + width] for index in range(max(1, len(left_text) - width + 1))}
+        right_parts = {right_text[index:index + width] for index in range(max(1, len(right_text) - width + 1))}
+        return (2.0 * len(left_parts & right_parts)) / max(1, len(left_parts) + len(right_parts))
+
+    def _historical_task_catalog(self, exclude_task_id: str = "") -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = [
+            {
+                "key": str(row.get("id") or ""), "source": "本系统题库",
+                "title": str(row.get("title") or ""), "taskType": str(row.get("task_type") or ""),
+                "prompt": str(row.get("prompt") or ""), "status": str(row.get("status") or ""),
+            }
+            for row in self.db.all(
+                "SELECT id,title,task_type,prompt,status FROM tasks WHERE id<>? ORDER BY created_at DESC LIMIT 1500",
+                (exclude_task_id,),
+            )
+        ]
+        old_path = Path(self.config.old_db_path)
+        if old_path.is_file():
+            try:
+                source = sqlite3.connect("file:%s?mode=ro" % old_path, uri=True)
+                source.row_factory = sqlite3.Row
+                try:
+                    table = source.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='solo_qa_prompt_history'"
+                    ).fetchone()
+                    if table:
+                        for row in source.execute(
+                            """SELECT remote_submission_id,repo_name,prompt,task_type,remote_status
+                                 FROM solo_qa_prompt_history WHERE trim(prompt)<>''
+                                 ORDER BY COALESCE(remote_updated_at,submitted_at,last_synced_at) DESC LIMIT 1000"""
+                        ).fetchall():
+                            rows.append({
+                                "key": "remote-" + str(row["remote_submission_id"] or ""),
+                                "source": "历史提交题库", "title": str(row["repo_name"] or ""),
+                                "taskType": str(row["task_type"] or ""), "prompt": str(row["prompt"] or ""),
+                                "status": str(row["remote_status"] or ""),
+                            })
+                finally:
+                    source.close()
+            except sqlite3.Error:
+                pass
+        unique: List[Dict[str, Any]] = []
+        seen = set()
+        for row in rows:
+            normalized = self._normalized_task_text(row.get("prompt"))
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(row)
+        return unique
+
+    def _task_duplicate_context(self, task: Dict[str, Any], exclude_task_id: str = "") -> List[Dict[str, Any]]:
+        prompt = str(task.get("prompt") or "")
+        title = str(task.get("title") or "")
+        ranked = []
+        catalog = self._historical_task_catalog(exclude_task_id)
+        for index, row in enumerate(catalog):
+            prompt_score = self._task_text_similarity(prompt, row.get("prompt"))
+            title_score = self._task_text_similarity(title, row.get("title"))
+            ranked.append((max(prompt_score, title_score * 0.75), index, row))
+        selected = sorted(ranked, key=lambda item: (-item[0], item[1]))[:28]
+        selected_keys = {item[2]["key"] for item in selected}
+        selected.extend(
+            (0.0, index, row) for index, row in enumerate(catalog[:20])
+            if row["key"] not in selected_keys
+        )
+        return [
+            {
+                "source": row["source"], "title": row["title"], "taskType": row["taskType"],
+                "summary": row["prompt"][:360], "similarityHint": round(score, 3),
+            }
+            for score, _, row in selected[:40]
+        ]
+
+    def _task_generation_context(self) -> List[Dict[str, Any]]:
+        catalog = self._historical_task_catalog()
+        current = [row for row in catalog if row["source"] == "本系统题库"][:100]
+        historical = [row for row in catalog if row["source"] == "历史提交题库"][:40]
+        return [
+            {
+                "source": row["source"], "title": row["title"], "taskType": row["taskType"],
+                "status": row["status"], "summary": row["prompt"][:220],
+            }
+            for row in current + historical
+        ]
+
+    def _deterministic_task_duplicate(self, task: Dict[str, Any], exclude_task_id: str = "") -> str:
+        prompt = str(task.get("prompt") or "")
+        title = str(task.get("title") or "")
+        normalized = self._normalized_task_text(prompt)
+        if not normalized:
+            return ""
+        allow_previous_period_reuse = str(task.get("source") or "") == "legacy"
+        for row in self._historical_task_catalog(exclude_task_id):
+            if allow_previous_period_reuse and row["source"] == "历史提交题库":
+                continue
+            other_prompt = str(row.get("prompt") or "")
+            other_normalized = self._normalized_task_text(other_prompt)
+            score = self._task_text_similarity(prompt, other_prompt)
+            same_title = bool(
+                self._normalized_task_text(title)
+                and self._normalized_task_text(title) == self._normalized_task_text(row.get("title"))
+            )
+            if normalized == other_normalized:
+                return "题面与%s中的“%s”完全重复" % (row["source"], row["title"] or row["key"])
+            if len(normalized) >= 120 and (score >= 0.86 or (same_title and score >= 0.68)):
+                return "题面与%s中的“%s”高度相似（%.0f%%），需要更换核心问题和验收机制" % (
+                    row["source"], row["title"] or row["key"], score * 100,
+                )
+        return ""
+
     def validate_task(self, task_id: str) -> Dict[str, Any]:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
         if not task:
             raise KeyError("任务不存在")
-        titles = self.db.all("SELECT id,title,substr(prompt,1,180) summary FROM tasks WHERE id<>? AND status IN ('ready','used') ORDER BY created_at DESC LIMIT 80", (task_id,))
+        titles = self._task_duplicate_context(task, exclude_task_id=task_id)
         recent_rejections = self.db.all(
             """SELECT t.title,t.task_type,d.assessed_difficulty,d.reason
                  FROM difficulty_reviews d JOIN pairs p ON p.id=d.pair_id
@@ -1000,6 +1154,11 @@ class PairwiseService:
             "task_validation", prompt, VALIDATION_SCHEMA,
             cwd=cwd if cwd.is_dir() else None, task_id=task_id,
         )
+        duplicate = self._deterministic_task_duplicate(task, exclude_task_id=task_id)
+        if duplicate:
+            result["accepted"] = False
+            result["duplicate"] = True
+            result["reason"] = duplicate
         accepted = bool(
             result["accepted"] and not result["banned"] and not result["duplicate"]
             and result["baselineReady"]
@@ -1031,15 +1190,18 @@ class PairwiseService:
         rejected = 0
         try:
             for _ in range(count):
-                existing = self.db.all(
-                    """SELECT title,task_type,difficulty,status,substr(prompt,1,220) summary,
-                       substr(rejection_reason,1,400) rejection_reason
-                       FROM tasks ORDER BY created_at DESC LIMIT 100"""
-                )
+                existing = self._task_generation_context()
                 prompt = task_generation_prompt(json.dumps(existing, ensure_ascii=False), task_type)
                 result = self.codex.run("task_generation", prompt, TASK_SCHEMA)
                 if result.get("taskType") != task_type:
                     rejected += 1
+                    continue
+                duplicate = self._deterministic_task_duplicate(result)
+                if duplicate:
+                    rejected += 1
+                    self.db.audit("task.generated_duplicate_rejected", "task", "", {
+                        "title": result.get("title", ""), "reason": duplicate,
+                    })
                     continue
                 task_id = "task-" + uuid.uuid4().hex[:16]
                 key = fingerprint(result["taskType"], result["prompt"], "")
@@ -1103,7 +1265,7 @@ class PairwiseService:
             "selectedArm": selected, "commitSha": arm["commit_sha"], "files": files,
             "readme": readme_text, "dockerCheck": json.loads(check.get("checks_json") or "[]"),
         }, ensure_ascii=False)
-        known = self.db.all("SELECT title,substr(prompt,1,220) summary FROM tasks ORDER BY created_at DESC LIMIT 100")
+        known = self._task_generation_context()
         last_error = ""
         for _ in range(3):
             result = self.codex.run(
@@ -1114,6 +1276,10 @@ class PairwiseService:
             )
             if result.get("taskType") != "feature" or result.get("difficulty") not in ("困难", "地狱"):
                 last_error = "生成结果不是困难或地狱 Feature"
+                continue
+            duplicate = self._deterministic_task_duplicate(result)
+            if duplicate:
+                last_error = duplicate
                 continue
             task_id = "task-" + uuid.uuid4().hex[:16]
             key = fingerprint("feature", result["prompt"], arm["commit_sha"])
@@ -1954,7 +2120,13 @@ class PairwiseService:
         self.db.execute(
             """INSERT INTO delivery_submissions(id,pair_id,status,created_at,updated_at)
                VALUES(?,?,'ready_to_submit',?,?)
-               ON CONFLICT(pair_id) DO UPDATE SET status='ready_to_submit',error='',updated_at=excluded.updated_at""",
+               ON CONFLICT(pair_id) DO UPDATE SET
+                 status=CASE
+                   WHEN delivery_submissions.remote_id='' THEN 'ready_to_submit'
+                   WHEN delivery_submissions.remote_status='PENDING_FIX' THEN 'needs_fix'
+                   ELSE delivery_submissions.status
+                 END,
+                 error='',updated_at=excluded.updated_at""",
             (submission_id, pair_id, stamp, stamp),
         )
         self.db.audit("gsb.confirmed", "pair", pair_id, {"verdict": verdict, "confirmed_by": confirmed_by})
@@ -2404,8 +2576,10 @@ class PairwiseService:
             "repro_level": "已容器化，可一键起环境",
             "env_snapshot": remote + "/commit/" + main_sha if remote and main_sha else "",
             "a_session_id": a_session,
+            "a_prompt_id": str((arms.get("A") or {}).get("prompt_id") or ""),
             "a_artifact_snapshot": remote + "/commit/" + str((arms.get("A") or {}).get("commit_sha") or "") if remote else "",
             "b_session_id": b_session,
+            "b_prompt_id": str((arms.get("B") or {}).get("prompt_id") or ""),
             "b_artifact_snapshot": remote + "/commit/" + str((arms.get("B") or {}).get("commit_sha") or "") if remote else "",
             "gsb_verdict": verdict,
             "gsb_reason": reason,
@@ -2453,6 +2627,26 @@ class PairwiseService:
         stamp = now_iso()
         submission_id = "delivery-" + uuid.uuid4().hex[:16]
         cleaned = lambda key, limit: str(values.get(key) or "")[:limit]
+        current = self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
+        incoming_remote_id = cleaned("remote_id", 128)
+        current_remote_id = str(current.get("remote_id") or "")
+        if current_remote_id and incoming_remote_id and incoming_remote_id != current_remote_id:
+            raise ValueError(
+                "该 Pair 已绑定 SOLO-QA #%s，禁止改绑为 #%s；请同步原记录或走返修"
+                % (current_remote_id, incoming_remote_id)
+            )
+        if status == "submitting" and current.get("status") == "submitting":
+            try:
+                updated = datetime.fromisoformat(str(current.get("updated_at") or ""))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                active_seconds = (datetime.now(timezone.utc) - updated).total_seconds()
+            except ValueError:
+                active_seconds = 0
+            if active_seconds < 15 * 60:
+                raise ValueError("该 Pair 已有提交正在进行，已拦截重复上传")
+        remote_id = incoming_remote_id or current_remote_id
+        remote_url = cleaned("remote_url", 1000) or str(current.get("remote_url") or "")
         self.db.execute(
             """INSERT INTO delivery_submissions(id,pair_id,status,remote_id,remote_url,payload_sha256,
                  remote_status,qc_summary,remote_updated_at,error,submitted_at,created_at,updated_at)
@@ -2463,12 +2657,12 @@ class PairwiseService:
                  error=excluded.error,submitted_at=CASE WHEN excluded.submitted_at IS NOT NULL
                    THEN excluded.submitted_at ELSE delivery_submissions.submitted_at END,
                  updated_at=excluded.updated_at""",
-            (submission_id, pair_id, status, cleaned("remote_id", 128), cleaned("remote_url", 1000),
+            (submission_id, pair_id, status, remote_id, remote_url,
              cleaned("payload_sha256", 64), cleaned("remote_status", 64), cleaned("qc_summary", 2000),
              cleaned("remote_updated_at", 128), cleaned("error", 2000),
              cleaned("submitted_at", 128) or None, stamp, stamp),
         )
-        self.db.audit("solo_qa.state", "pair", pair_id, {"status": status, "remote_id": cleaned("remote_id", 128)})
+        self.db.audit("solo_qa.state", "pair", pair_id, {"status": status, "remote_id": remote_id})
         return self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
 
     def set_delivery_hidden(self, pair_id: str, hidden: bool) -> Dict[str, Any]:

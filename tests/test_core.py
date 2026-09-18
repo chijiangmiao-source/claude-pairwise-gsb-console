@@ -81,6 +81,94 @@ class CoreTests(unittest.TestCase):
         self.assertIn("至少两个相互制约", generated)
         self.assertIn("当前不存在且相互制约", feature)
 
+    def test_task_duplicate_guard_checks_full_local_history(self):
+        stamp = now_iso()
+        original = "实现带断点恢复、分片摘要和幂等确认的大型扫描上传，并用 Docker Compose 验收异常恢复。"
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+               fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,'困难','[]',?,'used',?,?)""",
+            ("task-history", "test", "zero_to_one", "历史扫描上传", original, "history-key", stamp, stamp),
+        )
+        reason = self.service._deterministic_task_duplicate({"title": "换名后的扫描上传", "prompt": original})
+        self.assertIn("完全重复", reason)
+
+    def test_task_duplicate_context_includes_previous_submission_prompts(self):
+        connection = sqlite3.connect(self.config.old_db_path)
+        connection.execute(
+            """CREATE TABLE solo_qa_prompt_history(
+               remote_submission_id TEXT,repo_name TEXT,prompt TEXT,task_type TEXT,remote_status TEXT,
+               submitted_at TEXT,remote_updated_at TEXT,last_synced_at TEXT)"""
+        )
+        connection.execute(
+            "INSERT INTO solo_qa_prompt_history VALUES('900','历史冷库项目',?,'0-1代码生成','QC_PASSED',?,?,?)",
+            ("冷库断电后恢复告警序列并保持去重游标", now_iso(), now_iso(), now_iso()),
+        )
+        connection.commit()
+        connection.close()
+        context = self.service._task_generation_context()
+        self.assertTrue(any(item["source"] == "历史提交题库" and item["title"] == "历史冷库项目" for item in context))
+        prompt = "冷库断电后恢复告警序列并保持去重游标"
+        self.assertIn("历史提交题库", self.service._deterministic_task_duplicate({"title": "新生成", "prompt": prompt}))
+        self.assertEqual(
+            self.service._deterministic_task_duplicate({"source": "legacy", "title": "允许复用", "prompt": prompt}),
+            "",
+        )
+
+    def test_submission_claim_and_remote_binding_are_idempotent(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        first = self.service.update_solo_qa_state({"pair_id": pair["id"], "status": "submitting"})
+        self.assertEqual(first["status"], "submitting")
+        with self.assertRaisesRegex(ValueError, "重复上传"):
+            self.service.update_solo_qa_state({"pair_id": pair["id"], "status": "submitting"})
+        self.service.update_solo_qa_state({
+            "pair_id": pair["id"], "status": "qc_pending", "remote_id": "474", "remote_status": "SUBMITTED",
+        })
+        with self.assertRaisesRegex(ValueError, "禁止改绑"):
+            self.service.update_solo_qa_state({
+                "pair_id": pair["id"], "status": "qc_pending", "remote_id": "475", "remote_status": "SUBMITTED",
+            })
+        synced = self.service.update_solo_qa_state({
+            "pair_id": pair["id"], "status": "qc_passed", "remote_id": "474", "remote_status": "QC_PASSED",
+        })
+        self.assertEqual((synced["remote_id"], synced["status"]), ("474", "qc_passed"))
+
+    def test_confirming_gsb_keeps_pending_fix_record_in_repair_flow(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                ("arm-confirm-" + arm, pair["id"], arm, arm, str(self.root), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", arm.lower() * 40, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,created_at,updated_at)
+                   VALUES(?,?,?,?, 'passed','[]',?,?)""",
+                ("check-confirm-" + arm, pair["id"], arm, arm.lower() * 40, stamp, stamp),
+            )
+        self.db.execute(
+            """INSERT INTO gsb_reviews(id,pair_id,verdict,reason,a_reason,b_reason,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'draft',?,?)""",
+            ("gsb-confirm-repair", pair["id"], "Same", "", "", "", stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO delivery_submissions(id,pair_id,status,remote_id,remote_status,created_at,updated_at)
+               VALUES(?,?,'needs_fix','470','PENDING_FIX',?,?)""",
+            ("delivery-confirm-repair", pair["id"], stamp, stamp),
+        )
+        self.service.confirm_gsb(
+            pair["id"], "Same",
+            "A 在 app.py 完成状态恢复，Docker 验收跑通关键异常路径，最终行为符合题面。",
+            "B 在 app.py 也完成状态恢复，Docker 验收覆盖相同业务流程，结果与 A 接近。",
+            "刘昱",
+        )
+        delivery = self.db.one("SELECT status,remote_id FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
+        self.assertEqual(delivery, {"status": "needs_fix", "remote_id": "470"})
+
     def test_task_mix_prefers_bugfix_for_seven_seven_ten_ratio(self):
         stamp = now_iso()
         self.db.set_setting("task_mix_started_at", "2000-01-01T00:00:00+00:00")
@@ -1929,6 +2017,28 @@ class CoreTests(unittest.TestCase):
             state = self.service.claude.trace_state(arm, prompt)
         self.assertFalse(state["complete"])
         self.assertEqual(state["result"], "Now let me inspect the remaining files.")
+
+    def test_task_retired_by_false_completion_is_restored_to_pool(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        baseline = "b" * 40
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='failed',stage='replaced',baseline_sha=? WHERE id=?",
+            (baseline, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'failed',?,?)""",
+            ("arm-false-complete", pair["id"], "A", "A", str(self.root), "container", "screen",
+             "auto_model/urm", "image", stamp, stamp),
+        )
+        self.db.audit("claude.arm_completed", "arm_run", "arm-false-complete", {
+            "arm": "A", "commit_sha": baseline, "checkpointedDelivery": True,
+        })
+        self.service._restore_false_completed_tasks()
+        task = self.db.one("SELECT status,used_at FROM tasks WHERE id='task-1'")
+        self.assertEqual(task, {"status": "ready", "used_at": None})
 
     def test_completed_mismatched_prompt_is_visible_to_monitor_for_targeted_rerun(self):
         prompt = "Build the requested project\n\nKeep every boundary condition."

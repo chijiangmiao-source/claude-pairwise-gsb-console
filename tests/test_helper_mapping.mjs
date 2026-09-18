@@ -84,3 +84,22 @@ test("keeps the existing all-record sync when no Pair is selected", () => {
   const result = vm.runInContext("selectSyncItems(syncItems, syncPayload)", context);
   assert.equal(result.length, 2);
 });
+
+test("coalesces concurrent submit requests for the same Pair", async () => {
+  vm.runInContext(`
+    submitCallCount = 0;
+    submitOneUnlocked = async (pairId) => {
+      submitCallCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { pair_id: pairId, outcome: "submitted", remote_id: "474" };
+    };
+  `, context);
+  const result = await vm.runInContext(`Promise.all([
+    submitOne("pair-1111111111111111"), submitOne("pair-1111111111111111")
+  ])`, context);
+  assert.equal(vm.runInContext("submitCallCount", context), 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), [
+    { pair_id: "pair-1111111111111111", outcome: "submitted", remote_id: "474" },
+    { pair_id: "pair-1111111111111111", outcome: "submitted", remote_id: "474" },
+  ]);
+});
