@@ -52,6 +52,7 @@ GSB_STEP_REFERENCE = re.compile(
 )
 TASK_MIX_TYPES = ("zero_to_one", "feature", "bugfix")
 ELIGIBLE_TASK_SQL = "(difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"
+MAX_FEATURE_TASKS_PER_PROJECT = 3
 A9_REJECTED_PROMPT_FRAGMENTS = (
     "请修复该问题保留现有dockercompose启动与验收链路并补充覆盖复现路径的自动化验收",
 )
@@ -810,6 +811,48 @@ class PairwiseService:
         })
         return True
 
+    @staticmethod
+    def _canonical_repository_url(value: Any) -> str:
+        url = str(value or "").strip().casefold()
+        ssh = re.fullmatch(r"git@([^:]+):(.+)", url)
+        if ssh:
+            url = "https://%s/%s" % (ssh.group(1), ssh.group(2))
+        url = url.rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
+        return url
+
+    def _feature_project_key(self, task: Dict[str, Any]) -> str:
+        repo = self._canonical_repository_url(task.get("baseline_repo_url"))
+        parent_pair_id = str(task.get("parent_pair_id") or "").strip()
+        if not repo and parent_pair_id:
+            parent_repo = self.db.one(
+                "SELECT remote_url FROM git_repositories WHERE pair_id=?", (parent_pair_id,),
+            ) or {}
+            repo = self._canonical_repository_url(parent_repo.get("remote_url"))
+        if repo:
+            return "repo:" + repo
+        if parent_pair_id:
+            return "pair:" + parent_pair_id
+        title = " ".join(str(task.get("title") or "").casefold().split())
+        return "title:" + title
+
+    def _feature_project_rows(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
+        project = self._feature_project_key(task)
+        rows = self.db.all(
+            """SELECT id,title,baseline_repo_url,parent_pair_id,status,created_at
+                 FROM tasks WHERE task_type='feature'
+                  AND status IN ('candidate','ready','used','rejected')
+                ORDER BY created_at,id"""
+        )
+        return [row for row in rows if self._feature_project_key(row) == project]
+
+    def _feature_project_rank(self, task: Dict[str, Any]) -> int:
+        for index, row in enumerate(self._feature_project_rows(task), start=1):
+            if row["id"] == task.get("id"):
+                return index
+        return 0
+
     def _task_mix_weights(self) -> Dict[str, int]:
         return {
             "zero_to_one": max(1, int(self.db.setting("task_mix_zero_to_one", 7))),
@@ -865,6 +908,16 @@ class PairwiseService:
                 (task_type,),
             )
             for task in tasks:
+                if task_type == "feature" and self._feature_project_rank(task) > MAX_FEATURE_TASKS_PER_PROJECT:
+                    reason = "同一基线项目最多保留 3 个 Feature 迭代，超出额度后应重新创建 0–1 项目"
+                    self.db.execute(
+                        "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
+                        (reason, now_iso(), task["id"]),
+                    )
+                    self.db.audit("feature.project_limit_rejected", "task", task["id"], {
+                        "reason": reason, "project": self._feature_project_key(task),
+                    })
+                    continue
                 duplicate = self._deterministic_task_duplicate(
                     task, exclude_task_id=task["id"], selection=True,
                 )
@@ -886,20 +939,22 @@ class PairwiseService:
             )
         if task_type == "feature":
             source = self.db.one(
-                """SELECT p.id FROM pairs p JOIN tasks t ON t.id=p.task_id
+                """SELECT p.id,t.title,COALESCE(r.remote_url,'') baseline_repo_url
+                     FROM pairs p JOIN tasks t ON t.id=p.task_id
+                LEFT JOIN git_repositories r ON r.pair_id=p.id
                    WHERE p.status='completed' AND t.task_type='zero_to_one'
                      AND NOT EXISTS (
                        SELECT 1 FROM delivery_submissions d
                         WHERE d.pair_id=p.id AND d.status='discarded'
                      )
-                     AND NOT EXISTS (
-                       SELECT 1 FROM tasks child WHERE child.parent_pair_id=p.id
-                         AND child.task_type='feature'
-                         AND child.status IN ('candidate','ready','used','rejected')
-                     )
-                   ORDER BY p.completed_at,p.id LIMIT 1"""
+                   ORDER BY p.completed_at DESC,p.id DESC LIMIT 1"""
             )
-            if source:
+            feature_count = len(self._feature_project_rows({
+                "baseline_repo_url": source.get("baseline_repo_url", "") if source else "",
+                "parent_pair_id": source.get("id", "") if source else "",
+                "title": source.get("title", "") if source else "",
+            })) if source else 0
+            if source and feature_count < MAX_FEATURE_TASKS_PER_PROJECT:
                 return self._submit_auto(
                     "feature-" + source["id"], self.generate_followup_feature, source["id"],
                 )
@@ -1231,6 +1286,23 @@ class PairwiseService:
         task = self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
         if not task:
             raise KeyError("任务不存在")
+        if task.get("task_type") == "feature" and self._feature_project_rank(task) > MAX_FEATURE_TASKS_PER_PROJECT:
+            reason = "同一基线项目最多保留 3 个 Feature 迭代，超出额度后应重新创建 0–1 项目"
+            result = {
+                "accepted": False, "difficulty": task.get("difficulty") or "困难",
+                "difficultyEvidence": json.loads(task.get("difficulty_evidence_json") or "[]"),
+                "banned": False, "duplicate": True,
+                "baselineReady": bool(task.get("baseline_path") and task.get("baseline_sha")),
+                "reason": reason,
+            }
+            self.db.execute(
+                "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
+                (reason, now_iso(), task_id),
+            )
+            self.db.audit("feature.project_limit_rejected", "task", task_id, {
+                "reason": reason, "project": self._feature_project_key(task),
+            })
+            return {"taskId": task_id, "status": "rejected", "result": result}
         titles = self._task_duplicate_context(task, exclude_task_id=task_id)
         recent_rejections = self.db.all(
             """SELECT t.title,t.task_type,d.assessed_difficulty,d.reason
@@ -1344,11 +1416,19 @@ class PairwiseService:
         if task.get("task_type") != "zero_to_one":
             raise ValueError("Feature 迭代只能从已完成的 0–1 Pair 生成")
         existing_followup = self.db.one(
-            "SELECT * FROM tasks WHERE parent_pair_id=? AND task_type='feature' AND status IN ('candidate','ready','used') ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM tasks WHERE parent_pair_id=? AND task_type='feature' AND status IN ('candidate','ready') ORDER BY created_at DESC LIMIT 1",
             (pair_id,),
         )
         if existing_followup:
             return existing_followup
+        repository = self.db.one("SELECT remote_url FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
+        project_seed = {
+            "baseline_repo_url": repository.get("remote_url", ""),
+            "parent_pair_id": pair_id,
+            "title": task.get("title", ""),
+        }
+        if len(self._feature_project_rows(project_seed)) >= MAX_FEATURE_TASKS_PER_PROJECT:
+            raise ValueError("同一 0–1 项目最多生成 3 个 Feature 迭代，请重新创建 0–1 项目")
         selected = "B" if pair["winner"] == "B better" else "A"
         arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=? AND status='completed'", (pair_id, selected))
         check = self.db.one("SELECT * FROM artifact_checks WHERE pair_id=? AND arm=? AND status='passed' ORDER BY created_at DESC LIMIT 1", (pair_id, selected))
@@ -1393,7 +1473,7 @@ class PairwiseService:
                  normalize_project_category(task.get("project_category"), result["stack"], result["prompt"]),
                  json.dumps(result["acceptance"], ensure_ascii=False), result["difficulty"],
                  json.dumps(result["difficultyEvidence"], ensure_ascii=False), str(workspace),
-                 (self.db.one("SELECT remote_url FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}).get("remote_url", ""),
+                 repository.get("remote_url", ""),
                  arm["commit_sha"], pair_id, key, "candidate", stamp, stamp),
             )
             validation = self.validate_task(task_id)

@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 import zipfile
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -324,6 +325,74 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(self.service._schedule_task_source("feature"))
             self.assertTrue(self.service._schedule_task_source("bugfix"))
         self.assertEqual(submitted, ["generate-mix-zero-to-one", "generate-mix-zero-to-one"])
+
+    def test_latest_zero_to_one_gets_at_most_three_feature_tasks_then_new_project(self):
+        self.insert_ready_task()
+        older = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',completed_at=?,updated_at=? WHERE id=?",
+            (stamp, stamp, older["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+               fingerprint,status,created_at,updated_at)
+               VALUES('task-latest-root','test','zero_to_one','latest root','hard project','困难','[]',
+                      'latest-root','ready',?,?)""",
+            (stamp, stamp),
+        )
+        latest = self.service.create_pair("task-latest-root")
+        later = datetime.now(timezone.utc).isoformat()
+        self.db.execute(
+            "UPDATE pairs SET status='completed',stage='completed',completed_at=?,updated_at=? WHERE id=?",
+            (later, later, latest["id"]),
+        )
+        statuses = ("used", "rejected", "used")
+        for index, status in enumerate(statuses):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+                   parent_pair_id,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'困难','[]',?,?,?,?,?)""",
+                (f"feature-limit-{index}", "generated_followup", "feature", f"feature {index}",
+                 f"hard feature {index}", latest["id"], f"feature-limit-{index}", status, later, later),
+            )
+            submitted = []
+            with patch.object(
+                self.service, "_submit_auto",
+                side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+            ):
+                self.assertTrue(self.service._schedule_task_source("feature"))
+            expected = "feature-" + latest["id"] if index < 2 else "generate-mix-zero-to-one"
+            self.assertEqual(submitted, [expected])
+
+        # The older project is still below its limit, but saturation of the
+        # latest root deliberately starts a fresh 0–1 instead of mining old roots.
+        self.assertFalse(self.db.one(
+            "SELECT 1 FROM tasks WHERE parent_pair_id=? AND task_type='feature'",
+            (older["id"],),
+        ))
+        with self.assertRaisesRegex(ValueError, "最多生成 3 个 Feature"):
+            self.service.generate_followup_feature(latest["id"])
+
+    def test_feature_limit_groups_legacy_rows_by_baseline_repository(self):
+        for index in range(4):
+            status = "used" if index < 3 else "candidate"
+            suffix = ".git" if index == 3 else ""
+            created_at = "2026-09-18T00:00:0%d+00:00" % index
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+                   baseline_path,baseline_repo_url,baseline_sha,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'困难','[]',?,?,?,?,?,?,?)""",
+                (f"legacy-feature-{index}", "legacy", "feature", "same legacy project",
+                 f"hard feature {index}", str(self.root),
+                 "https://github.com/example/same-project" + suffix, "a" * 40,
+                 f"legacy-feature-{index}", status, created_at, created_at),
+            )
+        with patch.object(self.service.codex, "run") as run:
+            result = self.service.validate_task("legacy-feature-3")
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("最多保留 3 个 Feature", result["result"]["reason"])
+        run.assert_not_called()
 
     def test_refill_prepares_missing_mix_type_before_old_candidates(self):
         stamp = now_iso()
