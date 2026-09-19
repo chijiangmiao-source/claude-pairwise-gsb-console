@@ -3,7 +3,7 @@ import ffmpegPath from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { automaticFinishDelayMs, finalizeInteractionEvidence } from "./recording_timing.mjs";
+import { automaticFinishDelayMs, finalizeInteractionEvidence, isSafeFeatureControl } from "./recording_timing.mjs";
 import { rankOpenApiOperations, sampleValue } from "./recording_openapi.mjs";
 
 const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`, interactionMode = "auto"] = process.argv.slice(2);
@@ -54,7 +54,7 @@ async function moveAndClick(page, locator) {
   const box = await locator.boundingBox();
   if (!box) throw new Error("目标控件不可见");
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 24 });
-  await page.waitForTimeout(700);
+  await page.waitForTimeout(320);
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 }
 
@@ -69,6 +69,7 @@ async function selectSwaggerOperations(page) {
   return candidates.map((selected) => ({
     path: selected.path,
     method: selected.method,
+    hasPathParameters: /{[^}]+}/.test(selected.path),
     body: selected.content
       ? (selected.content.example ?? selected.content.examples?.default?.value
         ?? sampleValue(selected.content.schema, spec))
@@ -90,15 +91,42 @@ async function findSwaggerBlock(page, selected) {
 
 async function demonstrateSwaggerWorkflow(page) {
   if (!new URL(page.url()).pathname.startsWith("/docs")) return { required: false, ok: true };
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(900);
   const candidates = await selectSwaggerOperations(page);
-  let lastResult = { required: true, ok: false, error: "没有成功的业务接口请求" };
-  for (const selected of candidates.slice(0, 4)) {
-    lastResult = await demonstrateSwaggerOperation(page, selected);
-    if (lastResult.ok) return lastResult;
-    await page.waitForTimeout(1200);
+  const expanded = [];
+  for (const selected of candidates.slice(0, 12)) {
+    try {
+      const block = await findSwaggerBlock(page, selected);
+      if (!(await block.getAttribute("class") || "").includes("is-open")) {
+        await moveAndClick(page, block.locator(".opblock-summary").first());
+        await page.waitForTimeout(180);
+      }
+      expanded.push(`${selected.method.toUpperCase()} ${selected.path}`);
+    } catch {}
   }
-  return lastResult;
+  const results = [];
+  const executable = candidates.filter((selected) => !selected.hasPathParameters).slice(0, 6);
+  for (const selected of (executable.length ? executable : candidates.slice(0, 1))) {
+    try {
+      results.push(await demonstrateSwaggerOperation(page, selected));
+    } catch (error) {
+      results.push({ required: true, ok: false, method: selected.method, path: selected.path,
+        error: error?.message || String(error) });
+    }
+    await page.waitForTimeout(450);
+  }
+  const successful = results.filter((result) => result.ok);
+  return {
+    required: true,
+    ok: successful.length > 0,
+    operations: results.map(({ method, path, status, ok }) => ({ method, path, status, ok })),
+    expanded,
+    clicks: expanded.length + results.length,
+    featureCount: expanded.length,
+    requests: successful.length,
+    workflow: "swagger-business-operations",
+    error: "没有成功的业务接口请求",
+  };
 }
 
 async function demonstrateSwaggerOperation(page, selected) {
@@ -106,17 +134,17 @@ async function demonstrateSwaggerOperation(page, selected) {
   if (!(await block.getAttribute("class") || "").includes("is-open")) {
     await moveAndClick(page, block.locator(".opblock-summary").first());
   }
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(650);
   if (!selected.declaredBody && selected.body !== null) {
     return demonstrateDirectApiWorkflow(page, selected);
   }
   await moveAndClick(page, block.locator("button.try-out__btn").first());
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(650);
   if (selected.body !== null) {
     const textarea = block.locator("textarea").first();
     await moveAndClick(page, textarea);
     await textarea.fill(JSON.stringify(selected.body, null, 2));
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(450);
   }
   await moveAndClick(page, block.locator("button.execute").first());
   const responses = block.locator(".live-responses-table").first();
@@ -124,7 +152,7 @@ async function demonstrateSwaggerOperation(page, selected) {
   await responses.scrollIntoViewIfNeeded();
   const statusTexts = await responses.locator(".response-col_status").allTextContents();
   const status = Number(statusTexts.map((text) => text.match(/\d{3}/)?.[0]).find(Boolean) || 0);
-  await page.waitForTimeout(7000);
+  await page.waitForTimeout(850);
   const result = { required: true, ok: status >= 200 && status < 300, status, method: selected.method, path: selected.path };
   process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
   return result;
@@ -167,7 +195,7 @@ async function demonstrateDirectApiWorkflow(page, selected) {
   await moveAndClick(page, panel.locator("button"));
   await page.waitForFunction(() => Boolean(document.querySelector("#pairwise-direct-api-demo")?.dataset.status));
   const status = Number(await panel.getAttribute("data-status") || 0);
-  await page.waitForTimeout(7000);
+  await page.waitForTimeout(850);
   const result = { required: true, ok: status >= 200 && status < 300, status,
     method: selected.method, path: selected.path, compatibilityRequest: true };
   process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
@@ -217,7 +245,7 @@ async function demonstrateColdRoomAlarmWorkflow(page) {
   if (status >= 200 && status < 300) {
     await page.getByText(eventId, { exact: false }).first().waitFor({ state: "visible", timeout: 15000 });
   }
-  await page.waitForTimeout(7000);
+  await page.waitForTimeout(850);
   const result = { required: true, ok: status >= 200 && status < 300, status,
     method: "post", path: "/api/events", workflow: "device-gateway-callback" };
   process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
@@ -269,12 +297,12 @@ async function demonstrateFileUploadWorkflow(page, fileInput) {
     const box = await locator.boundingBox();
     if (!box) throw new Error("文件控件不可见");
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 24 });
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(320);
   };
   const chooseFile = async (name) => {
     await pointAt(fileInput);
     await fileInput.setInputFiles({ name, mimeType: "application/octet-stream", buffer: payload });
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(500);
   };
   const clickButton = async (pattern) => {
     const buttons = page.locator("button:visible:not([disabled])");
@@ -294,13 +322,13 @@ async function demonstrateFileUploadWorkflow(page, fileInput) {
     throw new Error("选择文件后没有可用的提交按钮");
   }
   await page.locator('[data-test="download-area"]').waitFor({ state: "visible", timeout: 20000 });
-  await page.waitForTimeout(2200);
+  await page.waitForTimeout(650);
 
   // A second delivery of the same bytes exercises real artifact reuse when
   // the product supports it. Other upload pages still get a complete first
   // upload even when they do not expose a clear/reset action.
   if (await clickButton(/清空|重置|重新选择|clear|reset/i)) {
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(450);
     await chooseFile("recording-demo-copy.bin");
     if (!await clickButton(/开始交付|开始上传|上传|提交|发布|保存|确认/i)) {
       throw new Error("重新选择文件后没有可用的提交按钮");
@@ -311,7 +339,7 @@ async function demonstrateFileUploadWorkflow(page, fileInput) {
     } else {
       await page.locator('[data-test="download-area"]').waitFor({ state: "visible", timeout: 20000 });
     }
-    await page.waitForTimeout(3200);
+    await page.waitForTimeout(650);
   }
 
   const requestCount = successfulRequests.length - beforeRequests;
@@ -330,48 +358,77 @@ async function demonstrateFileUploadWorkflow(page, fileInput) {
 }
 
 async function demonstrateGenericWorkflow(page) {
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(900);
   const before = await page.locator("body").innerText();
+  const workflowResults = [];
   if (/冷库门告警中控/.test(before)) {
-    return demonstrateColdRoomAlarmWorkflow(page);
+    const result = await demonstrateColdRoomAlarmWorkflow(page);
+    workflowResults.push(result);
   }
   const fileInput = page.locator('input[type="file"]:visible:not([disabled])').first();
   if (await fileInput.count()) {
-    return demonstrateFileUploadWorkflow(page, fileInput);
+    const result = await demonstrateFileUploadWorkflow(page, fileInput);
+    workflowResults.push(result);
   }
-  const clicked = [];
-  const clickMatching = async (pattern) => {
-    const buttons = page.locator("button:visible:not([disabled]), [role=button]:visible:not([aria-disabled=true])");
-    for (let index = 0; index < await buttons.count(); index += 1) {
-      const button = buttons.nth(index);
-      const label = (await button.innerText().catch(() => "")).trim();
-      if (!pattern.test(label)) continue;
-      await moveAndClick(page, button);
-      clicked.push(label || `control-${index + 1}`);
-      await page.waitForTimeout(3500);
-      return true;
+  const clicked = workflowResults.flatMap((result) => Array.isArray(result.clicks) ? result.clicks : []);
+  const seen = new Set(clicked.map((label) => String(label).replace(/\s+/g, " ").trim().toLowerCase()));
+  const clickMatching = async (pattern, limit) => {
+    let added = 0;
+    while (added < limit && clicked.length < 20) {
+      const controls = page.locator(
+        "button:visible:not([disabled]), [role=button]:visible:not([aria-disabled=true]), "
+        + "[role=tab]:visible:not([aria-disabled=true]), input[type=submit]:visible:not([disabled])",
+      );
+      let target = null;
+      let targetLabel = "";
+      for (let index = 0; index < await controls.count(); index += 1) {
+        const control = controls.nth(index);
+        const label = [
+          await control.innerText().catch(() => ""), await control.getAttribute("value"),
+          await control.getAttribute("aria-label"), await control.getAttribute("title"),
+        ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+        const key = label.toLowerCase();
+        if (!isSafeFeatureControl(label) || seen.has(key) || !pattern.test(label)) continue;
+        target = control;
+        targetLabel = label;
+        break;
+      }
+      if (!target) break;
+      try {
+        await moveAndClick(page, target);
+        seen.add(targetLabel.toLowerCase());
+        clicked.push(targetLabel);
+        added += 1;
+        await page.waitForTimeout(650);
+        await prepareGenericInputs(page);
+      } catch {
+        seen.add(targetLabel.toLowerCase());
+      }
     }
-    return false;
+    return added;
   };
-  await clickMatching(/载入|示例|样例|模板|预置|demo|sample|example/i);
+  await clickMatching(/载入|示例|样例|模板|预置|demo|sample|example/i, 4);
   const filled = await prepareGenericInputs(page);
-  const actionClicked = await clickMatching(
+  const actionCount = await clickMatching(
     /计算|运行|分析|核验|检查|生成|提交|开始|求解|领取|保存|创建|新增|添加|发送|确认|更新|修订|查询|搜索|演示|测试|solve|compute|run|inspect|check|analy|submit|save|create|add|send|confirm|update|search|test/i,
+    12,
   );
-  if (!clicked.length) {
-    await clickMatching(/^(?!.*(?:删除|清空|取消|关闭|remove|delete|clear|cancel|close)).+/i);
-  }
+  await clickMatching(/.+/i, 20 - clicked.length);
   const after = await page.locator("body").innerText();
   const visibleChange = before !== after;
+  const childOk = workflowResults.length === 0 || workflowResults.some((result) => result.ok);
+  const ok = childOk && clicked.length > 0
+    && (visibleChange || successfulRequests.length > 0 || actionCount > 0);
   const result = {
     required: true,
-    ok: clicked.length > 0 && (visibleChange || successfulRequests.length > 0 || actionClicked),
+    ok,
     clicks: clicked,
+    featureCount: clicked.length,
     filled,
     requests: successfulRequests.length,
     visibleChange,
     workflow: "browser-ui",
-    error: "没有完成可见的真实功能操作",
+    error: ok ? "" : "没有完成可见的真实功能操作",
   };
   process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
   return result;
@@ -438,19 +495,6 @@ async function finishAfterAutomaticWorkflow(page) {
     workflowSeconds: Math.round(elapsedMs / 100) / 10,
     plannedSeconds: Math.round((elapsedMs + delayMs) / 100) / 10,
   })}\n`);
-  if (delayMs > 0) {
-    const firstPause = Math.min(delayMs, Math.max(1200, Math.round(delayMs * 0.55)));
-    try {
-      await page.mouse.move(1010, 520, { steps: 28 });
-      await page.waitForTimeout(firstPause);
-      if (delayMs > firstPause) {
-        await page.mouse.move(760, 420, { steps: 20 });
-        await page.waitForTimeout(delayMs - firstPause);
-      }
-    } catch {
-      return;
-    }
-  }
   await finish("automatic_workflow_complete");
 }
 

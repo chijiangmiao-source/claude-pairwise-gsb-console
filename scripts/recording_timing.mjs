@@ -1,20 +1,14 @@
-function stableHash(value) {
-  let hash = 2166136261;
-  for (const character of String(value || "")) {
-    hash ^= character.codePointAt(0);
-    hash = Math.imul(hash, 16777619) >>> 0;
-  }
-  return hash >>> 0;
+export function automaticFinishDelayMs() {
+  // Every workflow already waits briefly after each real action so the result
+  // is visible in the recording. Do not pad a completed demonstration to an
+  // arbitrary target duration.
+  return 0;
 }
 
-export function automaticFinishDelayMs(recordingKey, elapsedMs, maximumSeconds) {
-  const seed = stableHash(recordingKey);
-  const naturalTargetMs = 30000 + (seed % 13000);
-  const reviewPauseMs = 3200 + ((seed >>> 8) % 3500);
-  const desiredFinishMs = Math.max(naturalTargetMs, Number(elapsedMs || 0) + reviewPauseMs);
-  const latestFinishMs = Math.max(0, Number(maximumSeconds || 0) * 1000 - 1200);
-  const finishAtMs = Math.min(desiredFinishMs, latestFinishMs);
-  return Math.max(0, finishAtMs - Number(elapsedMs || 0));
+export function isSafeFeatureControl(label) {
+  const text = String(label || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return !/(?:删除|移除|清空|重置|取消|关闭|退出|注销|下线|停止|终止|撤销|驳回|remove|delete|clear|reset|cancel|close|logout|stop|terminate|revoke|reject)/i.test(text);
 }
 
 export function finalizeInteractionEvidence(interactionMode, demonstration, metrics = {}, requestCount = 0) {
