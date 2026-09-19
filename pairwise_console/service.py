@@ -482,7 +482,10 @@ class PairwiseService:
         configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         target = max(1, min(MAX_PAIR_PROJECTS, configured))
         active = int((self.db.one(
-            "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')"
+            "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
+        ) or {"count": 0})["count"])
+        waiting_api_pairs = int((self.db.one(
+            "SELECT COUNT(*) count FROM pairs WHERE status='waiting_api_retry'"
         ) or {"count": 0})["count"])
         waiting_api_arms = int((self.db.one(
             "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_api_retry'"
@@ -502,6 +505,7 @@ class PairwiseService:
             "enabled": bool(self.db.setting("auto_pipeline_enabled", False)),
             "targetPairs": target,
             "activePairs": active,
+            "waitingApiPairs": waiting_api_pairs,
             "waitingApiArms": waiting_api_arms,
             "readyTasks": ready,
             "generatingBatches": generating,
@@ -554,7 +558,6 @@ class PairwiseService:
         if not self._automation_lock.acquire(blocking=False):
             return self.automation_status()
         try:
-            self._schedule_due_api_retries()
             active_pairs = self.db.all(
                 """SELECT * FROM pairs WHERE status IN ('queued','running','review')
                    ORDER BY created_at,id"""
@@ -598,7 +601,7 @@ class PairwiseService:
             self._schedule_next_automatic_recording(recording_pairs)
 
             active_count = int((self.db.one(
-                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')"
+                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
             ) or {"count": 0})["count"])
             configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
             pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured))
@@ -613,6 +616,12 @@ class PairwiseService:
                 pair = self.create_pair(task["id"])
                 self._submit_auto("repo-" + pair["id"], self.prepare_pair_repository, pair["id"])
                 active_count += 1
+
+            # A transient provider outage must not hold a development slot.
+            # Existing approved work is started first; cooled-down retries
+            # remain queued and resume only when a Pair slot is actually free.
+            if active_count < pair_limit:
+                active_count += self._schedule_due_api_retries(pair_limit - active_count)
 
             # Existing approved questions are consumed first. Refill begins
             # only when no additional approved question can fill the target.
@@ -669,8 +678,10 @@ class PairwiseService:
                     })
                 return
 
-    def _schedule_due_api_retries(self) -> None:
-        """Resume cooled-down API failures before advancing or creating work."""
+    def _schedule_due_api_retries(self, available_slots: int) -> int:
+        """Resume cooled-down API failures only in otherwise unused Pair slots."""
+        if available_slots <= 0:
+            return 0
         due = self.db.all(
             """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
                  JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
@@ -680,19 +691,28 @@ class PairwiseService:
                 ORDER BY COALESCE(a.api_retry_after,a.updated_at),a.updated_at,a.id""",
             (now_iso(),),
         )
-        resumed_pairs = set()
+        rows_by_pair: Dict[str, List[Dict[str, Any]]] = {}
         for row in due:
-            if row["pair_id"] not in resumed_pairs:
-                self.db.execute(
-                    """UPDATE pairs SET status='running',error='',updated_at=?
-                         WHERE id=? AND status='waiting_api_retry' AND stage='development'""",
-                    (now_iso(), row["pair_id"]),
-                )
-                resumed_pairs.add(row["pair_id"])
-            self._submit_monitor(
-                "api-retry-" + row["arm_id"], self._recover_api_retry,
-                row["pair_id"], row["arm_id"], row["prompt"],
+            rows_by_pair.setdefault(row["pair_id"], []).append(row)
+        resumed = 0
+        for pair_id, rows in rows_by_pair.items():
+            if resumed >= available_slots:
+                break
+            submitted = False
+            for row in rows:
+                submitted = self._submit_monitor(
+                    "api-retry-" + row["arm_id"], self._recover_api_retry,
+                    pair_id, row["arm_id"], row["prompt"],
+                ) or submitted
+            if not submitted:
+                continue
+            self.db.execute(
+                """UPDATE pairs SET status='running',error='',updated_at=?
+                     WHERE id=? AND status='waiting_api_retry' AND stage='development'""",
+                (now_iso(), pair_id),
             )
+            resumed += 1
+        return resumed
 
     def _schedule_pending_arm_retries(self, pair_id: str) -> None:
         """Recover retries stranded after launch but before prompt delivery."""
@@ -790,7 +810,7 @@ class PairwiseService:
         # replacement worker cannot claim the last free slot together.
         with self._pair_creation_lock:
             active_count = (self.db.one(
-                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')"
+                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
             ) or {"count": 0})["count"]
             configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
             pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
@@ -1665,7 +1685,7 @@ class PairwiseService:
             raise KeyError("任务不存在")
         if task["status"] != "ready" or not task_difficulty_allowed(task["task_type"], task["difficulty"]):
             raise ValueError("0–1/Feature 仅允许困难或地狱；Bug 修复允许中等、困难或地狱")
-        active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')") or {"count": 0})["count"]
+        active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')") or {"count": 0})["count"]
         configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
         if active_count >= pair_limit:
@@ -4068,13 +4088,14 @@ class PairwiseService:
                 return
             self._futures[operation] = self.executor.submit(fn, *args)
 
-    def _submit_monitor(self, operation: str, fn, *args) -> None:
+    def _submit_monitor(self, operation: str, fn, *args) -> bool:
         """Run long-lived Claude monitoring without blocking user actions."""
         with self._future_lock:
             existing = self._futures.get(operation)
             if existing and not existing.done():
-                return
+                return False
             self._futures[operation] = self.monitor_executor.submit(fn, *args)
+            return True
 
     def _pair(self, pair_id: str) -> Dict[str, Any]:
         pair = self.db.one("SELECT * FROM pairs WHERE id=?", (pair_id,))
