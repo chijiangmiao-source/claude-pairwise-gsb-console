@@ -42,6 +42,26 @@ class RewriteTests(unittest.TestCase):
         self.runner.run.return_value = dict(self.result, aReason="A 多加了一道旧草稿检查，接口测过了，不过浏览器测试没跑，所以稍好一些。")
         with self.assertRaisesRegex(ValueError, "证据"):
             self.rewrite()
+        self.assertEqual(self.runner.run.call_count, 2)
+
+    def test_retries_once_when_first_rewrite_loses_locator(self):
+        missing = dict(
+            self.result,
+            aReason="A 多加了一道旧草稿检查，接口测过了，不过浏览器测试没跑，所以稍好一些。",
+        )
+        self.runner.run.side_effect = [missing, self.result]
+        self.assertEqual(self.rewrite(), self.result)
+        self.assertEqual(self.runner.run.call_count, 2)
+        self.assertIn("遗漏了可核对证据", self.runner.run.call_args.args[1])
+
+    def test_module_name_is_a_reviewable_locator(self):
+        self.runner.run.return_value = dict(
+            self.result,
+            aReason="A 用 app.verify 测过旧草稿保存和接口，不过浏览器测试没跑，所以稍好一些。",
+        )
+        rewritten = self.rewrite()
+        self.assertIn("app.verify", rewritten["aReason"])
+        self.runner.run.assert_called_once()
 
     def test_invalid_source_never_calls_model(self):
         for verdict, a, b in [("invalid", "a"*20, "b"*20), ("Same", "", "b"*20), ("Same", None, "b"*20), ("Same", "a"*301, "b"*20)]:

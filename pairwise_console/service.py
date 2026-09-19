@@ -2422,6 +2422,10 @@ class PairwiseService:
         patterns = (
             r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+",
             r"\b[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|kt|rb|php|sh|yml|yaml|json|toml|md)\b",
+            # Python/JS module and package locators such as app.verify are
+            # still reviewable after a conversational rewrite removes the
+            # underlying file suffix.
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b",
             r"\b(?:docker\s+compose|pytest|npm\s+(?:test|run)|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|python3?\s+|curl\s+|git\s+)[^，。；]*",
             r"\b(?:[1-5]\d\d|[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\b",
             r"(?:函数|方法|接口)\s*[A-Za-z_][A-Za-z0-9_]*",
