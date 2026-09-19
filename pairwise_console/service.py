@@ -571,6 +571,7 @@ class PairwiseService:
                     self._submit_auto("start-" + pair_id, self.start_pair, pair_id)
                 elif stage in ("development", "artifact_validation"):
                     if stage == "development":
+                        self._schedule_active_arm_monitors(pair_id)
                         self._schedule_pending_arm_retries(pair_id)
                         self._schedule_checkpoint_pushes(pair_id)
                     self._schedule_completed_arm_validations(pair_id)
@@ -713,6 +714,24 @@ class PairwiseService:
             )
             resumed += 1
         return resumed
+
+    def _schedule_active_arm_monitors(self, pair_id: str) -> None:
+        """Reconnect monitors to live Claude sessions after a service restart."""
+        task = self.db.one(
+            """SELECT t.prompt FROM tasks t JOIN pairs p ON p.task_id=t.id
+               WHERE p.id=?""", (pair_id,),
+        ) or {}
+        prompt = str(task.get("prompt") or "")
+        if not prompt:
+            return
+        for arm in self.db.all(
+            """SELECT id FROM arm_runs WHERE pair_id=? AND status='developing'
+               AND prompt_sent_at IS NOT NULL""", (pair_id,),
+        ):
+            self._submit_monitor(
+                "monitor-" + arm["id"], self._monitor_arm,
+                pair_id, arm["id"], prompt,
+            )
 
     def _schedule_pending_arm_retries(self, pair_id: str) -> None:
         """Recover retries stranded after launch but before prompt delivery."""

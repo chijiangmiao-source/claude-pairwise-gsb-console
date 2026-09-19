@@ -2955,6 +2955,30 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.one("SELECT status FROM pairs WHERE id=?", (pair["id"],))["status"], "running")
         refill.assert_not_called()
 
+    def test_scheduler_reconnects_monitor_to_live_development_after_restart(self):
+        self.db.set_setting("max_pairs_parallel", 1)
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?,?)""",
+            ("arm-live-after-restart", pair["id"], "A", "A", str(self.root / "live"),
+             "container-live", "screen-live", "auto_model/urm", "image", stamp, stamp, stamp),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_monitor",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ), patch.object(self.service, "_submit_auto", return_value=True), \
+             patch.object(self.service, "_schedule_refill_once"):
+            self.service._schedule_auto_pipeline_once()
+        self.assertIn("monitor-arm-live-after-restart", submitted)
+
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()
         self.db.execute("UPDATE tasks SET stack='Python 3.13, FastAPI' WHERE id='task-1'")
