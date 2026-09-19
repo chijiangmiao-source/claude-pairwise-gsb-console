@@ -259,11 +259,85 @@ async function prepareGenericInputs(page) {
   return filled;
 }
 
+async function demonstrateFileUploadWorkflow(page, fileInput) {
+  const beforeRequests = successfulRequests.length;
+  const payload = Buffer.from(`pairwise browser recording ${Date.now()}\n`.repeat(64));
+  const clicks = [];
+
+  const pointAt = async (locator) => {
+    await locator.scrollIntoViewIfNeeded();
+    const box = await locator.boundingBox();
+    if (!box) throw new Error("文件控件不可见");
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 24 });
+    await page.waitForTimeout(700);
+  };
+  const chooseFile = async (name) => {
+    await pointAt(fileInput);
+    await fileInput.setInputFiles({ name, mimeType: "application/octet-stream", buffer: payload });
+    await page.waitForTimeout(1200);
+  };
+  const clickButton = async (pattern) => {
+    const buttons = page.locator("button:visible:not([disabled])");
+    for (let index = 0; index < await buttons.count(); index += 1) {
+      const button = buttons.nth(index);
+      const label = (await button.innerText().catch(() => "")).trim();
+      if (!pattern.test(label)) continue;
+      await moveAndClick(page, button);
+      clicks.push(label || `button-${index + 1}`);
+      return true;
+    }
+    return false;
+  };
+
+  await chooseFile("recording-demo.bin");
+  if (!await clickButton(/开始交付|开始上传|上传|提交|发布|保存|确认/i)) {
+    throw new Error("选择文件后没有可用的提交按钮");
+  }
+  await page.locator('[data-test="download-area"]').waitFor({ state: "visible", timeout: 20000 });
+  await page.waitForTimeout(2200);
+
+  // A second delivery of the same bytes exercises real artifact reuse when
+  // the product supports it. Other upload pages still get a complete first
+  // upload even when they do not expose a clear/reset action.
+  if (await clickButton(/清空|重置|重新选择|clear|reset/i)) {
+    await page.waitForTimeout(900);
+    await chooseFile("recording-demo-copy.bin");
+    if (!await clickButton(/开始交付|开始上传|上传|提交|发布|保存|确认/i)) {
+      throw new Error("重新选择文件后没有可用的提交按钮");
+    }
+    const reused = page.locator('[data-test="reused-badge"]');
+    if (await reused.count()) {
+      await reused.waitFor({ state: "visible", timeout: 20000 });
+    } else {
+      await page.locator('[data-test="download-area"]').waitFor({ state: "visible", timeout: 20000 });
+    }
+    await page.waitForTimeout(3200);
+  }
+
+  const requestCount = successfulRequests.length - beforeRequests;
+  const result = {
+    required: true,
+    ok: clicks.length > 0 && requestCount > 0,
+    clicks,
+    filled: ["file"],
+    requests: requestCount,
+    visibleChange: true,
+    workflow: "browser-file-upload",
+    error: "文件已选择，但没有完成真实上传请求",
+  };
+  process.stdout.write(`${JSON.stringify({ event: "interaction", ...result })}\n`);
+  return result;
+}
+
 async function demonstrateGenericWorkflow(page) {
   await page.waitForTimeout(3000);
   const before = await page.locator("body").innerText();
   if (/冷库门告警中控/.test(before)) {
     return demonstrateColdRoomAlarmWorkflow(page);
+  }
+  const fileInput = page.locator('input[type="file"]:visible:not([disabled])').first();
+  if (await fileInput.count()) {
+    return demonstrateFileUploadWorkflow(page, fileInput);
   }
   const clicked = [];
   const clickMatching = async (pattern) => {
