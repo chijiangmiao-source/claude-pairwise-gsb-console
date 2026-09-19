@@ -482,7 +482,10 @@ class PairwiseService:
         configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         target = max(1, min(MAX_PAIR_PROJECTS, configured))
         active = int((self.db.one(
-            "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
+            "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')"
+        ) or {"count": 0})["count"])
+        waiting_api_arms = int((self.db.one(
+            "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_api_retry'"
         ) or {"count": 0})["count"])
         ready = int((self.db.one(
             "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND " + ELIGIBLE_TASK_SQL
@@ -492,12 +495,14 @@ class PairwiseService:
         ) or {"count": 0})["count"])
         stages = self.db.all(
             """SELECT stage,COUNT(*) count FROM pairs
-               WHERE status IN ('queued','running','review') GROUP BY stage ORDER BY stage"""
+               WHERE status IN ('queued','running','review','waiting_api_retry')
+               GROUP BY stage ORDER BY stage"""
         )
         return {
             "enabled": bool(self.db.setting("auto_pipeline_enabled", False)),
             "targetPairs": target,
             "activePairs": active,
+            "waitingApiArms": waiting_api_arms,
             "readyTasks": ready,
             "generatingBatches": generating,
             "stages": stages,
@@ -549,6 +554,7 @@ class PairwiseService:
         if not self._automation_lock.acquire(blocking=False):
             return self.automation_status()
         try:
+            self._schedule_due_api_retries()
             active_pairs = self.db.all(
                 """SELECT * FROM pairs WHERE status IN ('queued','running','review')
                    ORDER BY created_at,id"""
@@ -592,7 +598,7 @@ class PairwiseService:
             self._schedule_next_automatic_recording(recording_pairs)
 
             active_count = int((self.db.one(
-                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
+                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')"
             ) or {"count": 0})["count"])
             configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
             pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured))
@@ -662,6 +668,31 @@ class PairwiseService:
                         "arm": arm, "error": redact(str(exc))[-2000:],
                     })
                 return
+
+    def _schedule_due_api_retries(self) -> None:
+        """Resume cooled-down API failures before advancing or creating work."""
+        due = self.db.all(
+            """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
+                 JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
+                WHERE a.status='waiting_api_retry' AND a.prompt_sent_at IS NULL
+                  AND p.stage='development'
+                  AND (a.api_retry_after IS NULL OR a.api_retry_after<=?)
+                ORDER BY COALESCE(a.api_retry_after,a.updated_at),a.updated_at,a.id""",
+            (now_iso(),),
+        )
+        resumed_pairs = set()
+        for row in due:
+            if row["pair_id"] not in resumed_pairs:
+                self.db.execute(
+                    """UPDATE pairs SET status='running',error='',updated_at=?
+                         WHERE id=? AND status='waiting_api_retry' AND stage='development'""",
+                    (now_iso(), row["pair_id"]),
+                )
+                resumed_pairs.add(row["pair_id"])
+            self._submit_monitor(
+                "api-retry-" + row["arm_id"], self._recover_api_retry,
+                row["pair_id"], row["arm_id"], row["prompt"],
+            )
 
     def _schedule_pending_arm_retries(self, pair_id: str) -> None:
         """Recover retries stranded after launch but before prompt delivery."""
@@ -759,7 +790,7 @@ class PairwiseService:
         # replacement worker cannot claim the last free slot together.
         with self._pair_creation_lock:
             active_count = (self.db.one(
-                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
+                "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')"
             ) or {"count": 0})["count"]
             configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
             pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
@@ -1634,11 +1665,14 @@ class PairwiseService:
             raise KeyError("任务不存在")
         if task["status"] != "ready" or not task_difficulty_allowed(task["task_type"], task["difficulty"]):
             raise ValueError("0–1/Feature 仅允许困难或地狱；Bug 修复允许中等、困难或地狱")
-        active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')") or {"count": 0})["count"]
+        active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')") or {"count": 0})["count"]
         configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
         if active_count >= pair_limit:
-            raise ValueError("已达到 Pair 并发上限：最多 4 个 Pair（8 个 A/B 终端）")
+            raise ValueError(
+                "已达到 Pair 并发上限：最多 %d 个 Pair（%d 个 A/B 终端）"
+                % (pair_limit, pair_limit * 2)
+            )
         pair_id = "pair-" + uuid.uuid4().hex[:16]
         if task["task_type"] == "zero_to_one":
             chain_id = "chain-" + uuid.uuid4().hex[:16]
@@ -3166,6 +3200,123 @@ class PairwiseService:
         return "api error" in text or "litellm" in text
 
     @staticmethod
+    def _api_retry_delay_seconds(error: str, previous_retries: int,
+                                 current: Optional[datetime] = None) -> int:
+        """Return a bounded cooldown without consuming a development attempt."""
+        now = current or datetime.now(timezone.utc)
+        lowered = str(error or "").casefold()
+        exponent = min(max(0, int(previous_retries)), 4)
+        if "429" in lowered or "rate limit" in lowered or "rate_limit" in lowered:
+            delay = 60 * (2 ** exponent)
+            match = re.search(
+                r"resets at:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*utc",
+                str(error or ""), re.IGNORECASE,
+            )
+            if match:
+                reset_at = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                delay = max(delay, int((reset_at - now).total_seconds()) + 30)
+        elif "504" in lowered or "gateway" in lowered:
+            delay = 120 * (2 ** exponent)
+        else:
+            delay = 180 * (2 ** exponent)
+        return max(60, min(900, delay))
+
+    def _queue_api_retry(self, pair_id: str, arm: Dict[str, Any],
+                         error: str) -> Dict[str, Any]:
+        """Archive a terminal API error and reserve the Pair for a fresh first turn."""
+        arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
+        if arm.get("status") == "waiting_api_retry":
+            return arm
+        previous_retries = int(arm.get("api_retry_count") or 0)
+        delay = self._api_retry_delay_seconds(error, previous_retries)
+        retry_after = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        prepared = self.claude.archive_failed_attempt(
+            arm, error, prepare_retry=True,
+            count_development_failure=False, count_error_retry=False,
+        )
+        stamp = now_iso()
+        self.db.execute(
+            """UPDATE arm_runs SET status='waiting_api_retry',api_retry_count=?,
+               api_retry_after=?,last_api_error=?,error=?,updated_at=? WHERE id=?""",
+            (previous_retries + 1, retry_after.isoformat(timespec="seconds"),
+             redact(error)[-3000:], redact(error)[-2000:], stamp, arm["id"]),
+        )
+        active_other = int((self.db.one(
+            """SELECT COUNT(*) count FROM arm_runs WHERE pair_id=? AND id<>?
+                 AND status IN ('queued','running','developing','waiting_retry','checkpointing','exported')""",
+            (pair_id, arm["id"]),
+        ) or {"count": 0})["count"])
+        if not active_other:
+            self.db.execute(
+                """UPDATE pairs SET status='waiting_api_retry',stage='development',error=?,updated_at=?
+                     WHERE id=? AND stage='development'""",
+                ("Claude API 暂时不可用，已保留现场并等待自动重试", stamp, pair_id),
+            )
+        self.db.audit("claude.api_retry_queued", "arm_run", arm["id"], {
+            "pair_id": pair_id, "retry_number": previous_retries + 1,
+            "retry_after": retry_after.isoformat(timespec="seconds"),
+            "cooldown_seconds": delay, "error": redact(error)[-1000:],
+            "prompt_mode": "fresh_session_same_original_prompt_once",
+            "counts_toward_development_attempts": False,
+            "counts_toward_error_retries": False,
+        })
+        return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or prepared
+
+    def _recover_api_retry(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
+        """Start a clean first-turn session after a transient API cooldown."""
+        arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+        if not arm or arm.get("status") != "waiting_api_retry":
+            return arm
+        blocked = self._abort_development_restart(
+            pair_id, arm_id, "Pair 已进入换题或失败终态，取消 API 自动重试",
+        )
+        if blocked:
+            return blocked
+        retry_at = str(arm.get("api_retry_after") or "")
+        if retry_at and retry_at > now_iso():
+            return arm
+        pair = self._pair(pair_id)
+        retry_number = int(arm.get("api_retry_count") or 1)
+        try:
+            canonical = self.git.reset_arm_to_baseline(pair_id, str(arm["arm"]))
+            self.db.execute(
+                "UPDATE arm_runs SET status='waiting_retry',updated_at=? WHERE id=?",
+                (now_iso(), arm_id),
+            )
+            arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
+            self.claude.launch(arm)
+            arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
+            self.claude.wait_until_ready(arm)
+            self.claude.materialize_repository(arm, canonical, pair["baseline_sha"])
+            arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
+            self._send_prompt_with_pair_stagger(pair_id, arm, prompt)
+            stamp = now_iso()
+            self.db.execute(
+                """UPDATE arm_runs SET api_retry_after=NULL,last_api_error='',error='',updated_at=?
+                     WHERE id=?""",
+                (stamp, arm_id),
+            )
+            self.db.execute(
+                """UPDATE pairs SET status='running',stage='development',error='',updated_at=?
+                     WHERE id=?""",
+                (stamp, pair_id),
+            )
+            self.db.audit("claude.api_retry_started", "arm_run", arm_id, {
+                "pair_id": pair_id, "retry_number": retry_number,
+                "attempt": int(arm.get("attempt_no") or 1),
+                "prompt_mode": "fresh_session_same_original_prompt_once",
+                "counts_toward_development_attempts": False,
+                "counts_toward_error_retries": False,
+            })
+            return self._monitor_arm(pair_id, arm_id, prompt)
+        except Exception as exc:
+            current_arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
+            return self._queue_api_retry(
+                pair_id, current_arm,
+                "API 自动重试启动失败：%s" % redact(str(exc)),
+            )
+
+    @staticmethod
     def _pair_blocks_development_restart(pair: Dict[str, Any]) -> bool:
         return str(pair.get("status") or "") in ("failed", "cancelled") or str(
             pair.get("stage") or ""
@@ -3177,7 +3328,7 @@ class PairwiseService:
         if not self._pair_blocks_development_restart(pair):
             return None
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
-        if arm.get("status") in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
+        if arm.get("status") in ("queued", "running", "developing", "waiting_retry", "waiting_api_retry", "checkpointing"):
             stamp = now_iso()
             self.db.execute(
                 "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
@@ -3288,13 +3439,7 @@ class PairwiseService:
         attempt = max(1, int(arm.get("attempt_no") or 1))
         maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
         if self._is_claude_api_error(error):
-            self.db.audit("claude.api_error_ignored", "arm_run", arm["id"], {
-                "attempt": attempt, "error": redact(error)[-1000:],
-                "action": "continue_same_native_session",
-                "counts_toward_development_attempts": False,
-                "counts_toward_error_retries": False,
-            })
-            return arm
+            return self._queue_api_retry(pair_id, arm, error)
         count_development_failure = True
         count_error_retry = True
         self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
@@ -3466,13 +3611,14 @@ class PairwiseService:
                     "UPDATE arm_runs SET session_id=?,prompt_id=?,updated_at=? WHERE id=?",
                     (state.get("session_id", ""), state.get("prompt_id", ""), now_iso(), arm_id),
                 )
-            # Claude API errors remain in the native trace for audit, but do
-            # not invalidate the session. The monitor keeps waiting for a
-            # normal final response or for an independent failure condition.
+            # A terminal API error is preserved with the native trace, then
+            # handed to the independent cooldown queue below. A trace that
+            # already contains a later normal completion remains deliverable.
             error = str(state.get("monitor_error") or "")
             if state.get("followup_detected"):
                 error = "检测到首轮后的追加消息，当前 Session 作废并从共同基线重跑：%s" % state.get("followup_text", "")
-            if not error and not state.get("complete") and not self.claude.runtime_alive(arm):
+            if (not error and not state.get("complete") and not state.get("api_error")
+                    and not self.claude.runtime_alive(arm)):
                 error = "Claude 容器或终端意外结束，当前 Session 没有形成完整结果"
             if error:
                 self.db.audit("claude.session_invalidated", "arm_run", arm_id, {
@@ -3531,6 +3677,10 @@ class PairwiseService:
                     # scheduler retries only the Git push instead of asking
                     # Claude to redo an already finished implementation.
                     return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
+            if state.get("api_error"):
+                return self._queue_api_retry(
+                    pair_id, arm, str(state.get("api_error") or "Claude API 暂时不可用"),
+                )
             elapsed = time.monotonic() - started
             workspace = Path(arm["workspace_path"])
             has_code = self.claude.has_business_code(
@@ -3541,28 +3691,6 @@ class PairwiseService:
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
             if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 40)) * 60 and not has_code:
-                # A terminal API/gateway error is infrastructure evidence, not
-                # a development failure. Keep the native Session and its trace
-                # intact instead of letting the generic no-code timeout archive
-                # it and consume an attempt.
-                if state.get("api_error"):
-                    already_logged = self.db.one(
-                        """SELECT 1 present FROM audit_events
-                           WHERE event_type='claude.api_error_waiting_same_session'
-                             AND entity_id=? AND created_at>=?
-                           ORDER BY id DESC LIMIT 1""",
-                        (arm_id, str(arm.get("prompt_sent_at") or "")),
-                    )
-                    if not already_logged:
-                        self.db.audit("claude.api_error_waiting_same_session", "arm_run", arm_id, {
-                            "attempt": max(1, int(arm.get("attempt_no") or 1)),
-                            "error": redact(str(state.get("api_error")))[-1000:],
-                            "action": "continue_same_native_session",
-                            "counts_toward_development_attempts": False,
-                            "counts_toward_error_retries": False,
-                        })
-                    time.sleep(5)
-                    continue
                 signature = str(state.get("activity_signature") or "")
                 attempt = max(1, int(arm.get("attempt_no") or 1))
                 previous = self.db.one(
@@ -3695,6 +3823,14 @@ class PairwiseService:
             statuses = {arm["status"] for arm in arms}
             if "failed" in statuses:
                 self.db.execute("UPDATE pairs SET status='failed',stage='development_failed',error='A/B 至少一侧开发失败',updated_at=? WHERE id=?", (now_iso(), pair_id))
+                return
+            if "waiting_api_retry" in statuses and statuses <= {"completed", "waiting_api_retry"}:
+                self.db.execute(
+                    """UPDATE pairs SET status='waiting_api_retry',stage='development',
+                       error='Claude API 暂时不可用，已保留现场并等待自动重试',updated_at=?
+                       WHERE id=?""",
+                    (now_iso(), pair_id),
+                )
                 return
             pair = self._pair(pair_id)
             task = self.db.one("SELECT prompt FROM tasks WHERE id=?", (pair["task_id"],)) or {}

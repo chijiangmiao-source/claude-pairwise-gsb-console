@@ -35,7 +35,9 @@ def dashboard(db: Database) -> Dict[str, Any]:
         recent.append({"hour": key, "label": point.strftime("%H"), "count": recent_counts.get(key, 0)})
     total = db.one("SELECT COUNT(*) count FROM pairs") or {"count": 0}
     completed_total = db.one("SELECT COUNT(*) count FROM pairs WHERE status='completed'") or {"count": 0}
-    active = db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')") or {"count": 0}
+    active = db.one(
+        "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review','waiting_api_retry')"
+    ) or {"count": 0}
     confirmed = db.one("SELECT COUNT(*) count FROM gsb_reviews WHERE status='confirmed'") or {"count": 0}
     peak = max(recent, key=lambda x: x["count"], default={"hour": "", "count": 0})
     active_hours = sum(1 for row in recent if row["count"])

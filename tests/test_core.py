@@ -2621,11 +2621,10 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(event["event_type"], "claude.api_error_recovered")
 
-    def test_no_code_timeout_does_not_restart_or_count_an_api_error_session(self):
+    def test_terminal_api_error_is_queued_without_counting_a_development_failure(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
-        self.db.set_setting("first_prompt_stop_minutes", 0)
         self.db.execute(
             "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
         )
@@ -2644,27 +2643,30 @@ class CoreTests(unittest.TestCase):
             "activity_signature": "api-error-signature", "activity_summary": ["API Error: 504"],
         }
 
-        def stop_after_wait(_seconds):
-            self.db.execute(
-                "UPDATE arm_runs SET status='failed' WHERE id='arm-api-error-wait'",
-            )
-
         with patch.object(self.service.claude, "trace_state", return_value=state), \
              patch.object(self.service.claude, "runtime_alive", return_value=True), \
              patch.object(self.service.claude, "has_business_code", return_value=False), \
-             patch.object(self.service, "_handle_attempt_failure") as failure, \
-             patch("pairwise_console.service.time.sleep", side_effect=stop_after_wait):
+             patch.object(self.service, "_handle_attempt_failure") as failure:
             self.service._monitor_arm(
                 pair["id"], "arm-api-error-wait", "Build a hard project with Docker Compose",
             )
         failure.assert_not_called()
-        arm = self.db.one("SELECT attempt_no,error_retry_count FROM arm_runs WHERE id='arm-api-error-wait'")
-        self.assertEqual(arm, {"attempt_no": 2, "error_retry_count": 1})
+        arm = self.db.one(
+            """SELECT status,attempt_no,error_retry_count,api_retry_count,api_retry_after
+                 FROM arm_runs WHERE id='arm-api-error-wait'"""
+        )
+        self.assertEqual(arm["status"], "waiting_api_retry")
+        self.assertEqual(arm["attempt_no"], 2)
+        self.assertEqual(arm["error_retry_count"], 1)
+        self.assertEqual(arm["api_retry_count"], 1)
+        self.assertTrue(arm["api_retry_after"])
+        self.assertEqual(self.db.one("SELECT status FROM pairs WHERE id=?", (pair["id"],))["status"],
+                         "waiting_api_retry")
         event = self.db.one(
             """SELECT event_type,detail_json FROM audit_events
                WHERE entity_id='arm-api-error-wait' ORDER BY id DESC LIMIT 1"""
         )
-        self.assertEqual(event["event_type"], "claude.api_error_waiting_same_session")
+        self.assertEqual(event["event_type"], "claude.api_retry_queued")
         detail = json.loads(event["detail_json"])
         self.assertFalse(detail["counts_toward_development_attempts"])
         self.assertFalse(detail["counts_toward_error_retries"])
@@ -2841,7 +2843,7 @@ class CoreTests(unittest.TestCase):
             pair["id"], arm["id"], "container exited", "开发连续 3 次失败",
         )
 
-    def test_api_errors_never_restart_or_consume_a_development_attempt(self):
+    def test_api_errors_use_the_separate_retry_queue(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
@@ -2853,27 +2855,75 @@ class CoreTests(unittest.TestCase):
         )
         for error in errors:
             with self.subTest(error=error), \
-                 patch.object(self.service, "_restart_arm_from_baseline",
-                              return_value={**arm, "status": "developing"}) as restart, \
+                 patch.object(self.service, "_queue_api_retry",
+                              return_value={**arm, "status": "waiting_api_retry"}) as queue, \
                  patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
                 result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", error)
             self.assertEqual(result["id"], arm["id"])
-            restart.assert_not_called()
+            queue.assert_called_once_with(pair["id"], arm, error)
             replace.assert_not_called()
 
-    def test_third_504_still_keeps_the_same_pair_and_session(self):
+    def test_third_504_still_does_not_retire_the_pair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
         arm = {"id": "arm-third-504", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
         error = "API Error: 504 Gateway Timeout"
-        with patch.object(self.service.claude, "archive_failed_attempt",
-                          return_value={**arm, "status": "failed"}) as archive, \
+        with patch.object(self.service, "_queue_api_retry",
+                          return_value={**arm, "status": "waiting_api_retry"}) as queue, \
              patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
             result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", error)
         self.assertEqual(result["id"], arm["id"])
-        archive.assert_not_called()
+        queue.assert_called_once_with(pair["id"], arm, error)
         replace.assert_not_called()
+
+    def test_api_retry_cooldown_uses_provider_reset_and_bounded_backoff(self):
+        current = datetime(2026, 9, 18, 19, 0, 0, tzinfo=timezone.utc)
+        error = "API Error: 429 Rate limit. Limit resets at: 2026-09-18 19:00:20 UTC"
+        self.assertEqual(self.service._api_retry_delay_seconds(error, 0, current), 60)
+        self.assertEqual(self.service._api_retry_delay_seconds(error, 2, current), 240)
+        self.assertEqual(
+            self.service._api_retry_delay_seconds("API Error: 504 Gateway Timeout", 0, current), 120,
+        )
+        self.assertEqual(
+            self.service._api_retry_delay_seconds("API Error: 504 Gateway Timeout", 4, current), 900,
+        )
+
+    def test_waiting_api_pair_reserves_capacity_and_due_retry_is_prioritized(self):
+        self.db.set_setting("max_pairs_parallel", 1)
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='waiting_api_retry',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,api_retry_count,api_retry_after,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'waiting_api_retry',NULL,1,?,?,?)""",
+            ("arm-api-due", pair["id"], "A", "A", str(self.root / "api-due"),
+             "container-api-due", "screen-api-due", "auto_model/urm", "image",
+             "2000-01-01T00:00:00+00:00", stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,difficulty_evidence_json,
+               fingerprint,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            ("task-spare", "test", "zero_to_one", "spare hard task", "Build another hard project",
+             "困难", '["跨模块状态"]', "spare-fingerprint", "ready", stamp, stamp),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_monitor",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ), patch.object(self.service, "_submit_auto", return_value=True), \
+             patch.object(self.service, "_schedule_refill_once") as refill:
+            status = self.service._schedule_auto_pipeline_once()
+        self.assertIn("api-retry-arm-api-due", submitted)
+        self.assertEqual(status["activePairs"], 1)
+        self.assertEqual(status["waitingApiArms"], 1)
+        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 1)
+        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-spare'")["status"], "ready")
+        refill.assert_not_called()
 
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()

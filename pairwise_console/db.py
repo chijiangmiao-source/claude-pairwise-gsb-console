@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def now_iso() -> str:
@@ -70,6 +70,9 @@ class Database:
                 ("warning_at", "TEXT"),
                 ("attempt_no", "INTEGER NOT NULL DEFAULT 1"),
                 ("error_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("api_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("api_retry_after", "TEXT"),
+                ("last_api_error", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in columns:
                     c.execute("ALTER TABLE arm_runs ADD COLUMN %s %s" % (name, definition))
@@ -377,6 +380,9 @@ CREATE TABLE IF NOT EXISTS arm_runs (
   warning_at TEXT,
   attempt_no INTEGER NOT NULL DEFAULT 1,
   error_retry_count INTEGER NOT NULL DEFAULT 0,
+  api_retry_count INTEGER NOT NULL DEFAULT 0,
+  api_retry_after TEXT,
+  last_api_error TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
