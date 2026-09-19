@@ -86,7 +86,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("codex_default_effort"), "medium")
         self.assertEqual(self.db.setting("codex_bug_effort"), "high")
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
-        self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 60)
+        self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 75)
         self.assertEqual(self.db.setting("development_max_attempts"), 2)
         self.assertTrue(self.db.setting("task_generation_zero_to_one_only"))
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)

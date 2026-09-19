@@ -159,7 +159,7 @@ class PairwiseService:
             "github_visibility": self.config.github_visibility,
             "repository_prefix": self.config.repository_prefix,
             "first_prompt_warning_minutes": 15,
-            "first_prompt_stop_minutes": 60,
+            "first_prompt_stop_minutes": 75,
             "development_max_attempts": 2,
             "terminal_idle_seconds": 120,
             "claude_api_auto_retry_enabled": True,
@@ -178,8 +178,8 @@ class PairwiseService:
             "('task_mix_zero_to_one','task_mix_feature','task_mix_bugfix','task_mix_started_at')"
         )
         # Upgrade prior shipped workflow values to the current operating rule.
-        if int(self.db.setting("first_prompt_stop_minutes", 60)) in (25, 40):
-            self.db.set_setting("first_prompt_stop_minutes", 60)
+        if int(self.db.setting("first_prompt_stop_minutes", 75)) in (25, 40, 60):
+            self.db.set_setting("first_prompt_stop_minutes", 75)
         if int(self.db.setting("development_max_attempts", 2)) == 3:
             self.db.set_setting("development_max_attempts", 2)
         if (str(self.db.setting("claude_image", self.config.claude_image))
@@ -3918,7 +3918,7 @@ class PairwiseService:
         if peer.get("status") in active_statuses:
             stamp = now_iso()
             message = (
-                "%s；失败侧已停止，%s 侧继续运行，并按自身题面发送时间执行 60 分钟无业务代码规则"
+                "%s；失败侧已停止，%s 侧继续运行，并按自身题面发送时间执行 75 分钟无业务代码规则"
                 % (retire_label, peer.get("arm") or "另一")
             )
             self.db.execute(
@@ -3931,7 +3931,7 @@ class PairwiseService:
                 "continuing_arm_id": peer.get("id") or "",
                 "continuing_arm": peer.get("arm") or "",
                 "continuing_status": peer.get("status") or "",
-                "no_code_timeout_minutes": int(self.db.setting("first_prompt_stop_minutes", 60)),
+                "no_code_timeout_minutes": int(self.db.setting("first_prompt_stop_minutes", 75)),
                 "retire_label": retire_label,
                 "reason": redact(error)[-1000:],
             })
@@ -4196,7 +4196,7 @@ class PairwiseService:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
-            if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 60)) * 60 and not has_code:
+            if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 75)) * 60 and not has_code:
                 signature = str(state.get("activity_signature") or "")
                 attempt = max(1, int(arm.get("attempt_no") or 1))
                 previous = self.db.one(
