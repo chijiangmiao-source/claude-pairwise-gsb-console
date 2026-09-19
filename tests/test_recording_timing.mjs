@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { automaticFinishDelayMs, finalizeInteractionEvidence, isSafeFeatureControl } from "../scripts/recording_timing.mjs";
+import {
+  automaticFinishDelayMs, finalizeInteractionEvidence, humanClickPauseMs, isSafeFeatureControl,
+} from "../scripts/recording_timing.mjs";
 
 test("automatic recordings finish as soon as the real workflow completes", () => {
   assert.equal(automaticFinishDelayMs("recording", 9000, 88), 0);
@@ -13,6 +15,15 @@ test("feature traversal skips destructive controls", () => {
   assert.equal(isSafeFeatureControl("结果详情"), true);
   assert.equal(isSafeFeatureControl("删除记录"), false);
   assert.equal(isSafeFeatureControl("Clear all"), false);
+});
+
+test("automatic clicks use varied human-paced pauses", () => {
+  const before = Array.from({ length: 8 }, (_, index) => humanClickPauseMs(index, "before"));
+  const after = Array.from({ length: 8 }, (_, index) => humanClickPauseMs(index, "after"));
+  assert.ok(before.every((value) => value >= 560 && value < 980));
+  assert.ok(after.every((value) => value >= 820 && value < 1340));
+  assert.ok(new Set(before).size > 4);
+  assert.ok(new Set(after).size > 4);
 });
 
 test("manual recording is saved for human review without automatic request detection", () => {

@@ -5,6 +5,12 @@ export function automaticFinishDelayMs() {
   return 0;
 }
 
+export function humanClickPauseMs(sequence, phase = "before") {
+  const index = Math.max(0, Number(sequence) || 0);
+  if (phase === "after") return 820 + ((index * 211 + 97) % 520);
+  return 560 + ((index * 173 + 61) % 420);
+}
+
 export function isSafeFeatureControl(label) {
   const text = String(label || "").replace(/\s+/g, " ").trim();
   if (!text) return false;

@@ -3,7 +3,9 @@ import ffmpegPath from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { automaticFinishDelayMs, finalizeInteractionEvidence, isSafeFeatureControl } from "./recording_timing.mjs";
+import {
+  automaticFinishDelayMs, finalizeInteractionEvidence, humanClickPauseMs, isSafeFeatureControl,
+} from "./recording_timing.mjs";
 import { rankOpenApiOperations, sampleValue } from "./recording_openapi.mjs";
 
 const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`, interactionMode = "auto"] = process.argv.slice(2);
@@ -20,6 +22,7 @@ let demonstrationPromise = Promise.resolve({ required: false, ok: true });
 let monitorRequests = false;
 const successfulRequests = [];
 const recordingStartedAt = Date.now();
+let clickSequence = 0;
 
 async function saveVideo(sourcePath, targetPath) {
   if (!targetPath.toLowerCase().endsWith(".mp4")) {
@@ -53,9 +56,14 @@ async function moveAndClick(page, locator) {
   await locator.scrollIntoViewIfNeeded();
   const box = await locator.boundingBox();
   if (!box) throw new Error("目标控件不可见");
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 24 });
-  await page.waitForTimeout(320);
+  const sequence = clickSequence;
+  clickSequence += 1;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, {
+    steps: 26 + (sequence % 9),
+  });
+  await page.waitForTimeout(humanClickPauseMs(sequence, "before"));
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForTimeout(humanClickPauseMs(sequence, "after"));
 }
 
 async function selectSwaggerOperations(page) {
@@ -99,7 +107,7 @@ async function demonstrateSwaggerWorkflow(page) {
       const block = await findSwaggerBlock(page, selected);
       if (!(await block.getAttribute("class") || "").includes("is-open")) {
         await moveAndClick(page, block.locator(".opblock-summary").first());
-        await page.waitForTimeout(180);
+        await page.waitForTimeout(240);
       }
       expanded.push(`${selected.method.toUpperCase()} ${selected.path}`);
     } catch {}
@@ -113,7 +121,7 @@ async function demonstrateSwaggerWorkflow(page) {
       results.push({ required: true, ok: false, method: selected.method, path: selected.path,
         error: error?.message || String(error) });
     }
-    await page.waitForTimeout(450);
+    await page.waitForTimeout(320);
   }
   const successful = results.filter((result) => result.ok);
   return {
@@ -399,7 +407,7 @@ async function demonstrateGenericWorkflow(page) {
         seen.add(targetLabel.toLowerCase());
         clicked.push(targetLabel);
         added += 1;
-        await page.waitForTimeout(650);
+        await page.waitForTimeout(280);
         await prepareGenericInputs(page);
       } catch {
         seen.add(targetLabel.toLowerCase());
