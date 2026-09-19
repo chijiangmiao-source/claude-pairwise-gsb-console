@@ -1,8 +1,8 @@
 export function automaticFinishDelayMs() {
   // Every workflow already waits briefly after each real action so the result
-  // is visible in the recording. Do not pad a completed demonstration to an
-  // arbitrary target duration.
-  return 0;
+  // is visible in the recording. Keep one final second for the completed
+  // result, without padding to an arbitrary target duration.
+  return 1000;
 }
 
 export function humanClickPauseMs(sequence, phase = "before") {

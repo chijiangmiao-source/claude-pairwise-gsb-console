@@ -503,6 +503,7 @@ async function finishAfterAutomaticWorkflow(page) {
     workflowSeconds: Math.round(elapsedMs / 100) / 10,
     plannedSeconds: Math.round((elapsedMs + delayMs) / 100) / 10,
   })}\n`);
+  if (delayMs > 0) await page.waitForTimeout(delayMs);
   await finish("automatic_workflow_complete");
 }
 
