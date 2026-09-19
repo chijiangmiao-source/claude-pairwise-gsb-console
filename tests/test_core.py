@@ -2032,6 +2032,16 @@ class CoreTests(unittest.TestCase):
             port = RecordingManager._published_port(["docker", "compose"], self.root, {})
         self.assertEqual(port, 51002)
 
+    def test_recording_prefers_api_published_port_over_database(self):
+        compose_ps = json.dumps([
+            {"Service": "db", "Publishers": [{"PublishedPort": 52001}]},
+            {"Service": "api1", "Publishers": [{"PublishedPort": 52002}]},
+            {"Service": "api2", "Publishers": [{"PublishedPort": 52003}]},
+        ])
+        with patch("pairwise_console.recording.run_command", return_value=MagicMock(stdout=compose_ps)):
+            port = RecordingManager._published_port(["docker", "compose"], self.root, {})
+        self.assertEqual(port, 52002)
+
     def test_artifact_failure_pair_reopens_for_commit_based_repair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

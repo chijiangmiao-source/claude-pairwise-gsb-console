@@ -58,6 +58,18 @@ export function sampleValue(inputSchema, spec, depth = 0, fieldName = "") {
     if (properties.L && properties.n && properties.distances) {
       return { L: 10, n: 5, distances: [2, 4, 7, 10, 2, 5, 8, 3, 6, 3] };
     }
+    if (properties.idempotency_key && properties.topology) {
+      return {
+        idempotency_key: "recording-plan-1",
+        topology: {
+          switches: [
+            { id: "s1", old_next: "s2", new_next: "DELIVER" },
+            { id: "s2", old_next: "DELIVER", new_next: "DELIVER" },
+          ],
+          ingresses: ["s1"],
+        },
+      };
+    }
     const required = new Set(schema.required || []);
     return Object.fromEntries(Object.entries(properties)
       .filter(([key, value]) => required.has(key)

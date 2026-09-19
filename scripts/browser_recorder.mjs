@@ -61,6 +61,26 @@ function fallbackBodyForPath(path) {
       candidates: [{ a: "e0", b: "e1", cost: 3 }],
     };
   }
+  if (path === "/api/plans") {
+    return {
+      switches: ["s1", "s2"], ingresses: ["s1"],
+      old_next: { s1: "s2", s2: "DELIVER" },
+      new_next: { s1: "DELIVER", s2: "DELIVER" },
+      idempotency_key: `recording-plan-${Date.now()}`,
+    };
+  }
+  if (path === "/plans") {
+    return {
+      idempotency_key: `recording-plan-${Date.now()}`,
+      topology: {
+        switches: [
+          { id: "s1", old_next: "s2", new_next: "DELIVER" },
+          { id: "s2", old_next: "DELIVER", new_next: "DELIVER" },
+        ],
+        ingresses: ["s1"],
+      },
+    };
+  }
   if (/align/i.test(path)) {
     return { planned: [{ code: "A", at_ms: 0 }], actual: [{ code: "A", at_ms: 0 }] };
   }
@@ -75,10 +95,25 @@ async function demonstrateBareJsonApiWorkflow(page) {
     const raw = document.body?.innerText || "";
     try { return JSON.parse(raw); } catch { return null; }
   });
-  if (!rootPayload || typeof rootPayload !== "object" || !rootPayload.endpoints) {
-    return { required: false, ok: true };
+  if (!rootPayload || typeof rootPayload !== "object") return { required: false, ok: true };
+  let declarations = rootPayload.endpoints && typeof rootPayload.endpoints === "object"
+    ? Object.entries(rootPayload.endpoints)
+    : [];
+  if (!declarations.length && /health/i.test(new URL(page.url()).pathname)) {
+    declarations = [["health", `GET ${new URL(page.url()).pathname}`]];
+    const discovered = await page.evaluate(async (paths) => {
+      const found = [];
+      for (const path of paths) {
+        try {
+          const response = await fetch(path, { method: "OPTIONS" });
+          if (response.status !== 404 && response.status < 500) found.push(path);
+        } catch {}
+      }
+      return found;
+    }, ["/api/plans", "/plans"]);
+    if (discovered[0]) declarations.push(["创建迁移计划", `POST ${discovered[0]}`]);
   }
-  const operations = Object.entries(rootPayload.endpoints).map(([name, declaration]) => {
+  const operations = declarations.map(([name, declaration]) => {
     const text = String(declaration || "").trim();
     const match = text.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\/\S*)$/i);
     const path = match ? match[2] : (text.startsWith("/") ? text : "");
@@ -225,7 +260,7 @@ async function demonstrateSwaggerWorkflow(page) {
   await page.waitForTimeout(900);
   const candidates = await selectSwaggerOperations(page);
   const expanded = [];
-  for (const selected of candidates.slice(0, 12)) {
+  for (const selected of candidates.slice(0, 6)) {
     try {
       const block = await findSwaggerBlock(page, selected);
       if (!(await block.getAttribute("class") || "").includes("is-open")) {
@@ -236,7 +271,7 @@ async function demonstrateSwaggerWorkflow(page) {
     } catch {}
   }
   const results = [];
-  const executable = candidates.filter((selected) => !selected.hasPathParameters).slice(0, 6);
+  const executable = candidates.filter((selected) => !selected.hasPathParameters).slice(0, 3);
   for (const selected of (executable.length ? executable : candidates.slice(0, 1))) {
     try {
       results.push(await demonstrateSwaggerOperation(page, selected));
@@ -740,7 +775,11 @@ try {
   if (interactionMode === "auto") {
     void finishAfterAutomaticWorkflow(page);
   }
-  setTimeout(() => finish("maximum_duration"), maximum * 1000);
+  // Reserve time for the final evidence check, browser close, and MP4
+  // conversion so the saved file remains below the 90-second delivery limit.
+  const elapsedBeforeDeadline = Date.now() - recordingStartedAt;
+  const deadlineDelay = Math.max(1000, maximum * 1000 - elapsedBeforeDeadline - 8000);
+  setTimeout(() => finish("maximum_duration"), deadlineDelay);
   setInterval(() => { if (existsSync(stopFile)) finish("manual_stop"); }, 250);
   process.on("SIGINT", () => finish("manual_stop"));
   process.on("SIGTERM", () => finish("terminated"));

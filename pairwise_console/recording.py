@@ -415,8 +415,16 @@ pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-b
             for line in result.stdout.splitlines():
                 try: rows.append(json.loads(line))
                 except ValueError: pass
-        preferred = {"web": 0, "frontend": 1, "ui": 2, "client": 3}
-        rows.sort(key=lambda row: preferred.get(str(row.get("Service") or "").casefold(), 100))
+        preferred = {"web": 0, "frontend": 1, "ui": 2, "client": 3,
+                     "api": 4, "app": 5, "server": 6, "backend": 7}
+        def service_priority(row):
+            name = str(row.get("Service") or "").casefold()
+            if name in preferred:
+                return preferred[name]
+            if name.startswith("api"):
+                return preferred["api"]
+            return 100
+        rows.sort(key=service_priority)
         for row in rows:
             for item in row.get("Publishers") or []:
                 value = int(item.get("PublishedPort") or 0)
@@ -449,7 +457,7 @@ pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-b
                 last = str(exc)
             except (URLError, OSError) as exc:
                 last = str(exc)
-            for path in ("/", "/index.html"):
+            for path in ("/", "/index.html", "/health", "/healthz", "/api/health"):
                 url = "http://127.0.0.1:%d%s" % (port, path)
                 try:
                     response = urlopen(Request(url, headers={"User-Agent": "PairwiseRecorder/1.0"}), timeout=3)

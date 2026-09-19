@@ -40,6 +40,24 @@ test("uses a stable future date for expiring resources", () => {
     "2099-01-01T00:00:00Z");
 });
 
+test("builds a safe switch migration plan instead of unrelated placeholder ids", () => {
+  const spec = {
+    components: { schemas: {
+      PlanCreateIn: {
+        type: "object", required: ["idempotency_key", "topology"],
+        properties: {
+          idempotency_key: { type: "string" },
+          topology: { type: "object" },
+        },
+      },
+    } },
+  };
+  const sample = sampleValue({ $ref: "#/components/schemas/PlanCreateIn" }, spec);
+  assert.equal(sample.topology.ingresses[0], "s1");
+  assert.deepEqual(sample.topology.switches.map((item) => item.id), ["s1", "s2"]);
+  assert.equal(sample.topology.switches[0].new_next, "DELIVER");
+});
+
 test("prefers a root create operation without unresolved identifier dependencies", () => {
   const spec = {
     paths: {
