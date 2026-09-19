@@ -2963,6 +2963,38 @@ class CoreTests(unittest.TestCase):
             self.db.one("SELECT status FROM pairs WHERE id=?", (pair["id"],))["status"], "running",
         )
 
+    def test_disabled_api_auto_retry_keeps_waiting_arm_queued(self):
+        self.db.set_setting("max_pairs_parallel", 1)
+        self.db.set_setting("claude_api_auto_retry_enabled", False)
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='waiting_api_retry',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,api_retry_count,api_retry_after,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'waiting_api_retry',NULL,1,?,?,?)""",
+            ("arm-api-disabled", pair["id"], "A", "A", str(self.root / "api-disabled"),
+             "container-api-disabled", "screen-api-disabled", "auto_model/urm", "image",
+             "2000-01-01T00:00:00+00:00", stamp, stamp),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_monitor",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ), patch.object(self.service, "_submit_auto", return_value=True), \
+             patch.object(self.service, "_schedule_refill_once"):
+            status = self.service._schedule_auto_pipeline_once()
+        self.assertEqual(submitted, [])
+        self.assertFalse(status["apiAutoRetryEnabled"])
+        self.assertEqual(status["waitingApiArms"], 1)
+        self.assertEqual(
+            self.db.one("SELECT status FROM pairs WHERE id=?", (pair["id"],))["status"],
+            "waiting_api_retry",
+        )
+
     def test_global_429_cooldown_blocks_retries_and_new_pairs(self):
         self.db.set_setting("max_pairs_parallel", 1)
         self.insert_ready_task()

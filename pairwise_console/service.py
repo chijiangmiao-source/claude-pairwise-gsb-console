@@ -152,6 +152,7 @@ class PairwiseService:
             "first_prompt_stop_minutes": 40,
             "development_max_attempts": 3,
             "terminal_idle_seconds": 120,
+            "claude_api_auto_retry_enabled": True,
             "claude_api_cooldown_until": "",
             "claude_api_probe_after": "",
             "claude_pair_start_after": "",
@@ -512,6 +513,9 @@ class PairwiseService:
             "activePairs": active,
             "waitingApiPairs": waiting_api_pairs,
             "waitingApiArms": waiting_api_arms,
+            "apiAutoRetryEnabled": bool(
+                self.db.setting("claude_api_auto_retry_enabled", True)
+            ),
             "apiCooldownUntil": (
                 str(self.db.setting("claude_api_cooldown_until", "") or "")
                 if self._api_cooldown_active() else ""
@@ -678,7 +682,9 @@ class PairwiseService:
                        AND p.status IN ('running','review','waiting_api_retry')"""
             ) or {"count": 0})["count"])
             if waiting_api_arms:
-                if not self._api_cooldown_active() and not self._api_probe_blocked():
+                if (bool(self.db.setting("claude_api_auto_retry_enabled", True))
+                        and not self._api_cooldown_active()
+                        and not self._api_probe_blocked()):
                     active_count += self._schedule_due_api_retries(
                         max(0, pair_limit - active_count),
                     )
