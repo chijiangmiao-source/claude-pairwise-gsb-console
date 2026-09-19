@@ -675,12 +675,13 @@ class PairwiseService:
             waiting_api_arms = int((self.db.one(
                 """SELECT COUNT(*) count FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
                      WHERE a.status='waiting_api_retry' AND p.stage='development'
-                       AND p.status IN ('running','waiting_api_retry')"""
+                       AND p.status IN ('running','review','waiting_api_retry')"""
             ) or {"count": 0})["count"])
             if waiting_api_arms:
-                if (not self._api_cooldown_active() and not self._api_probe_blocked()
-                        and active_count < pair_limit):
-                    active_count += self._schedule_due_api_retries(1)
+                if not self._api_cooldown_active() and not self._api_probe_blocked():
+                    active_count += self._schedule_due_api_retries(
+                        max(0, pair_limit - active_count),
+                    )
                 return self.automation_status()
             if self._api_cooldown_active():
                 return self.automation_status()
@@ -753,17 +754,18 @@ class PairwiseService:
                 return
 
     def _schedule_due_api_retries(self, available_slots: int) -> int:
-        """Resume cooled-down API failures only in otherwise unused Pair slots."""
-        if available_slots <= 0:
-            return 0
+        """Resume one cooled-down Arm without charging an already-active Pair twice."""
         due = self.db.all(
-            """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
+            """SELECT a.id arm_id,a.pair_id,p.status pair_status,t.prompt FROM arm_runs a
                  JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
                 WHERE a.status='waiting_api_retry' AND a.prompt_sent_at IS NULL
                   AND p.stage='development'
+                  AND (p.status IN ('running','review')
+                       OR (? > 0 AND p.status='waiting_api_retry'))
                   AND (a.api_retry_after IS NULL OR a.api_retry_after<=?)
-                ORDER BY COALESCE(a.api_retry_after,a.updated_at),a.updated_at,a.id""",
-            (now_iso(),),
+                ORDER BY CASE WHEN p.status IN ('running','review') THEN 0 ELSE 1 END,
+                         COALESCE(a.api_retry_after,a.updated_at),a.updated_at,a.id""",
+            (available_slots, now_iso()),
         )
         if not due:
             return 0
@@ -786,7 +788,7 @@ class PairwiseService:
             "claude_api_probe_after",
             (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="seconds"),
         )
-        return 1
+        return 1 if row["pair_status"] == "waiting_api_retry" else 0
 
     def _schedule_active_arm_monitors(self, pair_id: str) -> None:
         """Reconnect monitors to live Claude sessions after a service restart."""

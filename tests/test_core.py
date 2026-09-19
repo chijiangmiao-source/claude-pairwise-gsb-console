@@ -2926,6 +2926,43 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-spare'")["status"], "ready")
         refill.assert_not_called()
 
+    def test_waiting_arm_of_active_pair_resumes_when_pair_limit_is_full(self):
+        self.db.set_setting("max_pairs_parallel", 1)
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,api_retry_count,api_retry_after,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,0,NULL,?,?)""",
+            ("arm-active-a", pair["id"], "A", "A", str(self.root / "active-a"),
+             "container-active-a", "screen-active-a", "auto_model/urm", "image", stamp, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,api_retry_count,api_retry_after,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'waiting_api_retry',NULL,1,?,?,?)""",
+            ("arm-active-b", pair["id"], "B", "B", str(self.root / "active-b"),
+             "container-active-b", "screen-active-b", "auto_model/urm", "image",
+             "2000-01-01T00:00:00+00:00", stamp, stamp),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_monitor",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ), patch.object(self.service, "_submit_auto", return_value=True), \
+             patch.object(self.service, "_schedule_refill_once"):
+            status = self.service._schedule_auto_pipeline_once()
+        self.assertIn("monitor-arm-active-a", submitted)
+        self.assertIn("api-retry-arm-active-b", submitted)
+        self.assertEqual(status["activePairs"], 1)
+        self.assertEqual(
+            self.db.one("SELECT status FROM pairs WHERE id=?", (pair["id"],))["status"], "running",
+        )
+
     def test_global_429_cooldown_blocks_retries_and_new_pairs(self):
         self.db.set_setting("max_pairs_parallel", 1)
         self.insert_ready_task()
