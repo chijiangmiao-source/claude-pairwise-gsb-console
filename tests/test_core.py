@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2880,8 +2880,8 @@ class CoreTests(unittest.TestCase):
     def test_api_retry_cooldown_uses_provider_reset_and_bounded_backoff(self):
         current = datetime(2026, 9, 18, 19, 0, 0, tzinfo=timezone.utc)
         error = "API Error: 429 Rate limit. Limit resets at: 2026-09-18 19:00:20 UTC"
-        self.assertEqual(self.service._api_retry_delay_seconds(error, 0, current), 60)
-        self.assertEqual(self.service._api_retry_delay_seconds(error, 2, current), 240)
+        self.assertEqual(self.service._api_retry_delay_seconds(error, 0, current), 20)
+        self.assertEqual(self.service._api_retry_delay_seconds(error, 2, current), 20)
         self.assertEqual(
             self.service._api_retry_delay_seconds("API Error: 504 Gateway Timeout", 0, current), 120,
         )
@@ -2889,7 +2889,7 @@ class CoreTests(unittest.TestCase):
             self.service._api_retry_delay_seconds("API Error: 504 Gateway Timeout", 4, current), 900,
         )
 
-    def test_waiting_api_pair_releases_capacity_and_ready_task_is_prioritized(self):
+    def test_waiting_api_pair_is_retried_before_consuming_a_ready_task(self):
         self.db.set_setting("max_pairs_parallel", 1)
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
@@ -2918,12 +2918,45 @@ class CoreTests(unittest.TestCase):
         ), patch.object(self.service, "_submit_auto", return_value=True), \
              patch.object(self.service, "_schedule_refill_once") as refill:
             status = self.service._schedule_auto_pipeline_once()
-        self.assertNotIn("api-retry-arm-api-due", submitted)
+        self.assertIn("api-retry-arm-api-due", submitted)
         self.assertEqual(status["activePairs"], 1)
-        self.assertEqual(status["waitingApiPairs"], 1)
+        self.assertEqual(status["waitingApiPairs"], 0)
         self.assertEqual(status["waitingApiArms"], 1)
-        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 2)
-        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-spare'")["status"], "used")
+        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 1)
+        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-spare'")["status"], "ready")
+        refill.assert_not_called()
+
+    def test_global_429_cooldown_blocks_retries_and_new_pairs(self):
+        self.db.set_setting("max_pairs_parallel", 1)
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='waiting_api_retry',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,api_retry_count,api_retry_after,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'waiting_api_retry',NULL,1,?,?,?)""",
+            ("arm-api-cooling", pair["id"], "A", "A", str(self.root / "api-cooling"),
+             "container-api-cooling", "screen-api-cooling", "auto_model/urm", "image",
+             "2000-01-01T00:00:00+00:00", stamp, stamp),
+        )
+        self.db.set_setting(
+            "claude_api_cooldown_until",
+            (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec="seconds"),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_monitor",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ), patch.object(self.service, "_submit_auto", return_value=True), \
+             patch.object(self.service, "_schedule_refill_once") as refill:
+            status = self.service._schedule_auto_pipeline_once()
+        self.assertEqual(submitted, [])
+        self.assertEqual(status["activePairs"], 0)
+        self.assertEqual(status["waitingApiPairs"], 1)
+        self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 1)
         refill.assert_not_called()
 
     def test_due_api_pair_resumes_when_no_ready_work_uses_the_free_slot(self):

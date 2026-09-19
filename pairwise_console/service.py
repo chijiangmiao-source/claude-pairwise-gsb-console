@@ -152,6 +152,9 @@ class PairwiseService:
             "first_prompt_stop_minutes": 40,
             "development_max_attempts": 3,
             "terminal_idle_seconds": 120,
+            "claude_api_cooldown_until": "",
+            "claude_api_probe_after": "",
+            "claude_pair_start_after": "",
             "recording_width": 1280,
             "recording_height": 720,
             "recording_max_seconds": 90,
@@ -507,11 +510,50 @@ class PairwiseService:
             "activePairs": active,
             "waitingApiPairs": waiting_api_pairs,
             "waitingApiArms": waiting_api_arms,
+            "apiCooldownUntil": str(self.db.setting("claude_api_cooldown_until", "") or ""),
             "readyTasks": ready,
             "generatingBatches": generating,
             "stages": stages,
             "taskSelectionMode": "available_first",
         }
+
+    @staticmethod
+    def _future_iso(value: Any) -> bool:
+        text = str(value or "")
+        return bool(text and text > now_iso())
+
+    def _api_cooldown_active(self) -> bool:
+        return self._future_iso(self.db.setting("claude_api_cooldown_until", ""))
+
+    def _api_probe_blocked(self) -> bool:
+        return self._future_iso(self.db.setting("claude_api_probe_after", ""))
+
+    def _pair_start_blocked(self) -> bool:
+        return self._future_iso(self.db.setting("claude_pair_start_after", ""))
+
+    def _register_global_rate_limit(self, error: str, retry_after: datetime) -> None:
+        """Open a shared breaker so replacing a Pair cannot bypass a 429."""
+        lowered = str(error or "").casefold()
+        if "429" not in lowered and "max_parallel_requests" not in lowered:
+            return
+        match = re.search(
+            r"resets at:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*utc",
+            str(error or ""), re.IGNORECASE,
+        )
+        cooldown = (
+            datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            if match else retry_after
+        )
+        cooldown_text = cooldown.isoformat(timespec="seconds")
+        current = str(self.db.setting("claude_api_cooldown_until", "") or "")
+        if cooldown_text > current:
+            self.db.set_setting("claude_api_cooldown_until", cooldown_text)
+        self.db.audit("claude.api_global_cooldown_started", "scheduler", "claude-api", {
+            "cooldown_until": max(current, cooldown_text),
+            "reason": "max_parallel_requests",
+            "new_pair_launches_blocked": True,
+            "single_probe_at_provider_reset": True,
+        })
 
     def set_auto_pipeline(self, enabled: bool) -> Dict[str, Any]:
         self.db.set_setting("auto_pipeline_enabled", bool(enabled))
@@ -558,6 +600,12 @@ class PairwiseService:
         if not self._automation_lock.acquire(blocking=False):
             return self.automation_status()
         try:
+            waiting_api_arms = int((self.db.one(
+                "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_api_retry'"
+            ) or {"count": 0})["count"])
+            api_cooling = self._api_cooldown_active()
+            start_blocked = api_cooling or waiting_api_arms > 0 or self._pair_start_blocked()
+            pair_start_scheduled = False
             active_pairs = self.db.all(
                 """SELECT * FROM pairs WHERE status IN ('queued','running','review')
                    ORDER BY created_at,id"""
@@ -568,7 +616,15 @@ class PairwiseService:
                 if stage == "repository":
                     self._submit_auto("repo-" + pair_id, self.prepare_pair_repository, pair_id)
                 elif stage == "ready_to_start":
-                    self._submit_auto("start-" + pair_id, self.start_pair, pair_id)
+                    if not start_blocked and not pair_start_scheduled:
+                        pair_start_scheduled = self._submit_auto(
+                            "start-" + pair_id, self.start_pair, pair_id,
+                        )
+                        if pair_start_scheduled:
+                            self.db.set_setting(
+                                "claude_pair_start_after",
+                                (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(timespec="seconds"),
+                            )
                 elif stage in ("development", "artifact_validation"):
                     if stage == "development":
                         self._schedule_active_arm_monitors(pair_id)
@@ -606,6 +662,18 @@ class PairwiseService:
             ) or {"count": 0})["count"])
             configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
             pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured))
+
+            waiting_api_arms = int((self.db.one(
+                "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_api_retry'"
+            ) or {"count": 0})["count"])
+            if waiting_api_arms:
+                if (not self._api_cooldown_active() and not self._api_probe_blocked()
+                        and active_count < pair_limit):
+                    active_count += self._schedule_due_api_retries(1)
+                return self.automation_status()
+            if self._api_cooldown_active():
+                return self.automation_status()
+
             while active_count < pair_limit and self._resume_one_lineage_repair():
                 active_count += 1
             if active_count < pair_limit and self._resume_one_reusable_pair():
@@ -617,12 +685,6 @@ class PairwiseService:
                 pair = self.create_pair(task["id"])
                 self._submit_auto("repo-" + pair["id"], self.prepare_pair_repository, pair["id"])
                 active_count += 1
-
-            # A transient provider outage must not hold a development slot.
-            # Existing approved work is started first; cooled-down retries
-            # remain queued and resume only when a Pair slot is actually free.
-            if active_count < pair_limit:
-                active_count += self._schedule_due_api_retries(pair_limit - active_count)
 
             # Existing approved questions are consumed first. Refill begins
             # only when no additional approved question can fill the target.
@@ -692,28 +754,28 @@ class PairwiseService:
                 ORDER BY COALESCE(a.api_retry_after,a.updated_at),a.updated_at,a.id""",
             (now_iso(),),
         )
-        rows_by_pair: Dict[str, List[Dict[str, Any]]] = {}
-        for row in due:
-            rows_by_pair.setdefault(row["pair_id"], []).append(row)
-        resumed = 0
-        for pair_id, rows in rows_by_pair.items():
-            if resumed >= available_slots:
-                break
-            submitted = False
-            for row in rows:
-                submitted = self._submit_monitor(
-                    "api-retry-" + row["arm_id"], self._recover_api_retry,
-                    pair_id, row["arm_id"], row["prompt"],
-                ) or submitted
-            if not submitted:
-                continue
-            self.db.execute(
-                """UPDATE pairs SET status='running',error='',updated_at=?
-                     WHERE id=? AND status='waiting_api_retry' AND stage='development'""",
-                (now_iso(), pair_id),
-            )
-            resumed += 1
-        return resumed
+        if not due:
+            return 0
+        # A single Arm is the probe. Launching both A/B sides together simply
+        # consumes the same saturated provider pool twice.
+        row = due[0]
+        submitted = self._submit_monitor(
+            "api-retry-" + row["arm_id"], self._recover_api_retry,
+            row["pair_id"], row["arm_id"], row["prompt"],
+        )
+        if not submitted:
+            return 0
+        stamp = now_iso()
+        self.db.execute(
+            """UPDATE pairs SET status='running',error='',updated_at=?
+                 WHERE id=? AND status='waiting_api_retry' AND stage='development'""",
+            (stamp, row["pair_id"]),
+        )
+        self.db.set_setting(
+            "claude_api_probe_after",
+            (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="seconds"),
+        )
+        return 1
 
     def _schedule_active_arm_monitors(self, pair_id: str) -> None:
         """Reconnect monitors to live Claude sessions after a service restart."""
@@ -735,6 +797,8 @@ class PairwiseService:
 
     def _schedule_pending_arm_retries(self, pair_id: str) -> None:
         """Recover retries stranded after launch but before prompt delivery."""
+        if self._api_cooldown_active():
+            return
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
         task = self.db.one(
             """SELECT t.prompt FROM tasks t JOIN pairs p ON p.task_id=t.id
@@ -3262,12 +3326,13 @@ class PairwiseService:
             )
             if match:
                 reset_at = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                delay = max(delay, int((reset_at - now).total_seconds()) + 30)
+                # The provider supplies the authoritative recovery time.
+                delay = max(1, int((reset_at - now).total_seconds()))
         elif "504" in lowered or "gateway" in lowered:
             delay = 120 * (2 ** exponent)
         else:
             delay = 180 * (2 ** exponent)
-        return max(60, min(900, delay))
+        return max(1, min(900, delay))
 
     def _queue_api_retry(self, pair_id: str, arm: Dict[str, Any],
                          error: str) -> Dict[str, Any]:
@@ -3278,6 +3343,7 @@ class PairwiseService:
         previous_retries = int(arm.get("api_retry_count") or 0)
         delay = self._api_retry_delay_seconds(error, previous_retries)
         retry_after = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        self._register_global_rate_limit(error, retry_after)
         prepared = self.claude.archive_failed_attempt(
             arm, error, prepare_retry=True,
             count_development_failure=False, count_error_retry=False,
@@ -3356,7 +3422,14 @@ class PairwiseService:
                 "counts_toward_development_attempts": False,
                 "counts_toward_error_retries": False,
             })
-            return self._monitor_arm(pair_id, arm_id, prompt)
+            # Use the canonical monitor operation id. Calling _monitor_arm
+            # directly here allowed the scheduler to attach a second monitor
+            # to the same session, so both workers archived one 429 twice.
+            self._submit_monitor(
+                "monitor-" + arm_id, self._monitor_arm,
+                pair_id, arm_id, prompt,
+            )
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
         except Exception as exc:
             current_arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             return self._queue_api_retry(
