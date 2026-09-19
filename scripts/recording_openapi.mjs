@@ -55,6 +55,32 @@ export function sampleValue(inputSchema, spec, depth = 0, fieldName = "") {
   if (depth > 8) return null;
   if (schema.type === "object" || schema.properties) {
     const properties = schema.properties || {};
+    if (properties.markers && properties.father && properties.mother && properties.children) {
+      const father = resolveSchema(properties.father, spec);
+      if (father.type === "array") {
+        return {
+          markers: ["rs01", "rs02", "rs03"],
+          father: ["0/1", "0/1", "0/0"],
+          mother: ["0/0", "0/1", "0/0"],
+          children: [{ id: "proband", genotypes: ["0/0", "0/1", "0/0"] }],
+        };
+      }
+      return {
+        markers: ["m1", "m2"],
+        father: { genotypes: ["AC", "TT"] },
+        mother: { genotypes: ["GG", "AC"] },
+        children: [{ name: "k", genotypes: ["AG", "TC"] }],
+      };
+    }
+    if (properties.initial_value && properties.operations) {
+      return {
+        initial_value: 0,
+        operations: [
+          { id: "w", type: "write", value: 1, invoke: 0, respond: 2 },
+          { id: "r", type: "read", value: 1, invoke: 3, respond: 4 },
+        ],
+      };
+    }
     if (properties.L && properties.n && properties.distances) {
       return { L: 10, n: 5, distances: [2, 4, 7, 10, 2, 5, 8, 3, 6, 3] };
     }

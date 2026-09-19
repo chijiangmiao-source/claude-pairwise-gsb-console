@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -155,7 +155,8 @@ class RecordingManager:
 
     def _launch(self, attempt_id: str, workspace: Path, compose: Path, project: str,
                 path: Path, check: Dict[str, Any]) -> None:
-        if check.get("status") != "passed":
+        runtime_available = self._runtime_recording_is_allowed(check, compose)
+        if not runtime_available:
             try:
                 self._launch_failure_evidence(attempt_id, workspace, path, check)
             except Exception as exc:
@@ -218,6 +219,34 @@ class RecordingManager:
                 (redact(str(exc))[-3000:], now_iso(), now_iso(), attempt_id),
             )
             self.db.audit("recording.finished", "recording_attempt", attempt_id, {"status": "failed", "error": str(exc)[-1000:]})
+
+    @staticmethod
+    def _runtime_recording_is_allowed(check: Dict[str, Any], compose: Optional[Path]) -> bool:
+        """Use the real app when Docker starts even if a separate business test failed.
+
+        An observed business-test defect belongs in the GSB evidence, but it does
+        not make a working browser application unrecordable. Startup, health and
+        container failures still use the terminal evidence page so the recording
+        never hides an unstartable delivery.
+        """
+        if check.get("status") == "passed":
+            return bool(compose and compose.is_file())
+        if check.get("status") != "observed_failed" or not compose or not compose.is_file():
+            return False
+        try:
+            checks = json.loads(check.get("checks_json") or "[]")
+        except (TypeError, ValueError):
+            return False
+        if isinstance(checks, dict):
+            checks = checks.get("checks") or [checks]
+        failed = [item for item in checks if isinstance(item, dict) and not item.get("passed")]
+        if not failed:
+            return False
+        blocking = re.compile(
+            r"compose|dockerfile|clean_start|containers?_running|health|startup|published_port",
+            re.IGNORECASE,
+        )
+        return all(not blocking.search(str(item.get("name") or "")) for item in failed)
 
     def _launch_failure_evidence(self, attempt_id: str, workspace: Path, path: Path,
                                  check: Dict[str, Any]) -> None:

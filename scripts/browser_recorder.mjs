@@ -43,6 +43,53 @@ async function saveVideo(sourcePath, targetPath) {
 }
 
 function fallbackBodyForPath(path) {
+  if (path === "/plan") {
+    return {
+      targets: [
+        { id: 1, duration: 3, value: 5, windows: [{ open: 0, close: 10 }] },
+        { id: 2, duration: 3, value: 8, windows: [{ open: 0, close: 10 }] },
+      ],
+      slew: { from_night_start: [0, 0], between_targets: [[0, 1], [1, 0]] },
+    };
+  }
+  if (path === "/api/v1/plan") {
+    return {
+      targets: [
+        { id: 1, exposure: 5, science_value: 9, windows: [[0, 6]] },
+        { id: 2, exposure: 2, science_value: 6, windows: [[0, 3]] },
+        { id: 3, exposure: 2, science_value: 6, windows: [[2, 5]] },
+      ],
+      slews: {
+        night_start: [0, 0, 0],
+        1: [0, 10, 10], 2: [10, 0, 0], 3: [10, 10, 0],
+      },
+    };
+  }
+  if (path === "/phase") {
+    return {
+      markers: ["m1", "m2"],
+      father: { genotypes: ["AC", "TT"] },
+      mother: { genotypes: ["GG", "AC"] },
+      children: [{ name: "k", genotypes: ["AG", "TC"] }],
+    };
+  }
+  if (path === "/api/v1/phase") {
+    return {
+      markers: ["rs01", "rs02", "rs03"],
+      father: ["0/1", "0/1", "0/0"],
+      mother: ["0/0", "0/1", "0/0"],
+      children: [{ id: "proband", genotypes: ["0/0", "0/1", "0/0"] }],
+    };
+  }
+  if (/linearizability\/check\/?$/i.test(path)) {
+    return {
+      initial_value: 0,
+      operations: [
+        { id: "w", type: "write", value: 1, invoke: 0, respond: 2 },
+        { id: "r", type: "read", value: 1, invoke: 3, respond: 4 },
+      ],
+    };
+  }
   if (path === "/analyze") {
     return {
       endpoints: [
@@ -105,17 +152,24 @@ async function demonstrateBareJsonApiWorkflow(page) {
       const found = [];
       for (const path of paths) {
         try {
-          const response = await fetch(path, { method: "OPTIONS" });
-          if (response.status !== 404 && response.status < 500) found.push(path);
+          const response = await fetch(path, {
+            method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+          });
+          if (![404, 405, 501].includes(response.status) && response.status < 500) found.push(path);
         } catch {}
       }
       return found;
-    }, ["/api/plans", "/plans"]);
-    if (discovered[0]) declarations.push(["创建迁移计划", `POST ${discovered[0]}`]);
+    }, [
+      "/plan", "/api/v1/plan", "/phase", "/api/v1/phase",
+      "/api/v1/linearizability/check", "/api/plans", "/plans", "/analyze", "/api/analyze",
+    ]);
+    if (discovered[0]) declarations.push(["执行业务功能", `POST ${discovered[0]}`]);
   }
   const operations = declarations.map(([name, declaration]) => {
     const text = String(declaration || "").trim();
-    const match = text.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\/\S*)$/i);
+    const keyText = String(name || "").trim();
+    const match = text.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\/\S*)/i)
+      || keyText.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\/\S*)/i);
     const path = match ? match[2] : (text.startsWith("/") ? text : "");
     const method = match ? match[1].toUpperCase() : (/health/i.test(name) ? "GET" : "POST");
     return { name, method, path, body: method === "GET" ? null : fallbackBodyForPath(path) };

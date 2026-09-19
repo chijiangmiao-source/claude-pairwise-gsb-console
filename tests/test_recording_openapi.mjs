@@ -58,6 +58,29 @@ test("builds a safe switch migration plan instead of unrelated placeholder ids",
   assert.equal(sample.topology.switches[0].new_next, "DELIVER");
 });
 
+test("builds a consistent family phasing request", () => {
+  const sample = sampleValue({
+    type: "object", required: ["markers", "father", "mother", "children"], properties: {
+      markers: { type: "array" }, father: { type: "array" },
+      mother: { type: "array" }, children: { type: "array" },
+    },
+  }, {});
+  assert.equal(sample.markers.length, 3);
+  assert.equal(sample.father.length, sample.markers.length);
+  assert.equal(sample.children[0].genotypes.length, sample.markers.length);
+});
+
+test("builds a valid linearizability history", () => {
+  const sample = sampleValue({
+    type: "object", required: ["initial_value", "operations"], properties: {
+      initial_value: { type: "integer" }, operations: { type: "array" },
+    },
+  }, {});
+  assert.deepEqual(sample.operations.map((operation) => operation.type), ["write", "read"]);
+  assert.ok(sample.operations[0].respond < sample.operations[1].invoke);
+  assert.equal(sample.operations[0].value, sample.operations[1].value);
+});
+
 test("prefers a root create operation without unresolved identifier dependencies", () => {
   const spec = {
     paths: {
