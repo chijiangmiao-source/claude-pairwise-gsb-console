@@ -425,15 +425,35 @@ pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-b
 
     @staticmethod
     def _wait_for_url(port: int) -> str:
-        paths = ("/", "/docs", "/index.html")
         deadline = time.monotonic() + 120
         last = ""
         while time.monotonic() < deadline:
-            for path in paths:
+            # FastAPI commonly serves a small JSON object at `/` and the real
+            # interactive surface at `/docs`.  Recording the first 200 response
+            # therefore captured an inert JSON page even though Swagger was
+            # available.  Prefer `/docs` only when it is actually Swagger so a
+            # SPA that rewrites every path to index.html still opens at `/`.
+            docs_url = "http://127.0.0.1:%d/docs" % port
+            try:
+                response = urlopen(
+                    Request(docs_url, headers={"User-Agent": "PairwiseRecorder/1.0"}),
+                    timeout=3,
+                )
+                content_type = str(response.headers.get("Content-Type") or "").casefold()
+                body = response.read(256 * 1024).decode("utf-8", errors="ignore").casefold()
+                if response.status < 400 and "text/html" in content_type and any(
+                    marker in body for marker in ("swagger-ui", "swagger ui", "openapi.json")
+                ):
+                    return response.geturl()
+            except HTTPError as exc:
+                last = str(exc)
+            except (URLError, OSError) as exc:
+                last = str(exc)
+            for path in ("/", "/index.html"):
                 url = "http://127.0.0.1:%d%s" % (port, path)
                 try:
                     response = urlopen(Request(url, headers={"User-Agent": "PairwiseRecorder/1.0"}), timeout=3)
-                    if response.status < 400: return url
+                    if response.status < 400: return response.geturl()
                 except HTTPError as exc:
                     last = str(exc)
                 except (URLError, OSError) as exc:

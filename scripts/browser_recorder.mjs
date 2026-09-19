@@ -43,6 +43,24 @@ async function saveVideo(sourcePath, targetPath) {
 }
 
 function fallbackBodyForPath(path) {
+  if (path === "/analyze") {
+    return {
+      endpoints: [
+        { grain_left: 1, grain_right: 2 },
+        { grain_left: 2, grain_right: 1 },
+      ],
+      candidates: [{ endpoint_a: 0, endpoint_b: 1, cost: 3 }],
+    };
+  }
+  if (/\/stitch\/?$/i.test(path)) {
+    return {
+      endpoints: [
+        { id: "e0", left_grain: "g1", right_grain: "g2" },
+        { id: "e1", left_grain: "g2", right_grain: "g1" },
+      ],
+      candidates: [{ a: "e0", b: "e1", cost: 3 }],
+    };
+  }
   if (/align/i.test(path)) {
     return { planned: [{ code: "A", at_ms: 0 }], actual: [{ code: "A", at_ms: 0 }] };
   }
@@ -50,6 +68,92 @@ function fallbackBodyForPath(path) {
     return { L: 10, n: 5, distances: [2, 4, 7, 10, 2, 5, 8, 3, 6, 3] };
   }
   return {};
+}
+
+async function demonstrateBareJsonApiWorkflow(page) {
+  const rootPayload = await page.evaluate(() => {
+    const raw = document.body?.innerText || "";
+    try { return JSON.parse(raw); } catch { return null; }
+  });
+  if (!rootPayload || typeof rootPayload !== "object" || !rootPayload.endpoints) {
+    return { required: false, ok: true };
+  }
+  const operations = Object.entries(rootPayload.endpoints).map(([name, declaration]) => {
+    const text = String(declaration || "").trim();
+    const match = text.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\/\S*)$/i);
+    const path = match ? match[2] : (text.startsWith("/") ? text : "");
+    const method = match ? match[1].toUpperCase() : (/health/i.test(name) ? "GET" : "POST");
+    return { name, method, path, body: method === "GET" ? null : fallbackBodyForPath(path) };
+  }).filter((item) => item.path && ["GET", "POST", "PUT", "PATCH"].includes(item.method));
+  if (!operations.length) return { required: false, ok: true };
+
+  await page.evaluate((items) => {
+    document.body.innerHTML = "";
+    Object.assign(document.body.style, {
+      margin: "0", background: "#f4f7f5", color: "#17211b",
+      font: "16px/1.5 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif",
+    });
+    const main = document.createElement("main");
+    Object.assign(main.style, { width: "1040px", margin: "0 auto", padding: "34px 0 60px" });
+    main.innerHTML = `<header style="margin-bottom:22px"><p style="margin:0;color:#47725b">纯后端服务 · 真实接口操作</p>
+      <h1 style="margin:5px 0 4px;font-size:30px">${String(document.title || "API 功能验收")}</h1>
+      <p style="margin:0;color:#607066">依次点击接口并展示实际 HTTP 响应。</p></header>`;
+    for (const item of items) {
+      const card = document.createElement("section");
+      Object.assign(card.style, {
+        margin: "14px 0", padding: "18px 20px", border: "1px solid #cbd8d0",
+        borderRadius: "14px", background: "white", boxShadow: "0 8px 24px rgba(31,63,45,.07)",
+      });
+      card.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;gap:18px">
+        <div><strong style="font-size:18px">${item.name}</strong>
+        <div style="margin-top:5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#365745">${item.method} ${item.path}</div></div>
+        <button type="button" style="border:0;border-radius:10px;background:#176b47;color:white;padding:11px 18px;font-size:16px;cursor:pointer">发送真实请求</button></div>
+        ${item.body === null ? "" : `<pre style="margin:14px 0 0;padding:12px;background:#f5f7f6;border-radius:9px;white-space:pre-wrap">${JSON.stringify(item.body, null, 2)}</pre>`}
+        <pre data-result style="display:none;margin:14px 0 0;padding:12px;max-height:180px;overflow:auto;background:#0d1711;color:#d9eee1;border-radius:9px;white-space:pre-wrap">等待请求</pre>`;
+      const result = card.querySelector("[data-result]");
+      card.querySelector("button").addEventListener("click", async () => {
+        result.style.display = "block";
+        result.textContent = "请求中…";
+        try {
+          const response = await fetch(item.path, {
+            method: item.method,
+            headers: item.body === null ? undefined : { "content-type": "application/json" },
+            body: item.body === null ? undefined : JSON.stringify(item.body),
+          });
+          const text = await response.text();
+          card.dataset.status = String(response.status);
+          result.textContent = `HTTP ${response.status}\n${text.slice(0, 2400)}`;
+        } catch (error) {
+          card.dataset.status = "0";
+          result.textContent = String(error);
+        }
+      });
+      main.appendChild(card);
+    }
+    document.body.appendChild(main);
+  }, operations);
+
+  const cards = page.locator("main section");
+  const results = [];
+  for (let index = 0; index < await cards.count(); index += 1) {
+    const card = cards.nth(index);
+    await moveAndClick(page, card.locator("button"));
+    await page.waitForFunction((position) => Boolean(document.querySelectorAll("main section")[position]?.dataset.status), index);
+    const status = Number(await card.getAttribute("data-status") || 0);
+    results.push({ ...operations[index], status, ok: status >= 200 && status < 300 });
+    await page.waitForTimeout(850);
+  }
+  const business = results.filter((item) => !/health/i.test(item.name));
+  const ok = (business.length ? business : results).some((item) => item.ok);
+  const summary = {
+    required: true, ok, workflow: "bare-json-api-operations",
+    featureCount: results.length, clicks: results.length,
+    requests: results.filter((item) => item.ok).length,
+    operations: results.map(({ method, path, status, ok }) => ({ method, path, status, ok })),
+    error: "没有成功完成业务接口请求",
+  };
+  process.stdout.write(`${JSON.stringify({ event: "interaction", ...summary })}\n`);
+  return summary;
 }
 
 async function moveAndClick(page, locator) {
@@ -611,6 +715,8 @@ try {
     ? Promise.resolve({ required: false, ok: true, interactionMode })
     : new URL(page.url()).pathname.startsWith("/docs")
     ? demonstrateSwaggerWorkflow(page).catch((error) => ({ required: true, ok: false, error: error?.message || String(error) }))
+    : String(await page.evaluate(() => document.contentType || "")).toLowerCase().includes("json")
+    ? demonstrateBareJsonApiWorkflow(page).catch((error) => ({ required: true, ok: false, error: error?.message || String(error) }))
     : demonstrateGenericWorkflow(page).catch((error) => ({ required: true, ok: false, error: error?.message || String(error) }));
   if (interactionMode === "auto") {
     void finishAfterAutomaticWorkflow(page);
