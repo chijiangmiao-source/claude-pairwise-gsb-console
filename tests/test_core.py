@@ -567,6 +567,48 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Pair 已停止"):
             self.service.start_pair(pair["id"])
 
+    def test_cancel_pair_stops_only_the_selected_pair(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
+               VALUES('pair-unrelated','task-1',?,'running','development',?,?)""",
+            (pair["chain_id"], stamp, stamp),
+        )
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?)""",
+                ("arm-cancel-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-cancel-" + arm, "screen-cancel-" + arm,
+                 "auto_model/urm", "image", stamp, stamp),
+            )
+
+        def archive(arm, reason, **_kwargs):
+            self.db.execute(
+                "UPDATE arm_runs SET status='failed',error=?,updated_at=? WHERE id=?",
+                (reason, stamp, arm["id"]),
+            )
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],))
+
+        with patch.object(self.service.claude, "archive_failed_attempt", side_effect=archive) as stop:
+            result = self.service.cancel_pair(pair["id"], "改用新版短题")
+        self.assertEqual(result, {"pairId": pair["id"], "status": "cancelled", "stoppedArms": ["A", "B"]})
+        self.assertEqual(stop.call_count, 2)
+        self.assertEqual(
+            self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
+            {"status": "cancelled", "stage": "cancelled"},
+        )
+        self.assertEqual(
+            self.db.one("SELECT status FROM pairs WHERE id='pair-unrelated'")["status"],
+            "running",
+        )
+
     def test_completed_arm_is_scheduled_for_validation_before_peer_finishes(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

@@ -130,6 +130,12 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 operation = self.app.service.start_pair_async(match.group(1))
                 return self._json(202, {"operationId": operation})
+            match = re.fullmatch(r"/api/pairs/([^/]+)/cancel", path)
+            if match:
+                operation = self.app.service.cancel_pair_async(
+                    match.group(1), str(body.get("reason", "人工停止")),
+                )
+                return self._json(202, {"operationId": operation})
             match = re.fullmatch(r"/api/pairs/([^/]+)/difficulty/review", path)
             if match:
                 operation = self.app.service.reassess_actual_difficulty_async(match.group(1))

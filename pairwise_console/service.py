@@ -592,6 +592,57 @@ class PairwiseService:
             self._schedule_auto_pipeline_once()
         return self.automation_status()
 
+    def cancel_pair_async(self, pair_id: str, reason: str = "人工停止") -> str:
+        operation = "cancel-pair-" + pair_id
+        self._submit(operation, self.cancel_pair, pair_id, reason)
+        return operation
+
+    def cancel_pair(self, pair_id: str, reason: str = "人工停止") -> Dict[str, Any]:
+        """Stop one Pair while preserving each active Arm's code and native trace."""
+        reason = re.sub(r"\s+", " ", str(reason or "人工停止")).strip()[:1000]
+        with self._pair_failure_lock(pair_id):
+            pair = self._pair(pair_id)
+            if pair.get("status") in ("completed", "cancelled"):
+                return {"pairId": pair_id, "status": pair.get("status"), "stoppedArms": []}
+            stamp = now_iso()
+            self.db.execute(
+                """UPDATE pairs SET status='cancelled',stage='cancelled',error=?,updated_at=?
+                     WHERE id=?""",
+                (reason, stamp, pair_id),
+            )
+            self.db.execute(
+                """UPDATE delivery_submissions SET status='discarded',error=?,updated_at=?
+                     WHERE pair_id=?""",
+                (reason, stamp, pair_id),
+            )
+            stopped: List[str] = []
+            active_statuses = {
+                "queued", "running", "developing", "waiting_retry", "waiting_api_retry",
+                "checkpointing", "exported",
+            }
+            for arm in self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,)):
+                if arm.get("status") not in active_statuses:
+                    continue
+                try:
+                    self.claude.archive_failed_attempt(
+                        arm, reason, prepare_retry=False,
+                        count_development_failure=False, count_error_retry=False,
+                    )
+                except Exception as exc:
+                    self.db.execute(
+                        """UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=?
+                             WHERE id=?""",
+                        ((reason + "；停止现场时出现错误：" + redact(str(exc)))[-3000:],
+                         now_iso(), now_iso(), arm["id"]),
+                    )
+                stopped.append(str(arm.get("arm") or ""))
+            self._invalidate_recordings(pair_id, reason=reason)
+            self.db.audit("pair.cancelled", "pair", pair_id, {
+                "reason": reason, "stopped_arms": stopped,
+                "code_and_trace_preserved": True,
+            })
+            return {"pairId": pair_id, "status": "cancelled", "stoppedArms": stopped}
+
     def _submit_auto(self, operation: str, fn, *args) -> bool:
         """Submit an idempotent pipeline action with a small failure backoff."""
         with self._future_lock:
