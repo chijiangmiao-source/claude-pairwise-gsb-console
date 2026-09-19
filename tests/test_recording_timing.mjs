@@ -5,9 +5,9 @@ import {
   automaticFinishDelayMs, finalizeInteractionEvidence, humanClickPauseMs, isSafeFeatureControl,
 } from "../scripts/recording_timing.mjs";
 
-test("automatic recordings finish as soon as the real workflow completes", () => {
-  assert.equal(automaticFinishDelayMs("recording", 9000, 88), 1000);
-  assert.equal(automaticFinishDelayMs("long-workflow", 41000, 50), 1000);
+test("automatic recordings keep the final result visible for two seconds", () => {
+  assert.equal(automaticFinishDelayMs("recording", 9000, 88), 2000);
+  assert.equal(automaticFinishDelayMs("long-workflow", 41000, 50), 2000);
 });
 
 test("feature traversal skips destructive controls", () => {

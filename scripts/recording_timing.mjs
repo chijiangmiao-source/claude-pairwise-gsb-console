@@ -1,8 +1,7 @@
 export function automaticFinishDelayMs() {
-  // Every workflow already waits briefly after each real action so the result
-  // is visible in the recording. Keep one final second for the completed
-  // result, without padding to an arbitrary target duration.
-  return 1000;
+  // Keep the final result visible long enough to read after the last human-
+  // paced scroll. This is a fixed review pause, not arbitrary duration padding.
+  return 2000;
 }
 
 export function humanClickPauseMs(sequence, phase = "before") {

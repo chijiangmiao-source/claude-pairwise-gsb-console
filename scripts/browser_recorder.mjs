@@ -141,7 +141,8 @@ async function demonstrateBareJsonApiWorkflow(page) {
     await page.waitForFunction((position) => Boolean(document.querySelectorAll("main section")[position]?.dataset.status), index);
     const status = Number(await card.getAttribute("data-status") || 0);
     results.push({ ...operations[index], status, ok: status >= 200 && status < 300 });
-    await page.waitForTimeout(850);
+    await humanScrollIntoView(page, card.locator("[data-result]"));
+    await page.waitForTimeout(700);
   }
   const business = results.filter((item) => !/health/i.test(item.name));
   const ok = (business.length ? business : results).some((item) => item.ok);
@@ -156,8 +157,26 @@ async function demonstrateBareJsonApiWorkflow(page) {
   return summary;
 }
 
+async function humanScrollIntoView(page, locator) {
+  const target = await locator.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const top = window.scrollY + rect.top;
+    const centered = top - Math.max(36, (window.innerHeight - Math.min(rect.height, window.innerHeight * 0.7)) / 2);
+    return Math.max(0, Math.min(document.documentElement.scrollHeight - window.innerHeight, centered));
+  });
+  const current = await page.evaluate(() => window.scrollY);
+  const distance = target - current;
+  if (Math.abs(distance) < 12) return;
+  const steps = Math.max(7, Math.min(13, Math.ceil(Math.abs(distance) / 85)));
+  for (let index = 0; index < steps; index += 1) {
+    await page.mouse.wheel(0, distance / steps);
+    await page.waitForTimeout(105 + ((index * 37) % 55));
+  }
+  await page.waitForTimeout(420);
+}
+
 async function moveAndClick(page, locator) {
-  await locator.scrollIntoViewIfNeeded();
+  await humanScrollIntoView(page, locator);
   const box = await locator.boundingBox();
   if (!box) throw new Error("目标控件不可见");
   const sequence = clickSequence;
@@ -261,7 +280,7 @@ async function demonstrateSwaggerOperation(page, selected) {
   await moveAndClick(page, block.locator("button.execute").first());
   const responses = block.locator(".live-responses-table").first();
   await responses.waitFor({ state: "visible", timeout: 15000 });
-  await responses.scrollIntoViewIfNeeded();
+  await humanScrollIntoView(page, responses);
   const statusTexts = await responses.locator(".response-col_status").allTextContents();
   const status = Number(statusTexts.map((text) => text.match(/\d{3}/)?.[0]).find(Boolean) || 0);
   await page.waitForTimeout(850);
