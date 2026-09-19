@@ -491,7 +491,9 @@ class PairwiseService:
             "SELECT COUNT(*) count FROM pairs WHERE status='waiting_api_retry'"
         ) or {"count": 0})["count"])
         waiting_api_arms = int((self.db.one(
-            "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_api_retry'"
+            """SELECT COUNT(*) count FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
+                 WHERE a.status='waiting_api_retry' AND p.stage='development'
+                   AND p.status IN ('running','waiting_api_retry')"""
         ) or {"count": 0})["count"])
         ready = int((self.db.one(
             "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND " + ELIGIBLE_TASK_SQL
@@ -510,7 +512,10 @@ class PairwiseService:
             "activePairs": active,
             "waitingApiPairs": waiting_api_pairs,
             "waitingApiArms": waiting_api_arms,
-            "apiCooldownUntil": str(self.db.setting("claude_api_cooldown_until", "") or ""),
+            "apiCooldownUntil": (
+                str(self.db.setting("claude_api_cooldown_until", "") or "")
+                if self._api_cooldown_active() else ""
+            ),
             "readyTasks": ready,
             "generatingBatches": generating,
             "stages": stages,
@@ -540,10 +545,11 @@ class PairwiseService:
             r"resets at:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*utc",
             str(error or ""), re.IGNORECASE,
         )
-        cooldown = (
+        provider_reset = (
             datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             if match else retry_after
         )
+        cooldown = max(provider_reset, datetime.now(timezone.utc) + timedelta(minutes=5))
         cooldown_text = cooldown.isoformat(timespec="seconds")
         current = str(self.db.setting("claude_api_cooldown_until", "") or "")
         if cooldown_text > current:
@@ -552,7 +558,8 @@ class PairwiseService:
             "cooldown_until": max(current, cooldown_text),
             "reason": "max_parallel_requests",
             "new_pair_launches_blocked": True,
-            "single_probe_at_provider_reset": True,
+            "provider_reset": provider_reset.isoformat(timespec="seconds"),
+            "single_probe_after_cooldown": True,
         })
 
     def set_auto_pipeline(self, enabled: bool) -> Dict[str, Any]:
@@ -601,7 +608,9 @@ class PairwiseService:
             return self.automation_status()
         try:
             waiting_api_arms = int((self.db.one(
-                "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_api_retry'"
+                """SELECT COUNT(*) count FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
+                     WHERE a.status='waiting_api_retry' AND p.stage='development'
+                       AND p.status IN ('running','waiting_api_retry')"""
             ) or {"count": 0})["count"])
             api_cooling = self._api_cooldown_active()
             start_blocked = api_cooling or waiting_api_arms > 0 or self._pair_start_blocked()
@@ -664,7 +673,9 @@ class PairwiseService:
             pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured))
 
             waiting_api_arms = int((self.db.one(
-                "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_api_retry'"
+                """SELECT COUNT(*) count FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
+                     WHERE a.status='waiting_api_retry' AND p.stage='development'
+                       AND p.status IN ('running','waiting_api_retry')"""
             ) or {"count": 0})["count"])
             if waiting_api_arms:
                 if (not self._api_cooldown_active() and not self._api_probe_blocked()
@@ -1802,11 +1813,20 @@ class PairwiseService:
             else:
                 raise ValueError("Feature 或 Bug 任务缺少来源项目链")
         stamp = now_iso()
-        self.db.execute(
-            "INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (pair_id, task_id, chain_id, "queued", "repository", stamp, stamp),
-        )
-        self.db.execute("UPDATE tasks SET status='used',locked_by=?,used_at=?,updated_at=? WHERE id=?", (pair_id, stamp, stamp, task_id))
+        with self.db.transaction() as conn:
+            claimed = conn.execute(
+                """UPDATE tasks SET status='used',locked_by=?,used_at=?,updated_at=?
+                     WHERE id=? AND status='ready'""",
+                (pair_id, stamp, stamp, task_id),
+            )
+            if claimed.rowcount != 1:
+                raise ValueError("题目已被其他 Pair 使用，不能重复创建")
+            if conn.execute("SELECT id FROM pairs WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
+                raise ValueError("题目已存在 Pair，不能重复创建")
+            conn.execute(
+                "INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                (pair_id, task_id, chain_id, "queued", "repository", stamp, stamp),
+            )
         self.db.audit("pair.created", "pair", pair_id, {"task_id": task_id, "chain_id": chain_id})
         return self.pair_detail(pair_id)
 
