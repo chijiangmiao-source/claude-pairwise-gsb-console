@@ -85,6 +85,29 @@ test("keeps the existing all-record sync when no Pair is selected", () => {
   assert.equal(result.length, 2);
 });
 
+test("uses the current SOLO-QA GSB API routes", () => {
+  assert.match(source, /remoteJson\("\/gsb\/form-schema"\)/);
+  assert.match(source, /remoteJson\(`\/gsb\/submissions\/\$\{encodeURIComponent\(remoteId\)\}`\)/);
+});
+
+test("falls back to the submissions list when the detail endpoint is unavailable", async () => {
+  vm.runInContext(`
+    remoteJson = async (path) => {
+      if (path.startsWith("/gsb/submissions?")) return { items: [{
+        id: "1542", status: "PENDING_FIX",
+        data: { a_session_id: "a-session", b_session_id: "b-session", user_prompt: "prompt" }
+      }] };
+      throw new Error("数据不存在或无权访问");
+    };
+    fallbackBundle = { values: {
+      a_session_id: "a-session", b_session_id: "b-session", user_prompt: "prompt"
+    } };
+  `, context);
+  const result = await vm.runInContext('loadRemoteDetail(fallbackBundle, "1542")', context);
+  assert.equal(result.id, "1542");
+  assert.equal(result.status, "PENDING_FIX");
+});
+
 test("coalesces concurrent submit requests for the same Pair", async () => {
   vm.runInContext(`
     submitCallCount = 0;

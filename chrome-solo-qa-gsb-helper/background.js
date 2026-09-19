@@ -281,7 +281,8 @@ async function findRemote(bundle) {
       seen.add(id);
       let detail = compactRemote(item);
       if (!detail.a_session_id || !detail.b_session_id || !detail.user_prompt) {
-        detail = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(id)}`));
+        try { detail = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(id)}`)); }
+        catch { /* The current platform can list a submission while denying its detail endpoint. */ }
       }
       const sameSessions = Boolean(values.a_session_id && values.b_session_id
         && detail.a_session_id === values.a_session_id && detail.b_session_id === values.b_session_id);
@@ -291,6 +292,14 @@ async function findRemote(bundle) {
     }
   }
   return null;
+}
+async function loadRemoteDetail(bundle, remoteId) {
+  try { return compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(remoteId)}`)); }
+  catch (detailError) {
+    const recovered = await findRemote(bundle);
+    if (recovered && String(recovered.id) === String(remoteId)) return recovered;
+    throw detailError;
+  }
 }
 function stateForRemote(status) { return STATUS_MAP[String(status || "")] || "qc_pending"; }
 function stateValues(detail, bundle = null) {
@@ -376,17 +385,17 @@ async function repairOne(pairId) {
   if (!bundle.ready) throw new Error(`返修前检查未通过：${(bundle.issues || []).join("；")}`);
   const remoteId = String(bundle.solo_qa?.remote_id || "");
   if (!remoteId || bundle.solo_qa?.remote_status !== "PENDING_FIX") throw new Error("只有远端待返修的 Pair 可以返修，请先同步质检状态");
-  const before = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(remoteId)}`));
+  const before = await loadRemoteDetail(bundle, remoteId);
   if (before.status !== "PENDING_FIX") throw new Error("远端记录已不是待返修状态，请先同步");
   await recordState(bundle, { status: "submitting", remote_id: remoteId, remote_status: before.status, error: "" });
   try {
     const schema = await remoteJson("/gsb/form-schema");
     const uploaded = await uploadBundle(bundle, schema);
     const data = buildData(schema, bundle, uploaded);
-    await remoteJson(`/gsb/submissions/${encodeURIComponent(remoteId)}`, jsonOptions({
+    const updated = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(remoteId)}`, jsonOptions({
       data, schema_fingerprint: schema.fingerprint || "", comment: "",
-    }, "PUT"));
-    const detail = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(remoteId)}`));
+    }, "PUT")));
+    const detail = updated.id && updated.status ? updated : await loadRemoteDetail(bundle, remoteId);
     await recordState(bundle, stateValues(detail, bundle));
     return { pair_id: pairId, outcome: "repaired", remote_id: remoteId, status: detail.status };
   } catch (error) {
@@ -421,7 +430,8 @@ async function syncRemote(payload = {}) {
   const results = [];
   for (const item of selectSyncItems(local.items || [], payload)) {
     try {
-      const detail = compactRemote(await remoteJson(`/gsb/submissions/${encodeURIComponent(item.remote_id)}`));
+      const bundle = await loadBundle(item.pair_id);
+      const detail = await loadRemoteDetail(bundle, item.remote_id);
       await localJson("/state", jsonOptions({ pair_id: item.pair_id, payload_sha256: item.payload_sha256 || "", ...stateValues(detail) }));
       results.push({ pair_id: item.pair_id, outcome: "synced", status: detail.status });
     } catch (error) {

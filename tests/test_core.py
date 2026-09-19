@@ -21,7 +21,7 @@ from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
 from pairwise_console.prompts import (
-    feature_generation_prompt, gsb_prompt, gsb_recheck_prompt,
+    feature_generation_prompt, generated_task_prompt_issues, gsb_prompt, gsb_recheck_prompt,
     task_generation_prompt, task_validation_prompt,
 )
 from pairwise_console.recording import RecordingManager
@@ -86,7 +86,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("codex_default_effort"), "medium")
         self.assertEqual(self.db.setting("codex_bug_effort"), "high")
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
-        self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 40)
+        self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 60)
+        self.assertEqual(self.db.setting("development_max_attempts"), 2)
+        self.assertTrue(self.db.setting("task_generation_zero_to_one_only"))
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
         self.assertIsNone(self.db.setting("task_mix_zero_to_one"))
         self.assertIsNone(self.db.setting("task_mix_feature"))
@@ -115,8 +117,44 @@ class CoreTests(unittest.TestCase):
         self.assertIn("准确基线", validation)
         self.assertIn("近期开发完成后的真实难度案例", validation)
         self.assertIn("Bug 修复可用这些案例校准难度", validation)
-        self.assertIn("至少两个相互制约", generated)
-        self.assertIn("当前不存在且相互制约", feature)
+        self.assertIn("一个可独立验收的工程核心", generated)
+        self.assertIn("四至六个完整中文句子", generated)
+        self.assertIn("只增加一个工程核心", feature)
+        self.assertIn("不增加独立运行组件", feature)
+        self.assertNotIn("至少两个相互制约", generated)
+        self.assertNotIn("至少两个当前不存在", feature)
+
+    def test_generated_task_scope_budget_rejects_cluttered_prompt(self):
+        prompt = "甲" * 150 + "；" + "乙" * 150 + "；丙；丁。"
+        issues = generated_task_prompt_issues(
+            "zero_to_one", prompt, ["a", "b", "c"], {
+                "engineeringCore": "跨层状态裁决",
+                "mainUserFlow": "导入后核验并处理冲突",
+                "implementationModules": ["parser", "service", "api"],
+                "runtimeComponents": ["api"],
+                "auxiliaryMechanisms": [],
+                "newOperations": ["导入", "核验"],
+                "newStateSets": ["处理状态"],
+            },
+        )
+        self.assertTrue(any("完整句子" in issue for issue in issues))
+        self.assertTrue(any("单句最多" in issue for issue in issues))
+        self.assertTrue(any("分号最多" in issue for issue in issues))
+
+    def test_generated_task_scope_budget_accepts_old_system_shape(self):
+        prompt = "".join(("甲" * 62 + "。") for _ in range(5))
+        issues = generated_task_prompt_issues(
+            "zero_to_one", prompt, ["a", "b", "c"], {
+                "engineeringCore": "跨层状态裁决",
+                "mainUserFlow": "导入后核验并处理冲突",
+                "implementationModules": ["parser", "service", "api"],
+                "runtimeComponents": ["api"],
+                "auxiliaryMechanisms": ["幂等导入"],
+                "newOperations": ["导入", "核验"],
+                "newStateSets": ["处理状态"],
+            },
+        )
+        self.assertEqual(issues, [])
 
     def test_task_duplicate_guard_checks_full_local_history(self):
         stamp = now_iso()
@@ -230,7 +268,7 @@ class CoreTests(unittest.TestCase):
         delivery = self.db.one("SELECT status,remote_id FROM delivery_submissions WHERE pair_id=?", (pair["id"],))
         self.assertEqual(delivery, {"status": "needs_fix", "remote_id": "470"})
 
-    def test_ready_task_selection_uses_oldest_available_type_without_ratio(self):
+    def test_ready_task_selection_uses_only_zero_to_one_while_catching_up(self):
         stamps = {
             "feature": "2026-01-01T00:00:00+00:00",
             "bugfix": "2026-01-02T00:00:00+00:00",
@@ -241,10 +279,10 @@ class CoreTests(unittest.TestCase):
                 """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
                    difficulty_evidence_json,fingerprint,status,created_at,updated_at)
                    VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
-                ("task-ready-" + task_type, "test", task_type, task_type, "hard task",
+                ("task-ready-" + task_type, "test", task_type, task_type, "hard " + task_type + " task",
                  "ready-" + task_type, stamps[task_type], stamps[task_type]),
             )
-        self.assertEqual(self.service._next_ready_task()["task_type"], "feature")
+        self.assertEqual(self.service._next_ready_task()["task_type"], "zero_to_one")
 
     def test_ready_task_selection_prefers_new_zero_to_one_and_rejects_duplicate_title(self):
         rows = [
@@ -2670,6 +2708,11 @@ class CoreTests(unittest.TestCase):
         detail = json.loads(event["detail_json"])
         self.assertFalse(detail["counts_toward_development_attempts"])
         self.assertFalse(detail["counts_toward_error_retries"])
+        self.assertTrue(detail["counts_toward_pair_failure_limit"])
+        self.assertEqual(
+            self.db.one("SELECT development_failure_count FROM pairs WHERE id=?", (pair["id"],))["development_failure_count"],
+            1,
+        )
 
     def test_monitor_replaces_task_after_second_identical_no_code_signature(self):
         self.insert_ready_task()
@@ -2829,21 +2872,94 @@ class CoreTests(unittest.TestCase):
         self.assertTrue((trace_dir / "session-verified.jsonl").is_file())
         command.assert_called_once_with(["docker", "rm", "verified-container"], check=False, timeout=60)
 
-    def test_third_development_failure_retires_pair_and_schedules_new_task(self):
+    def test_second_pair_development_failure_retires_pair_and_schedules_new_task(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
-        arm = {"id": "arm-third-failure", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
+        self.db.execute(
+            "UPDATE pairs SET development_failure_count=1 WHERE id=?", (pair["id"],),
+        )
+        arm = {"id": "arm-second-failure", "pair_id": pair["id"], "attempt_no": 1, "arm": "A"}
         with patch.object(self.service.claude, "archive_failed_attempt", return_value={**arm, "status": "failed"}) as archive, \
              patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
             result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", "container exited")
         self.assertEqual(result["status"], "failed")
         archive.assert_called_once()
         replace.assert_called_once_with(
-            pair["id"], arm["id"], "container exited", "开发连续 3 次失败",
+            pair["id"], arm["id"], "container exited", "项目累计 2 次开发失败",
         )
 
-    def test_api_errors_use_the_separate_retry_queue(self):
+    def test_second_failure_keeps_the_other_arm_running_to_its_own_timeout(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development',development_failure_count=1 WHERE id=?",
+            (pair["id"],),
+        )
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,prompt_sent_at,attempt_no,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'developing',?,1,?,?)""",
+                ("arm-drain-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-drain-" + arm, "screen-drain-" + arm,
+                 "auto_model/urm", "image", stamp, stamp, stamp),
+            )
+        failed_arm = self.db.one("SELECT * FROM arm_runs WHERE id='arm-drain-A'")
+
+        def archive(arm, error, prepare_retry=False, **_kwargs):
+            self.db.execute(
+                "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
+                (error, stamp, stamp, arm["id"]),
+            )
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],))
+
+        with patch.object(self.service.claude, "archive_failed_attempt", side_effect=archive), \
+             patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
+            result = self.service._handle_attempt_failure(
+                pair["id"], failed_arm, "same prompt", "container exited",
+            )
+        self.assertEqual(result["status"], "failed")
+        replace.assert_not_called()
+        current = self.db.one(
+            "SELECT status,stage,development_failure_count,error FROM pairs WHERE id=?",
+            (pair["id"],),
+        )
+        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["stage"], "development")
+        self.assertEqual(current["development_failure_count"], 2)
+        self.assertIn("B 侧继续运行", current["error"])
+        self.assertEqual(
+            self.db.one("SELECT status FROM arm_runs WHERE id='arm-drain-B'")["status"],
+            "developing",
+        )
+
+    def test_pair_retires_after_preserved_peer_finishes(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development',development_failure_count=2 WHERE id=?",
+            (pair["id"],),
+        )
+        for arm, status, error in (("A", "failed", "container exited"), ("B", "completed", "")):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,error,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("arm-finish-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-finish-" + arm, "screen-finish-" + arm,
+                 "auto_model/urm", "image", status, error, stamp, stamp),
+            )
+        with patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
+            self.service._refresh_pair_after_arm(pair["id"])
+        replace.assert_called_once_with(
+            pair["id"], "arm-finish-A", "container exited",
+            "项目累计 2 次失败，另一侧已结束",
+        )
+
+    def test_first_api_error_uses_retry_queue_and_counts_against_pair_limit(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
@@ -2863,19 +2979,65 @@ class CoreTests(unittest.TestCase):
             queue.assert_called_once_with(pair["id"], arm, error)
             replace.assert_not_called()
 
-    def test_third_504_still_does_not_retire_the_pair(self):
+    def test_second_504_retires_the_pair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         self.db.execute("UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],))
-        arm = {"id": "arm-third-504", "pair_id": pair["id"], "attempt_no": 3, "arm": "A"}
+        arm = {"id": "arm-second-504", "pair_id": pair["id"], "attempt_no": 1, "arm": "A"}
         error = "API Error: 504 Gateway Timeout"
-        with patch.object(self.service, "_queue_api_retry",
-                          return_value={**arm, "status": "waiting_api_retry"}) as queue, \
+        self.db.execute("UPDATE pairs SET development_failure_count=1 WHERE id=?", (pair["id"],))
+        with patch.object(
+            self.service.claude, "archive_failed_attempt", return_value={**arm, "status": "failed"},
+        ) as archive, patch.object(
+            self.service, "_retire_pair_and_schedule_replacement",
+        ) as replace:
+            result = self.service._queue_api_retry(pair["id"], arm, error)
+        self.assertEqual(result["status"], "failed")
+        archive.assert_called_once()
+        replace.assert_called_once_with(
+            pair["id"], arm["id"], error, "项目累计 2 次失败（包含 API 错误）",
+        )
+
+    def test_second_504_does_not_stop_an_active_peer(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development',development_failure_count=1 WHERE id=?",
+            (pair["id"],),
+        )
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,prompt_sent_at,attempt_no,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'developing',?,1,?,?)""",
+                ("arm-api-drain-" + arm, pair["id"], arm, arm, str(self.root / arm),
+                 "container-api-drain-" + arm, "screen-api-drain-" + arm,
+                 "auto_model/urm", "image", stamp, stamp, stamp),
+            )
+        failed_arm = self.db.one("SELECT * FROM arm_runs WHERE id='arm-api-drain-A'")
+        error = "API Error: 504 Gateway Timeout"
+
+        def archive(arm, failure, prepare_retry=False, **_kwargs):
+            self.db.execute(
+                "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
+                (failure, stamp, stamp, arm["id"]),
+            )
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],))
+
+        with patch.object(self.service.claude, "archive_failed_attempt", side_effect=archive), \
              patch.object(self.service, "_retire_pair_and_schedule_replacement") as replace:
-            result = self.service._handle_attempt_failure(pair["id"], arm, "same prompt", error)
-        self.assertEqual(result["id"], arm["id"])
-        queue.assert_called_once_with(pair["id"], arm, error)
+            result = self.service._queue_api_retry(pair["id"], failed_arm, error)
+        self.assertEqual(result["status"], "failed")
         replace.assert_not_called()
+        self.assertEqual(
+            self.db.one("SELECT status FROM arm_runs WHERE id='arm-api-drain-B'")["status"],
+            "developing",
+        )
+        current = self.db.one("SELECT status,stage,error FROM pairs WHERE id=?", (pair["id"],))
+        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["stage"], "development")
+        self.assertIn("B 侧继续运行", current["error"])
 
     def test_api_retry_cooldown_uses_provider_reset_and_bounded_backoff(self):
         current = datetime(2026, 9, 18, 19, 0, 0, tzinfo=timezone.utc)

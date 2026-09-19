@@ -1,8 +1,107 @@
+import re
+from typing import Any, Dict, List, Optional
+
+
 BANNED_TASKS = """禁止生成或放行这些题型及换皮版本：经典小游戏与图形模拟；通用命令行、本地文件和桌面小工具；电商、订单、RBAC、库存、OA、CMS、挂号、CRM、聊天、拍卖、停车、工单、预约等通用业务 CRUD；报表、CSV 看板、记账、健身、菜谱、天气、番茄钟、习惯、播放器、旅行或观影记录等常见页面。"""
 
 DIFFICULTY_RULES = """0–1 和 Feature 任务只有困难或地狱可进入 A/B；从真实产物发现并双次复现的 Bug 修复任务允许中等、困难或地狱进入 A/B，简单 Bug 仍拒绝。困难必须整合多个模块或系统约束，做关键设计取舍，并处理复杂状态、兼容性、权限、并发、性能或异常链路；地狱还要求架构级判断、多步复杂调试或大量边界场景。文件多、页面多、字段多、题面长不能单独证明难度。
 
-必须按“满足题面所需的最小实现”预判，而不是按可能出现的最复杂实现判定。若现有架构已经提供核心状态机、事务、算法、恢复或兼容机制，任务只是增加字段、接口、条件分支、页面展示、迁移列、包装现有算法或补测试，即使跨多个文件也通常只是中等。困难任务至少要有两个相互制约且题面强制验收的高复杂度机制，例如并发一致性与兼容迁移、持久化恢复与幂等协议、性能上界与精确正确性；开发者自行增加的复杂设计不能计入。"""
+必须按“满足题面所需的最小实现”预判，而不是按可能出现的最复杂实现判定。若现有架构已经提供核心状态机、事务、算法、恢复或兼容机制，任务只是增加字段、接口、条件分支、页面展示、迁移列、包装现有算法或补测试，即使跨多个文件也通常只是中等。困难任务只选择一个真实主难点，并让它贯穿三至四个实现模块；主难点可以是状态不变量、故障恢复、复杂跨层契约或有独立判据的领域算法。不要再叠加第二套无关的复杂机制来制造难度，开发者自行增加的复杂设计也不能计入。"""
+
+
+ZERO_TO_ONE_PROMPT_MIN_CHARS = 300
+ZERO_TO_ONE_PROMPT_MAX_CHARS = 600
+FEATURE_PROMPT_MIN_CHARS = 300
+FEATURE_PROMPT_MAX_CHARS = 480
+TASK_PROMPT_MIN_SENTENCES = 4
+TASK_PROMPT_MAX_SENTENCES = 6
+TASK_PROMPT_MAX_SENTENCE_CHARS = 120
+TASK_PROMPT_MAX_SEMICOLONS = 2
+TASK_MIN_MODULES = 3
+TASK_MAX_MODULES = 4
+ZERO_TO_ONE_MAX_RUNTIME_COMPONENTS = 2
+TASK_MAX_AUXILIARY_MECHANISMS = 2
+TASK_MAX_OPERATIONS = 2
+TASK_MAX_STATE_SETS = 1
+TASK_MIN_ACCEPTANCE = 3
+ZERO_TO_ONE_MAX_ACCEPTANCE = 6
+FEATURE_MAX_ACCEPTANCE = 4
+TASK_PROMPT_AI_STYLE_MARKERS = (
+    "需求如下",
+    "具体要求如下",
+    "沿用既有不变量",
+    "其余失败沿用错误信封",
+    "不变量不变",
+)
+
+
+def _task_scope_list(candidate: Dict[str, Any], field: str) -> List[Any]:
+    value = candidate.get(field)
+    return value if isinstance(value, list) else []
+
+
+def generated_task_prompt_issues(task_type: str, prompt: str,
+                                 acceptance: Optional[List[Any]] = None,
+                                 candidate: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Return deterministic scope and readability failures for generated tasks."""
+    task_type = str(task_type or "zero_to_one")
+    cleaned = re.sub(r"\s+", " ", str(prompt or "")).strip()
+    issues: List[str] = []
+    minimum, maximum = (
+        (FEATURE_PROMPT_MIN_CHARS, FEATURE_PROMPT_MAX_CHARS)
+        if task_type == "feature"
+        else (ZERO_TO_ONE_PROMPT_MIN_CHARS, ZERO_TO_ONE_PROMPT_MAX_CHARS)
+    )
+    if not minimum <= len(cleaned) <= maximum:
+        issues.append(f"题面应为 {minimum} 至 {maximum} 字，当前 {len(cleaned)} 字")
+    if "\n" in str(prompt or "") or re.search(r"(?:^|\n)\s*(?:[-*•]|\d+[.、)])", str(prompt or "")):
+        issues.append("题面应为自然连贯的一段话，不使用标题或列表")
+    sentences = [
+        part.strip(" ，,；;：:")
+        for part in re.split(r"[。！？!?]+", cleaned)
+        if part.strip(" ，,；;：:")
+    ]
+    if not TASK_PROMPT_MIN_SENTENCES <= len(sentences) <= TASK_PROMPT_MAX_SENTENCES:
+        issues.append(
+            f"题面应有 {TASK_PROMPT_MIN_SENTENCES} 至 {TASK_PROMPT_MAX_SENTENCES} 个完整句子，"
+            f"当前 {len(sentences)} 句"
+        )
+    longest = max((len(sentence) for sentence in sentences), default=0)
+    if longest > TASK_PROMPT_MAX_SENTENCE_CHARS:
+        issues.append(f"题面单句最多 {TASK_PROMPT_MAX_SENTENCE_CHARS} 字，当前最长 {longest} 字")
+    semicolons = cleaned.count("；") + cleaned.count(";")
+    if semicolons > TASK_PROMPT_MAX_SEMICOLONS:
+        issues.append(f"题面分号最多 {TASK_PROMPT_MAX_SEMICOLONS} 个，当前 {semicolons} 个")
+    marker = next((item for item in TASK_PROMPT_AI_STYLE_MARKERS if item in cleaned), "")
+    if marker:
+        issues.append(f"题面包含模板化表达：{marker}")
+
+    scenarios = acceptance if isinstance(acceptance, list) else []
+    acceptance_max = FEATURE_MAX_ACCEPTANCE if task_type == "feature" else ZERO_TO_ONE_MAX_ACCEPTANCE
+    if scenarios and not TASK_MIN_ACCEPTANCE <= len(scenarios) <= acceptance_max:
+        issues.append(f"验收场景应为 {TASK_MIN_ACCEPTANCE} 至 {acceptance_max} 个")
+
+    if candidate is None:
+        return issues
+    if not str(candidate.get("engineeringCore") or "").strip():
+        issues.append("内部范围缺少唯一工程核心")
+    if not str(candidate.get("mainUserFlow") or "").strip():
+        issues.append("内部范围缺少唯一用户主流程")
+    modules = _task_scope_list(candidate, "implementationModules")
+    if not TASK_MIN_MODULES <= len(modules) <= TASK_MAX_MODULES:
+        issues.append(f"实现模块应为 {TASK_MIN_MODULES} 至 {TASK_MAX_MODULES} 个")
+    runtime = _task_scope_list(candidate, "runtimeComponents")
+    if task_type == "feature" and runtime:
+        issues.append("Feature 不得新增独立运行组件")
+    if task_type != "feature" and not 1 <= len(runtime) <= ZERO_TO_ONE_MAX_RUNTIME_COMPONENTS:
+        issues.append(f"0–1 应有一至 {ZERO_TO_ONE_MAX_RUNTIME_COMPONENTS} 个应用运行组件")
+    if len(_task_scope_list(candidate, "auxiliaryMechanisms")) > TASK_MAX_AUXILIARY_MECHANISMS:
+        issues.append(f"辅助机制最多 {TASK_MAX_AUXILIARY_MECHANISMS} 项")
+    if len(_task_scope_list(candidate, "newOperations")) > TASK_MAX_OPERATIONS:
+        issues.append(f"新增接口或用户操作最多 {TASK_MAX_OPERATIONS} 个")
+    if len(_task_scope_list(candidate, "newStateSets")) > TASK_MAX_STATE_SETS:
+        issues.append(f"新增状态集合最多 {TASK_MAX_STATE_SETS} 组")
+    return issues
 
 
 def actual_difficulty_review_prompt(task: str, original_difficulty: str,
@@ -49,7 +148,9 @@ def task_validation_prompt(task_text: str, known_titles: str,
 
 还要检查：必须能用 Docker Compose 清洁启动；应包含可操作的功能验收；不能只是改名换皮；与已有题目不能在核心功能、交互、数据模型、验收或技术实现上高度重复。去重按业务目标、核心机制和验收链路判断，不能只看标题或字面是否完全一致；相同机制换行业名、换角色名或改写措辞仍算重复。
 
-先做一次最小实现预演：列出题面不可省略的状态变化、数据边界和验收，再对照基线已有能力，判断最短正确实现的真实难度。Feature 或 Bug 必须检查准确基线中的现有模块；如果主要工作可以复用现有机制并通过直接扩字段、加路由、循环筛选、区间切分、调用既有算法或增加前端状态完成，应判为中等。Feature 的中等候选应拒绝；Bug 修复若来自真实产物、具备准确基线并已双次复现，中等可以接受。困难候选仍须明确至少两个相互制约的复杂机制，而且验收能证明这些机制确实被实现。difficultyEvidence 必须说明判定依据，不能只复述题面。
+先做一次最小实现预演：列出题面不可省略的状态变化、数据边界和验收，再对照基线已有能力，判断最短正确实现的真实难度。Feature 或 Bug 必须检查准确基线中的现有模块；如果主要工作可以复用现有机制并通过直接扩字段、加路由、循环筛选、区间切分、调用既有算法或增加前端状态完成，应判为中等。Feature 的中等候选应拒绝；Bug 修复若来自真实产物、具备准确基线并已双次复现，中等可以接受。困难候选应只有一个贯穿三至四个模块的真实主难点，验收必须能证明它确实被实现；不要用多套无关机制、字段数量或测试数量抬高难度。difficultyEvidence 必须说明判定依据，不能只复述题面。
+
+新生成的 0–1 和 Feature 还要按范围预算复核：一个工程核心、一条用户主流程、三至四个实现模块、最多两项辅助机制、最多两个新增接口或用户操作、最多一组新增状态。0–1 最多两个应用运行组件，验收为三至六个场景；Feature 不增加独立运行组件，验收为三至四个场景。题面应为四至六个完整句子，单句不超过 120 字，分号不超过两个，并按业务因果自然组织；不得机械拼接数据库、接口、页面、测试和交付清单。
 
 判定应依据题面真实内容，不能用内部字段是否单独填写代替事实判断。zero_to_one 本来就是从空仓库开始，baseline_path 为空属于正确基线，baselineReady 应判为 true。历史任务的 acceptance 数组可能为空；只要原始 prompt 已经写明 Docker Compose、验证服务、接口结果或可执行验收场景，就视为具备验收条件，不能仅因 acceptance 字段为空拒绝。只有发现明确的难度不足、禁出题、实质重复、Feature/Bug 缺少准确任务前代码，或题面确实无法验收时才拒绝；不要把可由系统直接整理的元数据缺项当成阻塞。
 
@@ -74,7 +175,11 @@ def task_generation_prompt(existing: str, task_type: str = "zero_to_one") -> str
 {DIFFICULTY_RULES}
 {BANNED_TASKS}
 
-直接生成困难或地狱任务，不先生成低难度再升级。输出前先在内部做最小实现预演，确保任务不能靠普通 CRUD、字段贯通、直接循环、既有算法包装或常规页面状态完成。题面必须强制至少两个相互制约的困难机制，并为每个机制写出能区分真实实现与表面实现的验收场景；只堆字段、边界条件、页面和测试数量不合格。projectCategory 必须明确选择纯后端、纯前端或全栈；纯后端不得创建前端，纯前端不得创建业务后端，全栈必须通过真实 API 联调。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如后端写 Python 3.13, FastAPI，前端写 TypeScript, React，全栈写 Python 3.13, FastAPI, TypeScript, React；不得写 Pydantic、SQLAlchemy、Vite、数据库、测试工具、Playwright、Docker、架构、算法、业务能力、约束或说明性句子。题面要给出明确业务背景、复杂状态或异常链路、技术约束、边界条件与验收条件；必须要求 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，并保证克隆后只依赖 Docker 即可运行。避免复述实现方案，给开发者保留关键设计取舍。
+直接生成困难或地狱任务，不先生成低难度再升级。沿用老系统的范围预算：题面有且只有一个可独立验收的工程核心和一条主要纵向链路，实际涉及三至四个实现模块；0–1 最多两个应用运行组件、两项辅助机制、两个接口或用户操作和一组状态。困难度只选择一个真实主轴，可以是状态不变量、故障恢复、复杂跨层契约或有独立判据的领域算法，并让它贯穿主流程；不要再叠加第二套无关算法、恢复链路、调度器或工作台。普通 CRUD、字段贯通、直接循环、既有算法包装和常规页面状态不能单独成为主难点。
+
+prompt 目标约 450 字，生成时控制在 300 至 520 字，写成四至六个完整中文句子，单句不超过 120 字，分号不超过两个；本地只为轻微偏差保留 300 至 600 字的硬边界。按业务背景、用户操作、关键约束、失败反馈和可观察验收的因果顺序自然展开，不加标题、列表或“需求如下”，不把数据库、接口、页面、测试数量和交付要求机械拼成一串。acceptance 只列三至六个可独立操作并观察结果的场景，同一次操作产生同一结果的校验要合并。projectCategory 必须明确选择纯后端、纯前端或全栈；纯后端不得创建前端，纯前端不得创建业务后端，全栈必须通过真实 API 联调。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如 Python 3.13, FastAPI 或 TypeScript, React。
+
+题面从空仓库起步，并在正文中用一句话自然交代 Dockerfile、Docker Compose、健康检查和可配置宿主机端口；不要在结尾堆 README、测试、.gitignore 等通用清单。只固定会改变核心验收结果的业务规则，字段命名、页面布局和内部实现留给开发者。内部范围字段只供系统校验，必须如实填写，不能写进 prompt。
 
 已有题目标题与摘要，必须避免核心问题、机制和验收链路雷同；换行业背景或改写措辞不能算新题：
 {existing or '无'}
@@ -88,7 +193,11 @@ def feature_generation_prompt(original_task: str, artifact_summary: str, existin
 {DIFFICULTY_RULES}
 {BANNED_TASKS}
 
-必须在现有产品和代码结构上增加真实的新能力，保留现有功能、接口与 Docker Compose 验收链路。先检查摘要和当前基线已经具备的状态机、事务、算法、恢复和兼容能力；这些既有能力不能再次当作新题难度。最短正确实现若只是扩字段、加接口、调用既有算法、增加条件分支或页面状态，必须放弃该候选并重新生成。新题必须强制至少两个当前不存在且相互制约的困难机制，并用并发、恢复、兼容、性能或异常链路的可执行场景验收。projectCategory 必须保持为 {project_category or '原项目类别'}，不得把纯后端擅自改成全栈或给纯前端增加业务后端。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如后端写 Python 3.13, FastAPI，前端写 TypeScript, React，全栈写 Python 3.13, FastAPI, TypeScript, React；不得写 Pydantic、SQLAlchemy、Vite、数据库、测试工具、Playwright、Docker、架构、算法、业务能力、约束或说明性句子。直接生成困难或地狱任务，复杂度必须来自跨模块状态、性能、并发、异常恢复或兼容性等真实约束，不能靠堆字段或扩大文字。题面要明确新行为、边界条件与可执行验收，但给开发者保留实现取舍。taskType 必须为 feature。
+必须在现有产品和代码结构上增加真实的新能力，保留现有功能、接口与 Docker Compose 验收链路。先检查摘要和当前基线已经具备的状态机、事务、算法、恢复和兼容能力；这些既有能力不能再次当作新题难度。最短正确实现若只是扩字段、加接口、调用既有算法、增加条件分支或页面状态，必须放弃该候选并重新生成。
+
+沿用老系统的迭代范围预算：只增加一个工程核心，围绕一条用户主流程改动三至四个现有模块；最多两个新增接口或用户操作、一组新增状态、两项辅助机制和一个复杂主轴，不增加独立运行组件。困难主轴可以是状态不变量、故障恢复、跨层一致性或有独立判据的领域算法，但不能同时堆多套机制。acceptance 只列三至四个可独立操作并观察结果的场景，覆盖主流程、直接相关的失败边界和兼容回归。
+
+prompt 控制在 300 至 480 字，写成四至六个完整中文句子，单句不超过 120 字，分号不超过两个。按新行为如何进入现有流程的业务因果自然展开，不加标题、列表、生成说明或结尾清单，不机械拼接数据库、接口、页面和测试字段。projectCategory 必须保持为 {project_category or '原项目类别'}，不得改变项目形态；stack 只写主要编程语言和主要应用框架。题面要给开发者保留设计取舍，内部范围字段只供系统校验，不能写进 prompt。taskType 必须为 feature。
 
 原始任务：
 {original_task}

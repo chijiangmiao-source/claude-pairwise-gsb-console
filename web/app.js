@@ -549,6 +549,7 @@ async function syncSoloQa(pairIds = []) {
     notify(ids.length ? `正在同步所选 ${ids.length} 条 SOLO-QA 状态…` : "正在同步全部 SOLO-QA 状态…");
     const data = await helperCall("PAIRWISE_GSB_SYNC", ids.length ? { pair_ids: ids } : {});
     const total = data.results?.length || 0;
+    if (data.failed) showHelperResults("SOLO-QA 状态同步结果", data);
     notify(data.failed ? `同步完成：${total - data.failed} 条成功，${data.failed} 条失败` : `已同步 ${total} 条记录`, Boolean(data.failed));
   } catch (error) {
     notify(error.message, true);

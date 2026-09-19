@@ -196,16 +196,54 @@ GSB_RECHECK_SCHEMA = {
 TASK_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["title", "prompt", "taskType", "projectCategory", "difficulty", "difficultyEvidence", "stack", "acceptance"],
+    "required": [
+        "title", "prompt", "taskType", "projectCategory", "difficulty",
+        "difficultyEvidence", "stack", "acceptance", "engineeringCore",
+        "mainUserFlow", "hardAxis", "implementationModules",
+        "runtimeComponents", "auxiliaryMechanisms", "newOperations",
+        "newStateSets",
+    ],
     "properties": {
-        "title": {"type": "string"},
-        "prompt": {"type": "string"},
+        "title": {"type": "string", "minLength": 2, "maxLength": 120},
+        "prompt": {"type": "string", "minLength": 300, "maxLength": 600},
         "taskType": {"type": "string", "enum": ["zero_to_one", "feature"]},
         "projectCategory": {"type": "string", "enum": ["纯后端", "纯前端", "全栈"]},
         "difficulty": {"type": "string", "enum": ["困难", "地狱"]},
-        "difficultyEvidence": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+        "difficultyEvidence": {
+            "type": "array", "items": {"type": "string", "maxLength": 300},
+            "minItems": 2, "maxItems": 4,
+        },
         "stack": {"type": "string", "minLength": 2, "maxLength": 255},
-        "acceptance": {"type": "array", "items": {"type": "string"}, "minItems": 3},
+        "acceptance": {
+            "type": "array", "items": {"type": "string", "maxLength": 240},
+            "minItems": 3, "maxItems": 6,
+        },
+        "engineeringCore": {"type": "string", "minLength": 2, "maxLength": 160},
+        "mainUserFlow": {"type": "string", "minLength": 2, "maxLength": 240},
+        "hardAxis": {
+            "type": "string",
+            "enum": ["状态不变量", "故障恢复", "跨层契约", "领域算法"],
+        },
+        "implementationModules": {
+            "type": "array", "items": {"type": "string", "maxLength": 100},
+            "minItems": 3, "maxItems": 4,
+        },
+        "runtimeComponents": {
+            "type": "array", "items": {"type": "string", "maxLength": 100},
+            "maxItems": 2,
+        },
+        "auxiliaryMechanisms": {
+            "type": "array", "items": {"type": "string", "maxLength": 120},
+            "maxItems": 2,
+        },
+        "newOperations": {
+            "type": "array", "items": {"type": "string", "maxLength": 120},
+            "maxItems": 2,
+        },
+        "newStateSets": {
+            "type": "array", "items": {"type": "string", "maxLength": 120},
+            "maxItems": 1,
+        },
     },
 }
 

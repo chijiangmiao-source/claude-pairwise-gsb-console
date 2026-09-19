@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def now_iso() -> str:
@@ -76,6 +76,11 @@ class Database:
             ):
                 if name not in columns:
                     c.execute("ALTER TABLE arm_runs ADD COLUMN %s %s" % (name, definition))
+            pair_columns = {row[1] for row in c.execute("PRAGMA table_info(pairs)")}
+            if "development_failure_count" not in pair_columns:
+                c.execute(
+                    "ALTER TABLE pairs ADD COLUMN development_failure_count INTEGER NOT NULL DEFAULT 0"
+                )
             bug_columns = {row[1] for row in c.execute("PRAGMA table_info(bug_candidates)")}
             for name, definition in (
                 ("reproduction_commands_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -334,6 +339,7 @@ CREATE TABLE IF NOT EXISTS pairs (
   repo_id TEXT NOT NULL DEFAULT '',
   baseline_sha TEXT NOT NULL DEFAULT '',
   winner TEXT NOT NULL DEFAULT '',
+  development_failure_count INTEGER NOT NULL DEFAULT 0,
   error TEXT NOT NULL DEFAULT '',
   started_at TEXT,
   completed_at TEXT,

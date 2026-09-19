@@ -10,7 +10,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .analytics import dashboard
 from .artifact import ArtifactChecker
@@ -27,7 +27,8 @@ from .gsb_rewrite import rewrite_preview, validate_source
 from .importer import fingerprint, import_historical_tasks
 from .prompts import (
     actual_difficulty_review_prompt, bug_discovery_prompt, bugfix_task_prompt, feature_generation_prompt,
-    gsb_prompt, gsb_recheck_prompt, task_generation_prompt, task_validation_prompt,
+    generated_task_prompt_issues, gsb_prompt, gsb_recheck_prompt, task_generation_prompt,
+    task_validation_prompt,
 )
 from .recording import RecordingManager
 from .commands import redact, run_command
@@ -101,11 +102,14 @@ class PairwiseService:
         self._start_locks: Dict[str, threading.Lock] = {}
         self._prompt_locks_lock = threading.Lock()
         self._prompt_locks: Dict[str, threading.Lock] = {}
+        self._failure_locks_lock = threading.Lock()
+        self._failure_locks: Dict[str, threading.RLock] = {}
         self._pair_completion_lock = threading.RLock()
         self._auto_retry_after: Dict[str, float] = {}
         self._artifact_retry_after: Dict[str, float] = {}
         self._seed_settings()
         self._retire_outdated_ready_bug_tasks()
+        self._retire_overloaded_ready_tasks()
         self._quarantine_invalid_completed_pairs()
         self._queue_invalid_delivery_lineage_pairs()
         self._restore_false_completed_tasks()
@@ -142,6 +146,7 @@ class PairwiseService:
             "task_pool_target_ready": 12,
             "auto_refill_enabled": True,
             "auto_refill_interval_seconds": 60,
+            "task_generation_zero_to_one_only": True,
             "auto_pipeline_enabled": False,
             "git_author_name": self.config.git_author_name,
             "git_author_email": self.config.git_author_email,
@@ -149,8 +154,8 @@ class PairwiseService:
             "github_visibility": self.config.github_visibility,
             "repository_prefix": self.config.repository_prefix,
             "first_prompt_warning_minutes": 15,
-            "first_prompt_stop_minutes": 40,
-            "development_max_attempts": 3,
+            "first_prompt_stop_minutes": 60,
+            "development_max_attempts": 2,
             "terminal_idle_seconds": 120,
             "claude_api_auto_retry_enabled": True,
             "claude_api_cooldown_until": "",
@@ -167,10 +172,11 @@ class PairwiseService:
             "DELETE FROM settings WHERE key IN "
             "('task_mix_zero_to_one','task_mix_feature','task_mix_bugfix','task_mix_started_at')"
         )
-        # Upgrade the original shipped timeout while preserving any later
-        # explicit customization made by an operator.
-        if int(self.db.setting("first_prompt_stop_minutes", 40)) == 25:
-            self.db.set_setting("first_prompt_stop_minutes", 40)
+        # Upgrade prior shipped workflow values to the current operating rule.
+        if int(self.db.setting("first_prompt_stop_minutes", 60)) in (25, 40):
+            self.db.set_setting("first_prompt_stop_minutes", 60)
+        if int(self.db.setting("development_max_attempts", 2)) == 3:
+            self.db.set_setting("development_max_attempts", 2)
         if (str(self.db.setting("claude_image", self.config.claude_image))
                 == "claude-eval-runtime:claude-2.1.269"
                 and self.config.claude_image == "claude-eval-runtime:prepared-2.1.269"):
@@ -485,6 +491,9 @@ class PairwiseService:
     def automation_status(self) -> Dict[str, Any]:
         configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         target = max(1, min(MAX_PAIR_PROJECTS, configured))
+        zero_to_one_only = bool(
+            self.db.setting("task_generation_zero_to_one_only", True)
+        )
         active = int((self.db.one(
             "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
         ) or {"count": 0})["count"])
@@ -498,6 +507,7 @@ class PairwiseService:
         ) or {"count": 0})["count"])
         ready = int((self.db.one(
             "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND " + ELIGIBLE_TASK_SQL
+            + (" AND task_type='zero_to_one'" if zero_to_one_only else "")
         ) or {"count": 0})["count"])
         generating = int((self.db.one(
             "SELECT COUNT(*) count FROM generation_batches WHERE status='running'"
@@ -523,7 +533,9 @@ class PairwiseService:
             "readyTasks": ready,
             "generatingBatches": generating,
             "stages": stages,
-            "taskSelectionMode": "available_first",
+            "taskSelectionMode": (
+                "zero_to_one_only" if zero_to_one_only else "available_first"
+            ),
         }
 
     @staticmethod
@@ -640,6 +652,8 @@ class PairwiseService:
                             )
                 elif stage in ("development", "artifact_validation"):
                     if stage == "development":
+                        if self._finish_exhausted_pair_after_peer(pair_id):
+                            continue
                         self._schedule_active_arm_monitors(pair_id)
                         self._schedule_pending_arm_retries(pair_id)
                         self._schedule_checkpoint_pushes(pair_id)
@@ -1089,11 +1103,46 @@ class PairwiseService:
             retired += int(self._retire_outdated_ready_bug_task(task))
         return retired
 
-    def _next_ready_task(self) -> Optional[Dict[str, Any]]:
+    def _retire_overloaded_ready_tasks(self) -> int:
+        """Remove unstarted generated prompts that violate the current scope budget."""
+        retired = 0
+        for task in self.db.all(
+            """SELECT * FROM tasks WHERE source IN ('generated','generated_followup')
+                 AND task_type IN ('zero_to_one','feature') AND status='ready'"""
+        ):
+            try:
+                acceptance = json.loads(task.get("acceptance_json") or "[]")
+            except (TypeError, ValueError):
+                acceptance = []
+            issues = generated_task_prompt_issues(
+                str(task.get("task_type") or ""), str(task.get("prompt") or ""), acceptance,
+            )
+            if not issues:
+                continue
+            reason = "旧版题面范围过载，已停用：" + "；".join(issues)
+            self.db.execute(
+                """UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=?
+                     WHERE id=? AND status='ready'""",
+                (reason[-2000:], now_iso(), task["id"]),
+            )
+            retired += 1
+            self.db.audit("task.overloaded_prompt_retired", "task", task["id"], {
+                "reason": reason,
+            })
+        return retired
+
+    def _next_ready_task(self, task_type: str = "") -> Optional[Dict[str, Any]]:
+        selected_type = str(task_type or "")
+        if not selected_type and bool(self.db.setting("task_generation_zero_to_one_only", True)):
+            selected_type = "zero_to_one"
+        type_clause = " AND task_type=?" if selected_type else ""
+        params: Tuple[Any, ...] = (selected_type,) if selected_type else ()
         tasks = self.db.all(
             """SELECT * FROM tasks WHERE status='ready'
-               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
-               ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 150"""
+               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"""
+            + type_clause
+            + " ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 150",
+            params,
         )
         for task in tasks:
             task_type = str(task.get("task_type") or "")
@@ -1125,6 +1174,8 @@ class PairwiseService:
 
     def _schedule_any_task_source(self) -> bool:
         """Prepare an existing real task source before creating a new 0-1 task."""
+        if bool(self.db.setting("task_generation_zero_to_one_only", True)):
+            return self._schedule_task_source("zero_to_one")
         pending_bug = self.db.one(
             """SELECT id FROM bug_candidates
                WHERE status IN ('reproduced','awaiting_reproduction')
@@ -1216,7 +1267,12 @@ class PairwiseService:
         raise ValueError("未知任务类型：" + task_type)
 
     def _schedule_refill_once(self) -> None:
-        ready = (self.db.one("SELECT COUNT(*) count FROM tasks WHERE status='ready' AND " + ELIGIBLE_TASK_SQL) or {"count": 0})["count"]
+        zero_to_one_only = bool(self.db.setting("task_generation_zero_to_one_only", True))
+        type_clause = " AND task_type='zero_to_one'" if zero_to_one_only else ""
+        ready = (self.db.one(
+            "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND "
+            + ELIGIBLE_TASK_SQL + type_clause
+        ) or {"count": 0})["count"]
         minimum = int(self.db.setting("task_pool_min_ready", 6))
         target = int(self.db.setting("task_pool_target_ready", 12))
         with self._future_lock:
@@ -1228,14 +1284,17 @@ class PairwiseService:
         needed = max(0, target - ready)
         candidates = self.db.all(
             """SELECT id FROM tasks WHERE status='candidate'
-               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))
-               ORDER BY created_at LIMIT ?""",
+               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"""
+            + type_clause + " ORDER BY created_at LIMIT ?",
             (min(capacity, needed),),
         )
         for row in candidates:
             self.validate_task_async(row["id"])
         if needed and capacity and not candidates and not generation_active:
-            self._schedule_any_task_source()
+            if zero_to_one_only:
+                self._schedule_task_source("zero_to_one")
+            else:
+                self._schedule_any_task_source()
 
     def preflight(self) -> Dict[str, Any]:
         return {
@@ -1594,6 +1653,34 @@ class PairwiseService:
                 "reason": reason, "project": self._feature_project_key(task),
             })
             return {"taskId": task_id, "status": "rejected", "result": result}
+        if (task.get("source") in ("generated", "generated_followup")
+                and task.get("task_type") in ("zero_to_one", "feature")):
+            try:
+                acceptance = json.loads(task.get("acceptance_json") or "[]")
+            except (TypeError, ValueError):
+                acceptance = []
+            scope_issues = generated_task_prompt_issues(
+                str(task.get("task_type") or ""), str(task.get("prompt") or ""), acceptance,
+            )
+            if scope_issues:
+                reason = "题面范围或表达未通过本地校验：" + "；".join(scope_issues)
+                result = {
+                    "accepted": False,
+                    "difficulty": task.get("difficulty") or "困难",
+                    "difficultyEvidence": json.loads(task.get("difficulty_evidence_json") or "[]"),
+                    "banned": False,
+                    "duplicate": False,
+                    "baselineReady": task.get("task_type") == "zero_to_one" or bool(
+                        task.get("baseline_path") and task.get("baseline_sha")
+                    ),
+                    "reason": reason,
+                }
+                self.db.execute(
+                    "UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=? WHERE id=?",
+                    (reason[-2000:], now_iso(), task_id),
+                )
+                self.db.audit("task.scope_rejected", "task", task_id, {"issues": scope_issues})
+                return {"taskId": task_id, "status": "rejected", "result": result}
         titles = self._task_duplicate_context(task, exclude_task_id=task_id)
         recent_rejections = self.db.all(
             """SELECT t.title,t.task_type,d.assessed_difficulty,d.reason
@@ -1656,6 +1743,15 @@ class PairwiseService:
                 result = self.codex.run("task_generation", prompt, TASK_SCHEMA)
                 if result.get("taskType") != task_type:
                     rejected += 1
+                    continue
+                scope_issues = generated_task_prompt_issues(
+                    task_type, str(result.get("prompt") or ""), result.get("acceptance"), result,
+                )
+                if scope_issues:
+                    rejected += 1
+                    self.db.audit("task.generated_scope_rejected", "task", "", {
+                        "title": result.get("title", ""), "issues": scope_issues,
+                    })
                     continue
                 duplicate = self._deterministic_task_duplicate(result)
                 if duplicate:
@@ -1745,6 +1841,12 @@ class PairwiseService:
             )
             if result.get("taskType") != "feature" or result.get("difficulty") not in ("困难", "地狱"):
                 last_error = "生成结果不是困难或地狱 Feature"
+                continue
+            scope_issues = generated_task_prompt_issues(
+                "feature", str(result.get("prompt") or ""), result.get("acceptance"), result,
+            )
+            if scope_issues:
+                last_error = "；".join(scope_issues)
                 continue
             duplicate = self._deterministic_task_duplicate(result)
             if duplicate:
@@ -3339,6 +3441,47 @@ class PairwiseService:
         text = str(error or "").casefold()
         return "api error" in text or "litellm" in text
 
+    def _record_pair_development_failure(self, pair_id: str, arm_id: str,
+                                         error: str, failure_kind: str) -> Tuple[int, int, bool]:
+        """Count every failed development run against one Pair-wide budget."""
+        maximum = max(1, int(self.db.setting("development_max_attempts", 2)))
+        stamp = now_iso()
+        with self.db.transaction() as conn:
+            pair = conn.execute(
+                "SELECT status,stage,development_failure_count FROM pairs WHERE id=?",
+                (pair_id,),
+            ).fetchone()
+            if not pair:
+                raise KeyError(pair_id)
+            current = int(pair["development_failure_count"] or 0)
+            if pair["status"] in ("failed", "cancelled") or pair["stage"] in (
+                "task_replacement", "replaced", "replacement_failed",
+            ):
+                return current, maximum, current >= maximum
+            current += 1
+            conn.execute(
+                "UPDATE pairs SET development_failure_count=?,updated_at=? WHERE id=?",
+                (current, stamp, pair_id),
+            )
+            conn.execute(
+                """INSERT INTO audit_events(event_type,entity_type,entity_id,detail_json,created_at)
+                   VALUES('claude.attempt_failed','arm_run',?,?,?)""",
+                (arm_id, json.dumps({
+                    "pair_id": pair_id,
+                    "pair_failure_count": current,
+                    "maximum": maximum,
+                    "failure_kind": failure_kind,
+                    "error": redact(error)[-1000:],
+                    "counts_toward_pair_failure_limit": True,
+                }, ensure_ascii=False), stamp),
+            )
+        return current, maximum, current >= maximum
+
+    def _pair_failure_lock(self, pair_id: str) -> threading.RLock:
+        """Serialize A/B failure decisions so two simultaneous errors count once each."""
+        with self._failure_locks_lock:
+            return self._failure_locks.setdefault(pair_id, threading.RLock())
+
     @staticmethod
     def _api_retry_delay_seconds(error: str, previous_retries: int,
                                  current: Optional[datetime] = None) -> int:
@@ -3364,10 +3507,32 @@ class PairwiseService:
 
     def _queue_api_retry(self, pair_id: str, arm: Dict[str, Any],
                          error: str) -> Dict[str, Any]:
-        """Archive a terminal API error and reserve the Pair for a fresh first turn."""
+        with self._pair_failure_lock(pair_id):
+            return self._queue_api_retry_locked(pair_id, arm, error)
+
+    def _queue_api_retry_locked(self, pair_id: str, arm: Dict[str, Any],
+                                error: str) -> Dict[str, Any]:
+        """Archive an API error, or replace the Pair after its second failure."""
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
         if arm.get("status") == "waiting_api_retry":
             return arm
+        failure_count, maximum, exhausted = self._record_pair_development_failure(
+            pair_id, arm["id"], error, "api_error",
+        )
+        if exhausted:
+            archived = self.claude.archive_failed_attempt(
+                arm, error, prepare_retry=False,
+                count_development_failure=False, count_error_retry=False,
+            )
+            label = "项目累计 %d 次失败（包含 API 错误）" % maximum
+            self.db.audit("claude.api_retry_exhausted", "arm_run", arm["id"], {
+                "pair_id": pair_id, "pair_failure_count": failure_count,
+                "maximum": maximum, "error": redact(error)[-1000:],
+            })
+            self._retire_after_peer_finishes(
+                pair_id, arm["id"], error, label,
+            )
+            return archived
         previous_retries = int(arm.get("api_retry_count") or 0)
         delay = self._api_retry_delay_seconds(error, previous_retries)
         retry_after = datetime.now(timezone.utc) + timedelta(seconds=delay)
@@ -3396,11 +3561,13 @@ class PairwiseService:
             )
         self.db.audit("claude.api_retry_queued", "arm_run", arm["id"], {
             "pair_id": pair_id, "retry_number": previous_retries + 1,
+            "pair_failure_count": failure_count, "maximum": maximum,
             "retry_after": retry_after.isoformat(timespec="seconds"),
             "cooldown_seconds": delay, "error": redact(error)[-1000:],
             "prompt_mode": "fresh_session_same_original_prompt_once",
             "counts_toward_development_attempts": False,
             "counts_toward_error_retries": False,
+            "counts_toward_pair_failure_limit": True,
         })
         return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or prepared
 
@@ -3540,7 +3707,7 @@ class PairwiseService:
         """Repair a real artifact defect without discarding delivered code."""
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
         attempt = max(1, int(arm.get("attempt_no") or 1))
-        maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
+        maximum = max(1, int(self.db.setting("development_max_attempts", 2)))
         if attempt >= maximum:
             archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
             self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error)
@@ -3579,32 +3746,35 @@ class PairwiseService:
 
     def _handle_attempt_failure(self, pair_id: str, arm: Dict[str, Any], prompt: str,
                                 error: str, early_replace: bool = False) -> Dict[str, Any]:
+        with self._pair_failure_lock(pair_id):
+            return self._handle_attempt_failure_locked(
+                pair_id, arm, prompt, error, early_replace,
+            )
+
+    def _handle_attempt_failure_locked(self, pair_id: str, arm: Dict[str, Any], prompt: str,
+                                       error: str, early_replace: bool = False) -> Dict[str, Any]:
         """Retry every failed development attempt in a new session.
 
-        The initial run counts as attempt one. After the third failed attempt the
-        whole Pair is retired and a different ready task is started automatically.
+        A/B share one failure budget. The second failure stops that Arm; an
+        active peer keeps its own development window before the Pair is replaced.
+        API failures use the same budget.
         """
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
         attempt = max(1, int(arm.get("attempt_no") or 1))
-        maximum = max(1, int(self.db.setting("development_max_attempts", 3)))
         if self._is_claude_api_error(error):
             return self._queue_api_retry(pair_id, arm, error)
+        failure_count, maximum, exhausted = self._record_pair_development_failure(
+            pair_id, arm["id"], error, "development_error",
+        )
         count_development_failure = True
         count_error_retry = True
-        self.db.audit("claude.attempt_failed", "arm_run", arm["id"], {
-            "attempt": attempt, "maximum": maximum, "error": redact(error)[-1000:],
-            "action": "replace_task" if early_replace or attempt >= maximum else "fresh_session_from_baseline",
-            "early_replace": early_replace,
-            "counts_toward_development_attempts": count_development_failure,
-            "counts_toward_error_retries": count_error_retry,
-        })
-        if early_replace or (count_development_failure and attempt >= maximum):
+        if early_replace or exhausted:
             archived = self.claude.archive_failed_attempt(arm, error, prepare_retry=False)
             label = (
                 "同一侧连续 2 次出现相同无代码轨迹，已提前换题"
-                if early_replace else "开发连续 %d 次失败" % maximum
+                if early_replace else "项目累计 %d 次开发失败" % maximum
             )
-            self._retire_pair_and_schedule_replacement(pair_id, arm["id"], error, label)
+            self._retire_after_peer_finishes(pair_id, arm["id"], error, label)
             return archived
         try:
             return self._restart_arm_from_baseline(
@@ -3619,9 +3789,76 @@ class PairwiseService:
                 "第 %d 次失败后启动全新 Session 仍失败：%s" % (attempt, redact(str(exc))),
             )
 
+    def _retire_after_peer_finishes(self, pair_id: str, failed_arm_id: str,
+                                    error: str, retire_label: str) -> bool:
+        """Stop only the exhausted Arm and let its peer finish its own window."""
+        peer = self.db.one(
+            "SELECT id,arm,status FROM arm_runs WHERE pair_id=? AND id<>? ORDER BY arm LIMIT 1",
+            (pair_id, failed_arm_id),
+        ) or {}
+        active_statuses = {
+            "queued", "running", "developing", "waiting_retry", "waiting_api_retry",
+            "checkpointing", "exported",
+        }
+        if peer.get("status") in active_statuses:
+            stamp = now_iso()
+            message = (
+                "%s；失败侧已停止，%s 侧继续运行，并按自身题面发送时间执行 60 分钟无业务代码规则"
+                % (retire_label, peer.get("arm") or "另一")
+            )
+            self.db.execute(
+                """UPDATE pairs SET status='running',stage='development',error=?,updated_at=?
+                     WHERE id=?""",
+                ((message + "：" + redact(error))[-3000:], stamp, pair_id),
+            )
+            self.db.audit("pair.failure_limit_waiting_for_peer", "pair", pair_id, {
+                "failed_arm_id": failed_arm_id,
+                "continuing_arm_id": peer.get("id") or "",
+                "continuing_arm": peer.get("arm") or "",
+                "continuing_status": peer.get("status") or "",
+                "no_code_timeout_minutes": int(self.db.setting("first_prompt_stop_minutes", 60)),
+                "retire_label": retire_label,
+                "reason": redact(error)[-1000:],
+            })
+            return False
+        self._retire_pair_and_schedule_replacement(
+            pair_id, failed_arm_id, error, retire_label,
+        )
+        return True
+
+    def _finish_exhausted_pair_after_peer(self, pair_id: str) -> bool:
+        """Replace an exhausted Pair only after the other Arm is no longer active."""
+        pair = self.db.one(
+            "SELECT status,stage,development_failure_count,error FROM pairs WHERE id=?",
+            (pair_id,),
+        ) or {}
+        maximum = max(1, int(self.db.setting("development_max_attempts", 2)))
+        if (pair.get("stage") != "development"
+                or int(pair.get("development_failure_count") or 0) < maximum):
+            return False
+        arms = self.db.all("SELECT id,arm,status,error FROM arm_runs WHERE pair_id=?", (pair_id,))
+        failed = next((arm for arm in arms if arm.get("status") == "failed"), None)
+        if not failed:
+            return False
+        active_statuses = {
+            "queued", "running", "developing", "waiting_retry", "waiting_api_retry",
+            "checkpointing", "exported",
+        }
+        if any(
+            arm.get("id") != failed.get("id") and arm.get("status") in active_statuses
+            for arm in arms
+        ):
+            return False
+        error = str(failed.get("error") or pair.get("error") or "项目已达到开发失败上限")
+        self._retire_pair_and_schedule_replacement(
+            pair_id, str(failed["id"]), error,
+            "项目累计 %d 次失败，另一侧已结束" % maximum,
+        )
+        return True
+
     def _retire_pair_and_schedule_replacement(self, pair_id: str, failed_arm_id: str,
                                               error: str,
-                                              retire_label: str = "开发连续 3 次失败") -> None:
+                                              retire_label: str = "项目累计 2 次开发失败") -> None:
         stamp = now_iso()
         with self.db.transaction() as conn:
             pair = conn.execute("SELECT status,stage FROM pairs WHERE id=?", (pair_id,)).fetchone()
@@ -3638,10 +3875,15 @@ class PairwiseService:
             )
         self._invalidate_recordings(pair_id, reason="当前 Pair 已换题：" + error)
         for other in self.db.all("SELECT * FROM arm_runs WHERE pair_id=? AND id<>?", (pair_id, failed_arm_id)):
-            if other["status"] in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
+            if other["status"] == "waiting_api_retry":
+                self.db.execute(
+                    "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
+                    ("同一 Pair 已达到失败上限并换题", stamp, stamp, other["id"]),
+                )
+            elif other["status"] in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
                 try:
                     self.claude.archive_failed_attempt(
-                        other, "同一 Pair 的另一侧连续 3 次失败，当前 Pair 已换题", prepare_retry=False,
+                        other, "同一 Pair 已累计 2 次失败，当前 Pair 已换题", prepare_retry=False,
                     )
                 except Exception as exc:
                     self.db.audit("claude.peer_retire_failed", "arm_run", other["id"], {
@@ -3655,7 +3897,7 @@ class PairwiseService:
 
     def _start_replacement_pair(self, retired_pair_id: str) -> Dict[str, Any]:
         try:
-            candidate = self._next_ready_task()
+            candidate = self._next_ready_task("zero_to_one")
             if not candidate:
                 self._schedule_refill_once()
                 self.db.execute(
@@ -3839,7 +4081,7 @@ class PairwiseService:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
-            if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 40)) * 60 and not has_code:
+            if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 60)) * 60 and not has_code:
                 signature = str(state.get("activity_signature") or "")
                 attempt = max(1, int(arm.get("attempt_no") or 1))
                 previous = self.db.one(
@@ -3971,7 +4213,23 @@ class PairwiseService:
                 return
             statuses = {arm["status"] for arm in arms}
             if "failed" in statuses:
-                self.db.execute("UPDATE pairs SET status='failed',stage='development_failed',error='A/B 至少一侧开发失败',updated_at=? WHERE id=?", (now_iso(), pair_id))
+                if self._finish_exhausted_pair_after_peer(pair_id):
+                    return
+                pair_state = self.db.one(
+                    "SELECT development_failure_count FROM pairs WHERE id=?", (pair_id,),
+                ) or {}
+                maximum = max(1, int(self.db.setting("development_max_attempts", 2)))
+                if int(pair_state.get("development_failure_count") or 0) >= maximum:
+                    self.db.execute(
+                        "UPDATE pairs SET status='running',stage='development',updated_at=? WHERE id=?",
+                        (now_iso(), pair_id),
+                    )
+                    return
+                self.db.execute(
+                    """UPDATE pairs SET status='failed',stage='development_failed',
+                       error='A/B 至少一侧开发失败',updated_at=? WHERE id=?""",
+                    (now_iso(), pair_id),
+                )
                 return
             if "waiting_api_retry" in statuses and statuses <= {"completed", "waiting_api_retry"}:
                 self.db.execute(
