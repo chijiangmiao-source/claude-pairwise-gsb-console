@@ -545,7 +545,7 @@ class PairwiseService:
             return True
 
     def _schedule_auto_pipeline_once(self) -> Dict[str, Any]:
-        """Advance every active Pair and refill empty Pair slots up to four."""
+        """Advance every active Pair and refill to the configured Pair target."""
         if not self._automation_lock.acquire(blocking=False):
             return self.automation_status()
         try:
@@ -594,11 +594,13 @@ class PairwiseService:
             active_count = int((self.db.one(
                 "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
             ) or {"count": 0})["count"])
-            while active_count < MAX_PAIR_PROJECTS and self._resume_one_lineage_repair():
+            configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
+            pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured))
+            while active_count < pair_limit and self._resume_one_lineage_repair():
                 active_count += 1
-            if active_count < MAX_PAIR_PROJECTS and self._resume_one_reusable_pair():
+            if active_count < pair_limit and self._resume_one_reusable_pair():
                 active_count += 1
-            while active_count < MAX_PAIR_PROJECTS:
+            while active_count < pair_limit:
                 task = self._next_ready_task()
                 if not task:
                     break
@@ -608,7 +610,7 @@ class PairwiseService:
 
             # Existing approved questions are consumed first. Refill begins
             # only when no additional approved question can fill the target.
-            if active_count < MAX_PAIR_PROJECTS:
+            if active_count < pair_limit:
                 self._schedule_refill_once()
             return self.automation_status()
         finally:
