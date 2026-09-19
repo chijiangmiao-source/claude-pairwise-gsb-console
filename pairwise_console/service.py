@@ -2427,6 +2427,11 @@ class PairwiseService:
             # underlying file suffix.
             r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b",
             r"\b(?:docker\s+compose|pytest|npm\s+(?:test|run)|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|python3?\s+|curl\s+|git\s+)[^，。；]*",
+            # Natural public wording can identify a concrete verification
+            # without exposing an internal path or a literal shell command.
+            # These named tools/protocols plus an observed outcome are still
+            # reviewable evidence, e.g. “Docker 验收通过” or “Range 返回 206”.
+            r"(?:Docker|Compose|Playwright|Vitest|pytest|Go\s*测试|Range|浏览器|接口)[^。；]{0,100}(?:验收|测试|通过|返回|状态|报错|错误|失败|一致|正确)",
             r"\b(?:[1-5]\d\d|[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\b",
             r"(?:函数|方法|接口)\s*[A-Za-z_][A-Za-z0-9_]*",
             r"(?:报错|错误|冲突|失败)",
