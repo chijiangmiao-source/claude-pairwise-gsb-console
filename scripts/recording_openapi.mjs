@@ -3,6 +3,32 @@ export function resolveSchema(schema, spec) {
   return schema.$ref.slice(2).split("/").reduce((value, key) => value?.[key], spec) || {};
 }
 
+export function rankOpenApiOperations(spec) {
+  const methods = ["post", "put", "patch", "get"];
+  const candidates = [];
+  for (const [path, definition] of Object.entries(spec.paths || {})) {
+    if (/health|ready|live/i.test(path)) continue;
+    for (const method of methods) {
+      const operation = definition?.[method];
+      if (!operation) continue;
+      const content = operation.requestBody?.content?.["application/json"];
+      const schema = resolveSchema(content?.schema, spec);
+      const required = schema.required || [];
+      const dependencyFields = required.filter((name) =>
+        /(?:^|_)(?:id|key|token|reference)$|idempotency/i.test(name));
+      const pathParameters = (path.match(/{[^}]+}/g) || []).length;
+      const score = (content ? 100 : 0)
+        + (method === "post" ? 20 : 0)
+        + (pathParameters === 0 ? 60 : 0)
+        - (dependencyFields.length * 35)
+        - (pathParameters * 50)
+        - path.length;
+      candidates.push({ path, method, operation, content, spec, score });
+    }
+  }
+  return candidates.sort((left, right) => right.score - left.score);
+}
+
 function stringSample(schema, fieldName) {
   const name = fieldName.toLowerCase();
   if (/sha|digest|checksum|hash/.test(name)) return "0".repeat(64);

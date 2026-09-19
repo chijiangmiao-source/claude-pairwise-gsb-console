@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { automaticFinishDelayMs, finalizeInteractionEvidence } from "./recording_timing.mjs";
-import { sampleValue } from "./recording_openapi.mjs";
+import { rankOpenApiOperations, sampleValue } from "./recording_openapi.mjs";
 
 const [url, outputPath, profileDir, maximumRaw = "88", stopFile = `${outputPath}.stop`, interactionMode = "auto"] = process.argv.slice(2);
 if (!url || !outputPath || !profileDir) {
@@ -58,34 +58,23 @@ async function moveAndClick(page, locator) {
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 }
 
-async function selectSwaggerOperation(page) {
+async function selectSwaggerOperations(page) {
   const spec = await page.evaluate(async () => {
     const response = await fetch("/openapi.json");
     if (!response.ok) throw new Error(`OpenAPI ${response.status}`);
     return response.json();
   });
-  const methods = ["post", "put", "patch", "get"];
-  const candidates = [];
-  for (const [path, definition] of Object.entries(spec.paths || {})) {
-    if (/health|ready|live/i.test(path)) continue;
-    for (const method of methods) {
-      const operation = definition?.[method];
-      if (!operation) continue;
-      const content = operation.requestBody?.content?.["application/json"];
-      candidates.push({ path, method, operation, content, spec });
-    }
-  }
-  candidates.sort((left, right) => {
-    const leftScore = (left.content ? 100 : 0) + (left.method === "post" ? 20 : 0) - left.path.length;
-    const rightScore = (right.content ? 100 : 0) + (right.method === "post" ? 20 : 0) - right.path.length;
-    return rightScore - leftScore;
-  });
+  const candidates = rankOpenApiOperations(spec);
   if (!candidates.length) throw new Error("没有可演示的业务接口");
-  const selected = candidates[0];
-  const body = selected.content
-    ? (selected.content.example ?? selected.content.examples?.default?.value ?? sampleValue(selected.content.schema, spec))
-    : (["post", "put", "patch"].includes(selected.method) ? fallbackBodyForPath(selected.path) : null);
-  return { path: selected.path, method: selected.method, body, declaredBody: Boolean(selected.content) };
+  return candidates.map((selected) => ({
+    path: selected.path,
+    method: selected.method,
+    body: selected.content
+      ? (selected.content.example ?? selected.content.examples?.default?.value
+        ?? sampleValue(selected.content.schema, spec))
+      : (["post", "put", "patch"].includes(selected.method) ? fallbackBodyForPath(selected.path) : null),
+    declaredBody: Boolean(selected.content),
+  }));
 }
 
 async function findSwaggerBlock(page, selected) {
@@ -102,7 +91,17 @@ async function findSwaggerBlock(page, selected) {
 async function demonstrateSwaggerWorkflow(page) {
   if (!new URL(page.url()).pathname.startsWith("/docs")) return { required: false, ok: true };
   await page.waitForTimeout(3000);
-  const selected = await selectSwaggerOperation(page);
+  const candidates = await selectSwaggerOperations(page);
+  let lastResult = { required: true, ok: false, error: "没有成功的业务接口请求" };
+  for (const selected of candidates.slice(0, 4)) {
+    lastResult = await demonstrateSwaggerOperation(page, selected);
+    if (lastResult.ok) return lastResult;
+    await page.waitForTimeout(1200);
+  }
+  return lastResult;
+}
+
+async function demonstrateSwaggerOperation(page, selected) {
   const block = await findSwaggerBlock(page, selected);
   if (!(await block.getAttribute("class") || "").includes("is-open")) {
     await moveAndClick(page, block.locator(".opblock-summary").first());

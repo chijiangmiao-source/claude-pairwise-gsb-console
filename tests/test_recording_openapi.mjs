@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sampleValue } from "../scripts/recording_openapi.mjs";
+import { rankOpenApiOperations, sampleValue } from "../scripts/recording_openapi.mjs";
 
 test("builds a valid non-degenerate polygon sample from an OpenAPI reference", () => {
   const spec = {
@@ -38,4 +38,25 @@ test("builds distinct coordinates for required paths", () => {
 test("uses a stable future date for expiring resources", () => {
   assert.equal(sampleValue({ type: "string", format: "date-time" }, {}, 0, "expires_at"),
     "2099-01-01T00:00:00Z");
+});
+
+test("prefers a root create operation without unresolved identifier dependencies", () => {
+  const spec = {
+    paths: {
+      "/runs": { post: { requestBody: { content: { "application/json": {
+        schema: { $ref: "#/components/schemas/CreateRun" },
+      } } } } },
+      "/pipelines": { post: { requestBody: { content: { "application/json": {
+        schema: { $ref: "#/components/schemas/CreatePipeline" },
+      } } } } },
+    },
+    components: { schemas: {
+      CreateRun: {
+        type: "object", required: ["pipeline_id", "seal_id", "idempotency_key"],
+        properties: { pipeline_id: { type: "string" }, seal_id: { type: "string" }, idempotency_key: { type: "string" } },
+      },
+      CreatePipeline: { type: "object", properties: { name: { type: "string" } } },
+    } },
+  };
+  assert.equal(rankOpenApiOperations(spec)[0].path, "/pipelines");
 });
