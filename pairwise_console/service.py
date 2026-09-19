@@ -54,6 +54,8 @@ GSB_STEP_REFERENCE = re.compile(
 )
 ELIGIBLE_TASK_SQL = "(difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"
 MAX_FEATURE_TASKS_PER_PROJECT = 3
+PROJECT_CATEGORY_ORDER = ("全栈", "纯前端", "纯后端")
+PROJECT_CATEGORY_DEFAULT_WEIGHTS = {"纯后端": 15, "纯前端": 40, "全栈": 45}
 A9_REJECTED_PROMPT_FRAGMENTS = (
     "请修复该问题保留现有dockercompose启动与验收链路并补充覆盖复现路径的自动化验收",
 )
@@ -147,6 +149,9 @@ class PairwiseService:
             "auto_refill_enabled": True,
             "auto_refill_interval_seconds": 60,
             "task_generation_zero_to_one_only": True,
+            "task_category_weight_backend": PROJECT_CATEGORY_DEFAULT_WEIGHTS["纯后端"],
+            "task_category_weight_frontend": PROJECT_CATEGORY_DEFAULT_WEIGHTS["纯前端"],
+            "task_category_weight_fullstack": PROJECT_CATEGORY_DEFAULT_WEIGHTS["全栈"],
             "auto_pipeline_enabled": False,
             "git_author_name": self.config.git_author_name,
             "git_author_email": self.config.git_author_email,
@@ -1195,6 +1200,13 @@ class PairwiseService:
             + " ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 150",
             params,
         )
+        preferred_category = self._preferred_generation_project_category()
+        tasks.sort(key=lambda task: (
+            normalize_project_category(task.get("project_category")) != preferred_category,
+            task.get("source") == "legacy",
+            str(task.get("created_at") or ""),
+            str(task.get("id") or ""),
+        ))
         for task in tasks:
             task_type = str(task.get("task_type") or "")
             if self._retire_outdated_ready_bug_task(task):
@@ -1222,6 +1234,42 @@ class PairwiseService:
                 "reason": duplicate, "task_type": task_type,
             })
         return None
+
+    def _project_category_weights(self) -> Dict[str, int]:
+        keys = {
+            "纯后端": "task_category_weight_backend",
+            "纯前端": "task_category_weight_frontend",
+            "全栈": "task_category_weight_fullstack",
+        }
+        weights = {
+            category: max(0, int(self.db.setting(key, PROJECT_CATEGORY_DEFAULT_WEIGHTS[category])))
+            for category, key in keys.items()
+        }
+        return weights if sum(weights.values()) else dict(PROJECT_CATEGORY_DEFAULT_WEIGHTS)
+
+    def _preferred_generation_project_category(self) -> str:
+        """Choose the most underrepresented recent 0-1 project shape."""
+        rows = self.db.all(
+            """SELECT project_category FROM tasks
+                 WHERE source='generated' AND task_type='zero_to_one' AND status<>'rejected'
+                 ORDER BY created_at DESC,id DESC LIMIT 40"""
+        )
+        counts = {category: 0 for category in PROJECT_CATEGORY_ORDER}
+        for row in rows:
+            category = normalize_project_category(row.get("project_category"))
+            if category in counts:
+                counts[category] += 1
+        weights = self._project_category_weights()
+        total_weight = max(1, sum(weights.values()))
+        projected_total = len(rows) + 1
+        return max(
+            PROJECT_CATEGORY_ORDER,
+            key=lambda category: (
+                weights[category] * projected_total / total_weight - counts[category],
+                weights[category],
+                -PROJECT_CATEGORY_ORDER.index(category),
+            ),
+        )
 
     def _schedule_any_task_source(self) -> bool:
         """Prepare an existing real task source before creating a new 0-1 task."""
@@ -1790,10 +1838,26 @@ class PairwiseService:
         try:
             for _ in range(count):
                 existing = self._task_generation_context()
-                prompt = task_generation_prompt(json.dumps(existing, ensure_ascii=False), task_type)
+                desired_category = (
+                    self._preferred_generation_project_category()
+                    if task_type == "zero_to_one" else ""
+                )
+                prompt = task_generation_prompt(
+                    json.dumps(existing, ensure_ascii=False), task_type, desired_category,
+                )
                 result = self.codex.run("task_generation", prompt, TASK_SCHEMA)
                 if result.get("taskType") != task_type:
                     rejected += 1
+                    continue
+                actual_category = normalize_project_category(
+                    result.get("projectCategory"), result.get("stack"), result.get("prompt"),
+                )
+                if desired_category and actual_category != desired_category:
+                    rejected += 1
+                    self.db.audit("task.generated_category_rejected", "task", "", {
+                        "title": result.get("title", ""), "expected": desired_category,
+                        "actual": actual_category,
+                    })
                     continue
                 scope_issues = generated_task_prompt_issues(
                     task_type, str(result.get("prompt") or ""), result.get("acceptance"), result,
@@ -1822,7 +1886,7 @@ class PairwiseService:
                        difficulty_evidence_json,fingerprint,status,created_at,updated_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (task_id, "generated", result["taskType"], result["title"], result["prompt"], normalize_stack(result["stack"]),
-                     normalize_project_category(result.get("projectCategory"), result["stack"], result["prompt"]),
+                     actual_category,
                      json.dumps(result["acceptance"], ensure_ascii=False), result["difficulty"],
                      json.dumps(result["difficultyEvidence"], ensure_ascii=False), key, "candidate", stamp, stamp),
                 )

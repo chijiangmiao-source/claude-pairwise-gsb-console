@@ -224,6 +224,19 @@ class Handler(BaseHTTPRequestHandler):
                     prompt_stagger = int(body["ab_prompt_stagger_seconds"])
                     if prompt_stagger < 0 or prompt_stagger > 300:
                         raise ValueError("A/B 题面发送间隔只能设置为 0–300 秒")
+                weight_keys = (
+                    "task_category_weight_backend", "task_category_weight_frontend",
+                    "task_category_weight_fullstack",
+                )
+                if any(key in body for key in weight_keys):
+                    current = {
+                        key: int(body.get(key, self.app.db.setting(key, 0)))
+                        for key in weight_keys
+                    }
+                    if any(value < 0 or value > 100 for value in current.values()):
+                        raise ValueError("项目形态权重只能设置为 0–100")
+                    if sum(current.values()) <= 0:
+                        raise ValueError("项目形态权重至少有一项大于 0")
                 for key, value in body.items():
                     self.app.db.set_setting(str(key), value)
                 self.app.db.audit("settings.updated", "settings", "", {"keys": list(body)})

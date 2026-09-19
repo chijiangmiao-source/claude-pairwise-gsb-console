@@ -124,6 +124,17 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("至少两个相互制约", generated)
         self.assertNotIn("至少两个当前不存在", feature)
 
+    def test_task_generation_can_pin_project_category(self):
+        generated = task_generation_prompt("known", "zero_to_one", "纯前端")
+        self.assertIn("本次项目形态固定为纯前端", generated)
+        self.assertIn("不得创建业务后端", generated)
+
+    def test_project_category_mix_prioritizes_frontend_and_fullstack(self):
+        self.db.set_setting("task_category_weight_backend", 15)
+        self.db.set_setting("task_category_weight_frontend", 40)
+        self.db.set_setting("task_category_weight_fullstack", 45)
+        self.assertEqual(self.service._preferred_generation_project_category(), "全栈")
+
     def test_generated_task_scope_budget_rejects_cluttered_prompt(self):
         prompt = "甲" * 150 + "；" + "乙" * 150 + "；丙；丁。"
         issues = generated_task_prompt_issues(
