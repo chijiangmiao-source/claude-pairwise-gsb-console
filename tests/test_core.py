@@ -142,7 +142,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(any("分号最多" in issue for issue in issues))
 
     def test_generated_task_scope_budget_accepts_old_system_shape(self):
-        prompt = "".join(("甲" * 62 + "。") for _ in range(5))
+        prompt = "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供名为 verify 的可执行验收服务。" + "".join(("甲" * 60 + "。") for _ in range(4))
         issues = generated_task_prompt_issues(
             "zero_to_one", prompt, ["a", "b", "c"], {
                 "engineeringCore": "跨层状态裁决",
@@ -154,6 +154,16 @@ class CoreTests(unittest.TestCase):
                 "newStateSets": ["处理状态"],
             },
         )
+        self.assertEqual(issues, [])
+
+    def test_generated_zero_to_one_requires_named_verify_service(self):
+        prompt = "".join(("甲" * 62 + "。") for _ in range(5))
+        issues = generated_task_prompt_issues("zero_to_one", prompt, ["a", "b", "c"])
+        self.assertTrue(any("verify" in issue for issue in issues))
+
+    def test_generated_feature_does_not_repeat_existing_verify_requirement(self):
+        prompt = "".join(("甲" * 62 + "。") for _ in range(5))
+        issues = generated_task_prompt_issues("feature", prompt, ["a", "b", "c"])
         self.assertEqual(issues, [])
 
     def test_task_duplicate_guard_checks_full_local_history(self):

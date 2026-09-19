@@ -75,6 +75,12 @@ def generated_task_prompt_issues(task_type: str, prompt: str,
     marker = next((item for item in TASK_PROMPT_AI_STYLE_MARKERS if item in cleaned), "")
     if marker:
         issues.append(f"题面包含模板化表达：{marker}")
+    if task_type == "zero_to_one" and not re.search(
+        r"(?:名为|名称为|叫作|叫做)?\s*`?verify`?[^。！？]{0,16}(?:服务|验收)",
+        cleaned,
+        re.IGNORECASE,
+    ):
+        issues.append("0–1 题面必须明确要求 Compose 中提供名为 verify 的可执行验收服务")
 
     scenarios = acceptance if isinstance(acceptance, list) else []
     acceptance_max = FEATURE_MAX_ACCEPTANCE if task_type == "feature" else ZERO_TO_ONE_MAX_ACCEPTANCE
@@ -179,7 +185,7 @@ def task_generation_prompt(existing: str, task_type: str = "zero_to_one") -> str
 
 prompt 目标约 450 字，生成时控制在 300 至 520 字，写成四至六个完整中文句子，单句不超过 120 字，分号不超过两个；本地只为轻微偏差保留 300 至 600 字的硬边界。按业务背景、用户操作、关键约束、失败反馈和可观察验收的因果顺序自然展开，不加标题、列表或“需求如下”，不把数据库、接口、页面、测试数量和交付要求机械拼成一串。acceptance 只列三至六个可独立操作并观察结果的场景，同一次操作产生同一结果的校验要合并。projectCategory 必须明确选择纯后端、纯前端或全栈；纯后端不得创建前端，纯前端不得创建业务后端，全栈必须通过真实 API 联调。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如 Python 3.13, FastAPI 或 TypeScript, React。
 
-题面从空仓库起步，并在正文中用一句话自然交代 Dockerfile、Docker Compose、健康检查和可配置宿主机端口；不要在结尾堆 README、测试、.gitignore 等通用清单。只固定会改变核心验收结果的业务规则，字段命名、页面布局和内部实现留给开发者。内部范围字段只供系统校验，必须如实填写，不能写进 prompt。
+题面从空仓库起步，并在正文中用一句话自然交代 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，以及 Compose 中名为 verify 的可执行验收服务；不要在结尾堆 README、测试、.gitignore 等通用清单。只固定会改变核心验收结果的业务规则，字段命名、页面布局和内部实现留给开发者。内部范围字段只供系统校验，必须如实填写，不能写进 prompt。
 
 已有题目标题与摘要，必须避免核心问题、机制和验收链路雷同；换行业背景或改写措辞不能算新题：
 {existing or '无'}
