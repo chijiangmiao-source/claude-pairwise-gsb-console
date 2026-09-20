@@ -1935,13 +1935,62 @@ class CoreTests(unittest.TestCase):
              patch.object(self.service.claude, "wait_until_ready"), \
              patch.object(self.service.claude, "materialize_repository") as materialize, \
              patch.object(self.service, "_send_prompt_with_pair_stagger"), \
-             patch.object(self.service, "_monitor_arm", return_value={"status": "completed"}):
+             patch.object(self.service, "_submit_monitor") as submit:
             result = self.service._recover_pending_retry(
                 pair["id"], "arm-retry-A", "Build a hard project with Docker Compose"
             )
         prepare.assert_called_once_with(pair["id"], "A", delivered)
         self.assertEqual(materialize.call_args.args[2], delivered)
-        self.assertEqual(result, {"status": "completed"})
+        submit.assert_called_once_with(
+            "monitor-arm-retry-A", self.service._monitor_arm,
+            pair["id"], "arm-retry-A", "Build a hard project with Docker Compose",
+        )
+        self.assertEqual(result["id"], "arm-retry-A")
+
+    def test_api_retry_clears_disposable_workspace_before_launch(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='waiting_api_retry',stage='development' WHERE id=?", (pair["id"],),
+        )
+        workspace = self.root / "api-retry-workspace"
+        workspace.mkdir()
+        (workspace / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,api_retry_count,api_retry_after,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'waiting_api_retry',NULL,1,?,?,?)""",
+            ("arm-api-clean", pair["id"], "A", "A", str(workspace),
+             "container-api-clean", "screen-api-clean", "auto_model/urm", "image",
+             "2000-01-01T00:00:00+00:00", stamp, stamp),
+        )
+        canonical = self.root / "canonical-A"
+        canonical.mkdir()
+        order = []
+
+        def reset(_arm):
+            order.append("reset")
+            for item in workspace.iterdir():
+                item.unlink()
+            self.db.execute(
+                "UPDATE arm_runs SET status='queued' WHERE id='arm-api-clean'"
+            )
+
+        with patch.object(self.service.claude, "reset_unsent_arm", side_effect=reset) as reset_mock, \
+             patch.object(self.service, "_reserve_terminal_slot", side_effect=lambda *_a, **_k: order.append("reserve") or True), \
+             patch.object(self.service.git, "reset_arm_to_baseline", return_value=canonical), \
+             patch.object(self.service.claude, "launch", side_effect=lambda _arm: order.append("launch")), \
+             patch.object(self.service.claude, "wait_until_ready"), \
+             patch.object(self.service.claude, "materialize_repository"), \
+             patch.object(self.service, "_send_prompt_with_pair_stagger"), \
+             patch.object(self.service, "_submit_monitor", return_value=True):
+            self.service._recover_api_retry(
+                pair["id"], "arm-api-clean", "Build a hard project with Docker Compose",
+            )
+        reset_mock.assert_called_once()
+        self.assertEqual(order[:3], ["reset", "reserve", "launch"])
+        self.assertEqual(list(workspace.iterdir()), [])
 
     def test_artifact_retry_compares_new_work_with_delivered_commit(self):
         self.insert_ready_task()

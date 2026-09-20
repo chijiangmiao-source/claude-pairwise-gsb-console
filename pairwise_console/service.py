@@ -386,7 +386,11 @@ class PairwiseService:
         if not arm:
             return {}
         if arm.get("prompt_sent_at"):
-            return self._monitor_arm(pair_id, arm_id, prompt)
+            self._submit_monitor(
+                "monitor-" + arm_id, self._monitor_arm,
+                pair_id, arm_id, prompt,
+            )
+            return arm
         pair = self._pair(pair_id)
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
         canonical = Path(str(repo.get("local_root") or "")) / str(arm["arm"])
@@ -416,7 +420,14 @@ class PairwiseService:
                 "attempt": int(arm.get("attempt_no") or 1),
                 "prompt_mode": "same_original_prompt_once",
             })
-            return self._monitor_arm(pair_id, arm_id, prompt)
+            # Hand monitoring to its canonical operation id. Running the
+            # monitor inline here allowed the scheduler to attach a second
+            # worker to the same live session.
+            self._submit_monitor(
+                "monitor-" + arm_id, self._monitor_arm,
+                pair_id, arm_id, prompt,
+            )
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
         except Exception as exc:
             failure = "恢复全新 Session 失败：%s" % redact(str(exc))
             current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
@@ -865,12 +876,16 @@ class PairwiseService:
         row = self.db.one(
             """SELECT a.id arm_id,a.pair_id,a.status,p.status pair_status,t.prompt,
                       COALESCE((
-                        SELECT MIN(e.created_at) FROM audit_events e
+                        SELECT MAX(e.created_at) FROM audit_events e
                          WHERE e.entity_id=a.id AND e.event_type IN (
-                           'claude.api_retry_queued','claude.terminal_slot_waiting',
-                           'claude.retry_waiting_terminal_slot',
+                           'claude.api_retry_queued','claude.retry_waiting_terminal_slot',
+                           'claude.manual_single_arm_retry_queued',
                            'claude.false_monitor_failure_requeued'
                          )
+                      ),(
+                        SELECT MIN(e.created_at) FROM audit_events e
+                         WHERE e.entity_id=a.id
+                           AND e.event_type='claude.terminal_slot_waiting'
                       ),a.updated_at) queued_at
                  FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
                  JOIN tasks t ON t.id=p.task_id
@@ -3856,6 +3871,12 @@ class PairwiseService:
         pair = self._pair(pair_id)
         retry_number = int(arm.get("api_retry_count") or 1)
         try:
+            # A failed or manually queued API attempt can leave .gitignore or
+            # other launch debris in its disposable mount. Claude requires an
+            # empty first-start workspace before the canonical branch is
+            # materialized.
+            self.claude.reset_unsent_arm(arm)
+            arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             if not self._reserve_terminal_slot(arm_id, waiting_status="waiting_api_retry"):
                 return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             canonical = self.git.reset_arm_to_baseline(pair_id, str(arm["arm"]))
