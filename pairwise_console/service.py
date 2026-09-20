@@ -102,6 +102,9 @@ class PairwiseService:
         self._repository_locks: Dict[str, threading.Lock] = {}
         self._start_locks_lock = threading.Lock()
         self._start_locks: Dict[str, threading.Lock] = {}
+        # Pair capacity and terminal capacity are separate. Two Pair projects
+        # may stay active while only three Claude terminals run at once.
+        self._terminal_capacity_lock = threading.Lock()
         self._prompt_locks_lock = threading.Lock()
         self._prompt_locks: Dict[str, threading.Lock] = {}
         self._failure_locks_lock = threading.Lock()
@@ -142,6 +145,7 @@ class PairwiseService:
             "claude_model": self.config.claude_model,
             "claude_image": self.config.claude_image,
             "max_pairs_parallel": self.config.max_pairs_parallel,
+            "max_claude_terminals": 3,
             "ab_prompt_stagger_seconds": 30,
             "task_generation_max_parallel": self.config.task_generation_max_parallel,
             "task_pool_min_ready": 6,
@@ -358,7 +362,7 @@ class PairwiseService:
             """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
                JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
                WHERE a.prompt_sent_at IS NULL
-                 AND a.status IN ('queued','waiting_retry','running')
+                 AND a.status IN ('queued','launching','waiting_retry','waiting_terminal_slot','running')
                  AND p.stage='development'"""
         )
         for row in pending_retries:
@@ -386,7 +390,10 @@ class PairwiseService:
         repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
         canonical = Path(str(repo.get("local_root") or "")) / str(arm["arm"])
         expected_sha = str(pair.get("baseline_sha") or "")
-        if "docker 产物验收" in str(arm.get("error") or "").casefold():
+        delivered_commit = str(arm.get("commit_sha") or "")
+        if re.fullmatch(r"[0-9a-f]{40}", delivered_commit):
+            expected_sha = delivered_commit
+        elif "docker 产物验收" in str(arm.get("error") or "").casefold():
             column = "a_sha" if arm["arm"] == "A" else "b_sha"
             delivered_sha = str(arm.get("commit_sha") or repo.get(column) or "")
             if re.fullmatch(r"[0-9a-f]{40}", delivered_sha):
@@ -395,6 +402,8 @@ class PairwiseService:
             self.claude.reset_unsent_arm(arm)
             if expected_sha != str(pair.get("baseline_sha") or ""):
                 canonical = self.git.prepare_arm_commit(pair_id, str(arm["arm"]), expected_sha)
+            if not self._reserve_terminal_slot(arm_id):
+                return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             self.claude.launch(arm)
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
@@ -522,10 +531,18 @@ class PairwiseService:
                WHERE status IN ('queued','running','review','waiting_api_retry')
                GROUP BY stage ORDER BY stage"""
         )
+        terminal_limit = self._terminal_limit()
+        active_terminals = self._active_terminal_count()
+        waiting_terminal_arms = int((self.db.one(
+            "SELECT COUNT(*) count FROM arm_runs WHERE status='waiting_terminal_slot'"
+        ) or {"count": 0})["count"])
         return {
             "enabled": bool(self.db.setting("auto_pipeline_enabled", False)),
             "targetPairs": target,
             "activePairs": active,
+            "targetTerminals": terminal_limit,
+            "activeTerminals": active_terminals,
+            "waitingTerminalArms": waiting_terminal_arms,
             "waitingApiPairs": waiting_api_pairs,
             "waitingApiArms": waiting_api_arms,
             "apiAutoRetryEnabled": bool(
@@ -542,6 +559,42 @@ class PairwiseService:
                 "zero_to_one_only" if zero_to_one_only else "available_first"
             ),
         }
+
+    def _terminal_limit(self) -> int:
+        configured = int(self.db.setting("max_claude_terminals", 3))
+        return max(1, min(MAX_PAIR_PROJECTS * 2, configured))
+
+    def _active_terminal_count(self) -> int:
+        return int((self.db.one(
+            """SELECT COUNT(*) count FROM arm_runs
+                 WHERE status IN ('launching','running','developing','checkpointing','exported')"""
+        ) or {"count": 0})["count"])
+
+    def _reserve_terminal_slot(self, arm_id: str,
+                               waiting_status: str = "waiting_terminal_slot") -> bool:
+        """Atomically reserve one global Claude terminal slot for an Arm."""
+        with self._terminal_capacity_lock:
+            arm = self.db.one("SELECT status FROM arm_runs WHERE id=?", (arm_id,)) or {}
+            if arm.get("status") in ("launching", "running", "developing"):
+                return True
+            active = self._active_terminal_count()
+            limit = self._terminal_limit()
+            if active >= limit:
+                self.db.execute(
+                    """UPDATE arm_runs SET status=?,
+                       error=CASE WHEN error='' THEN ? ELSE error END,updated_at=? WHERE id=?""",
+                    (waiting_status, "等待 Claude 终端名额（最多 %d 个）" % limit,
+                     now_iso(), arm_id),
+                )
+                self.db.audit("claude.terminal_slot_waiting", "arm_run", arm_id, {
+                    "active_terminals": active, "terminal_limit": limit,
+                })
+                return False
+            self.db.execute(
+                "UPDATE arm_runs SET status='launching',error='',updated_at=? WHERE id=?",
+                (now_iso(), arm_id),
+            )
+            return True
 
     @staticmethod
     def _future_iso(value: Any) -> bool:
@@ -622,7 +675,8 @@ class PairwiseService:
             )
             stopped: List[str] = []
             active_statuses = {
-                "queued", "running", "developing", "waiting_retry", "waiting_api_retry",
+                "queued", "launching", "running", "developing", "waiting_retry",
+                "waiting_terminal_slot", "waiting_api_retry",
                 "checkpointing", "exported",
             }
             for arm in self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,)):
@@ -831,6 +885,8 @@ class PairwiseService:
 
     def _schedule_due_api_retries(self, available_slots: int) -> int:
         """Resume one cooled-down Arm without charging an already-active Pair twice."""
+        if self._active_terminal_count() >= self._terminal_limit():
+            return 0
         due = self.db.all(
             """SELECT a.id arm_id,a.pair_id,p.status pair_status,t.prompt FROM arm_runs a
                  JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
@@ -898,8 +954,14 @@ class PairwiseService:
             return
         for arm in self.db.all(
             """SELECT * FROM arm_runs WHERE pair_id=? AND prompt_sent_at IS NULL
-               AND status IN ('queued','waiting_retry','running')""", (pair_id,),
+               AND status IN ('queued','launching','waiting_retry','waiting_terminal_slot','running')""", (pair_id,),
         ):
+            if arm.get("status") == "waiting_terminal_slot":
+                self._submit_monitor(
+                    "retry-recover-" + arm["id"], self._recover_pending_retry,
+                    pair_id, arm["id"], prompt,
+                )
+                continue
             try:
                 updated = datetime.fromisoformat(
                     str(arm.get("updated_at") or "").replace("Z", "+00:00")
@@ -2138,31 +2200,46 @@ class PairwiseService:
         if len(runs) != 2:
             raise RuntimeError("A/B Arm 不完整")
         started: List[Dict[str, Any]] = []
+        deferred: List[Dict[str, Any]] = []
         try:
             for run in runs:
                 self.claude.reset_unsent_arm(run)
             runs = self.db.all("SELECT * FROM arm_runs WHERE pair_id=? ORDER BY arm", (pair_id,))
             for run in runs:
-                self.claude.launch(run)
-                started.append(run)
-            for run in runs:
+                if not self._reserve_terminal_slot(run["id"]):
+                    deferred.append(
+                        self.db.one("SELECT * FROM arm_runs WHERE id=?", (run["id"],)) or run
+                    )
+                    continue
+                current = self.db.one("SELECT * FROM arm_runs WHERE id=?", (run["id"],)) or run
+                self.claude.launch(current)
+                started.append(
+                    self.db.one("SELECT * FROM arm_runs WHERE id=?", (run["id"],)) or current
+                )
+            for run in started:
                 self.claude.wait_until_ready(run)
-            for run in runs:
+            for run in started:
                 self.claude.materialize_repository(
                     run, Path(repo["local_root"]) / run["arm"], pair["baseline_sha"]
                 )
-            # Both containers are ready before A receives the original prompt.
-            # Mark development first so a service restart during the configured
-            # A/B gap can recover the still-unsent Arm.
+            # Mark development before prompt delivery so a service restart can
+            # recover both a launched Arm and an Arm waiting for a terminal slot.
             self.db.execute(
                 "UPDATE pairs SET status='running',stage='development',error='',started_at=?,updated_at=? WHERE id=?",
                 (now_iso(), now_iso(), pair_id),
             )
             prompt = task["prompt"]
-            for run in runs:
+            for run in started:
                 self._send_prompt_with_pair_stagger(pair_id, run, prompt)
-            for run in runs:
+            for run in started:
                 self._submit_monitor("monitor-" + run["id"], self._monitor_arm, pair_id, run["id"], prompt)
+            if deferred:
+                self.db.audit("claude.pair_started_with_deferred_arm", "pair", pair_id, {
+                    "started_arms": [run["arm"] for run in started],
+                    "deferred_arms": [run["arm"] for run in deferred],
+                    "terminal_limit": self._terminal_limit(),
+                    "rule": "start_deferred_arm_when_any_terminal_slot_is_released",
+                })
             return self.pair_detail(pair_id)
         except Exception as exc:
             self.db.execute("UPDATE pairs SET status='failed',error=?,updated_at=? WHERE id=?", (str(exc)[-3000:], now_iso(), pair_id))
@@ -3710,11 +3787,9 @@ class PairwiseService:
         pair = self._pair(pair_id)
         retry_number = int(arm.get("api_retry_count") or 1)
         try:
+            if not self._reserve_terminal_slot(arm_id, waiting_status="waiting_api_retry"):
+                return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             canonical = self.git.reset_arm_to_baseline(pair_id, str(arm["arm"]))
-            self.db.execute(
-                "UPDATE arm_runs SET status='waiting_retry',updated_at=? WHERE id=?",
-                (now_iso(), arm_id),
-            )
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
             self.claude.launch(arm)
             arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or arm
@@ -3767,7 +3842,10 @@ class PairwiseService:
         if not self._pair_blocks_development_restart(pair):
             return None
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm_id,)) or {}
-        if arm.get("status") in ("queued", "running", "developing", "waiting_retry", "waiting_api_retry", "checkpointing"):
+        if arm.get("status") in (
+            "queued", "launching", "running", "developing", "waiting_retry",
+            "waiting_terminal_slot", "waiting_api_retry", "checkpointing",
+        ):
             stamp = now_iso()
             self.db.execute(
                 "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
@@ -3809,6 +3887,12 @@ class PairwiseService:
         )
         if blocked:
             return blocked
+        if not self._reserve_terminal_slot(arm["id"]):
+            self.db.audit("claude.retry_waiting_terminal_slot", "arm_run", arm["id"], {
+                "pair_id": pair_id, "arm": arm.get("arm"),
+                "terminal_limit": self._terminal_limit(),
+            })
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
         self.claude.launch(restarted)
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
@@ -3849,6 +3933,12 @@ class PairwiseService:
         )
         canonical = self.git.prepare_arm_commit(pair_id, str(arm["arm"]), source_sha)
         time.sleep(8)
+        if not self._reserve_terminal_slot(arm["id"]):
+            self.db.audit("artifact.repair_waiting_terminal_slot", "arm_run", arm["id"], {
+                "pair_id": pair_id, "arm": arm.get("arm"),
+                "terminal_limit": self._terminal_limit(),
+            })
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
         self.claude.launch(restarted)
         restarted = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or restarted
@@ -3936,7 +4026,8 @@ class PairwiseService:
             (pair_id, failed_arm_id),
         ) or {}
         active_statuses = {
-            "queued", "running", "developing", "waiting_retry", "waiting_api_retry",
+            "queued", "launching", "running", "developing", "waiting_retry",
+            "waiting_terminal_slot", "waiting_api_retry",
             "checkpointing", "exported",
         }
         if peer.get("status") in active_statuses:
@@ -3980,7 +4071,8 @@ class PairwiseService:
         if not failed:
             return False
         active_statuses = {
-            "queued", "running", "developing", "waiting_retry", "waiting_api_retry",
+            "queued", "launching", "running", "developing", "waiting_retry",
+            "waiting_terminal_slot", "waiting_api_retry",
             "checkpointing", "exported",
         }
         if any(
@@ -4019,7 +4111,10 @@ class PairwiseService:
                     "UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=? WHERE id=?",
                     ("同一 Pair 已达到失败上限并换题", stamp, stamp, other["id"]),
                 )
-            elif other["status"] in ("queued", "running", "developing", "waiting_retry", "checkpointing"):
+            elif other["status"] in (
+                "queued", "launching", "running", "developing", "waiting_retry",
+                "waiting_terminal_slot", "checkpointing",
+            ):
                 try:
                     self.claude.archive_failed_attempt(
                         other, "同一 Pair 已累计 2 次失败，当前 Pair 已换题", prepare_retry=False,
@@ -4267,16 +4362,6 @@ class PairwiseService:
             })
             return {"pairId": pair_id, "restarted": [], "issues": list(dict.fromkeys(issues)),
                     "skipped": "terminal_pair"}
-        active_arms = int((self.db.one(
-            """SELECT COUNT(*) count FROM arm_runs
-               WHERE status IN ('queued','running','developing','waiting_retry','checkpointing')"""
-        ) or {"count": 0})["count"])
-        replacing_active = sum(
-            1 for arm in arms
-            if str(arm.get("status") or "") in ("queued", "running", "developing", "waiting_retry", "checkpointing")
-        )
-        if active_arms - replacing_active + len(arms) > MAX_PAIR_PROJECTS * 2:
-            raise RuntimeError("当前 8 个开发终端均在运行，轨迹返工需等待一个终端空位")
         stamp = now_iso()
         reason = "；".join(dict.fromkeys(str(issue) for issue in issues))[-2500:]
         prompt_mismatch = any("首轮 User Prompt" in str(issue) for issue in issues)

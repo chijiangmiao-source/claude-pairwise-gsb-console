@@ -220,6 +220,10 @@ class Handler(BaseHTTPRequestHandler):
                     pair_limit = int(body["max_pairs_parallel"])
                     if pair_limit < 1 or pair_limit > MAX_PAIR_PROJECTS:
                         raise ValueError("Pair 并发只能设置为 1–4；每个 Pair 会占用 A/B 两个终端")
+                if "max_claude_terminals" in body:
+                    terminal_limit = int(body["max_claude_terminals"])
+                    if terminal_limit < 1 or terminal_limit > MAX_PAIR_PROJECTS * 2:
+                        raise ValueError("Claude 开发终端并发只能设置为 1–8")
                 if "ab_prompt_stagger_seconds" in body:
                     prompt_stagger = int(body["ab_prompt_stagger_seconds"])
                     if prompt_stagger < 0 or prompt_stagger > 300:

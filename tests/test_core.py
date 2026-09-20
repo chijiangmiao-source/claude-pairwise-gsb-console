@@ -86,6 +86,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("codex_default_effort"), "medium")
         self.assertEqual(self.db.setting("codex_bug_effort"), "high")
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
+        self.assertEqual(self.db.setting("max_claude_terminals"), 3)
         self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 75)
         self.assertEqual(self.db.setting("development_max_attempts"), 2)
         self.assertTrue(self.db.setting("task_generation_zero_to_one_only"))
@@ -587,6 +588,81 @@ class CoreTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "Pair 已停止"):
             self.service.start_pair(pair["id"])
+
+    def test_pair_start_defers_fourth_terminal_and_recovers_it_after_slot_release(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        baseline = "b" * 40
+        repo_root = self.root / "terminal-cap-repo"
+        for name in ("A", "B"):
+            (repo_root / name).mkdir(parents=True)
+        self.db.execute(
+            "UPDATE pairs SET status='queued',stage='ready_to_start',baseline_sha=? WHERE id=?",
+            (baseline, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO git_repositories(id,pair_id,owner,name,visibility,local_root,
+               main_sha,a_sha,b_sha,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'ready',?,?)""",
+            ("repo-terminal-cap", pair["id"], "owner", "repo", "public", str(repo_root),
+             baseline, baseline, baseline, stamp, stamp),
+        )
+        for arm in ("A", "B"):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)""",
+                (pair["id"] + "-" + arm.lower(), pair["id"], arm, arm,
+                 str(self.root / ("workspace-" + arm)), "container-" + arm,
+                 "screen-" + arm, "auto_model/urm", "image", stamp, stamp),
+            )
+        self.db.set_setting("max_claude_terminals", 1)
+
+        def launch(arm):
+            self.db.execute(
+                "UPDATE arm_runs SET status='running' WHERE id=?", (arm["id"],),
+            )
+
+        def send(_pair_id, arm, _prompt):
+            self.db.execute(
+                "UPDATE arm_runs SET status='developing',prompt_sent_at=? WHERE id=?",
+                (now_iso(), arm["id"]),
+            )
+
+        with patch.object(self.service.claude, "prepare_arm"), \
+             patch.object(self.service.claude, "reset_unsent_arm"), \
+             patch.object(self.service.claude, "launch", side_effect=launch) as launch_mock, \
+             patch.object(self.service.claude, "wait_until_ready"), \
+             patch.object(self.service.claude, "materialize_repository"), \
+             patch.object(self.service, "_send_prompt_with_pair_stagger", side_effect=send), \
+             patch.object(self.service, "_submit_monitor"):
+            result = self.service.start_pair(pair["id"])
+
+        self.assertEqual(launch_mock.call_count, 1)
+        self.assertEqual(result["arms"][0]["status"], "developing")
+        self.assertEqual(result["arms"][1]["status"], "waiting_terminal_slot")
+        self.assertEqual(self.service.automation_status()["activeTerminals"], 1)
+        self.assertEqual(self.service.automation_status()["waitingTerminalArms"], 1)
+
+        self.db.execute(
+            "UPDATE arm_runs SET status='completed',commit_sha=? WHERE pair_id=? AND arm='A'",
+            ("a" * 40, pair["id"]),
+        )
+        with patch.object(self.service.claude, "reset_unsent_arm"), \
+             patch.object(self.service.claude, "launch", side_effect=launch) as resumed_launch, \
+             patch.object(self.service.claude, "wait_until_ready"), \
+             patch.object(self.service.claude, "materialize_repository"), \
+             patch.object(self.service, "_send_prompt_with_pair_stagger", side_effect=send), \
+             patch.object(self.service, "_monitor_arm", return_value={"status": "completed"}):
+            self.service._recover_pending_retry(
+                pair["id"], pair["id"] + "-b", "Build a hard project with Docker Compose",
+            )
+        resumed_launch.assert_called_once()
+        self.assertEqual(
+            self.db.one("SELECT status FROM arm_runs WHERE pair_id=? AND arm='B'", (pair["id"],))["status"],
+            "developing",
+        )
 
     def test_cancel_pair_stops_only_the_selected_pair(self):
         self.insert_ready_task()
