@@ -164,6 +164,7 @@ class PairwiseService:
             "repository_prefix": self.config.repository_prefix,
             "first_prompt_warning_minutes": 15,
             "first_prompt_stop_minutes": 75,
+            "repeated_no_code_trace_minutes": 40,
             "development_max_attempts": 2,
             "terminal_idle_seconds": 120,
             "claude_api_auto_retry_enabled": True,
@@ -4416,9 +4417,15 @@ class PairwiseService:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
-            if elapsed >= int(self.db.setting("first_prompt_stop_minutes", 75)) * 60 and not has_code:
+            stop_minutes = int(self.db.setting("first_prompt_stop_minutes", 75))
+            repeated_trace_minutes = int(self.db.setting("repeated_no_code_trace_minutes", 40))
+            attempt = max(1, int(arm.get("attempt_no") or 1))
+            hard_timeout_due = elapsed >= stop_minutes * 60
+            repeated_trace_check_due = (
+                attempt >= 2 and elapsed >= max(0, repeated_trace_minutes) * 60
+            )
+            if not has_code and (hard_timeout_due or repeated_trace_check_due):
                 signature = str(state.get("activity_signature") or "")
-                attempt = max(1, int(arm.get("attempt_no") or 1))
                 previous = self.db.one(
                     """SELECT detail_json FROM audit_events
                        WHERE event_type='claude.no_code_timeout_signature' AND entity_id=?
@@ -4434,10 +4441,18 @@ class PairwiseService:
                     and int(previous_detail.get("attempt") or 0) == attempt - 1
                     and previous_detail.get("signature") == signature
                 )
+                # The 40-minute checkpoint only stops a retry when its trace
+                # is identical to the immediately preceding no-code attempt.
+                # A different trace keeps its full 75-minute development window.
+                if not hard_timeout_due and not repeated:
+                    time.sleep(5)
+                    continue
                 self.db.audit("claude.no_code_timeout_signature", "arm_run", arm_id, {
                     "attempt": attempt, "signature": signature,
                     "summary": list(state.get("activity_summary") or [])[:12],
                     "matches_previous_attempt": repeated,
+                    "rule_trigger": "repeated_trace_early" if not hard_timeout_due else "hard_timeout",
+                    "elapsedSeconds": int(elapsed),
                 })
                 reason = (
                     "同一侧连续 2 次出现完全相同的无代码轨迹特征"

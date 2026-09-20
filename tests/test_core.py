@@ -88,6 +88,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("claude_model"), "auto_model/urm")
         self.assertEqual(self.db.setting("max_claude_terminals"), 3)
         self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 75)
+        self.assertEqual(self.db.setting("repeated_no_code_trace_minutes"), 40)
         self.assertEqual(self.db.setting("development_max_attempts"), 2)
         self.assertTrue(self.db.setting("task_generation_zero_to_one_only"))
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
@@ -3172,7 +3173,8 @@ class CoreTests(unittest.TestCase):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
-        self.db.set_setting("first_prompt_stop_minutes", 0)
+        self.db.set_setting("first_prompt_stop_minutes", 75)
+        self.db.set_setting("repeated_no_code_trace_minutes", 0)
         self.db.execute(
             "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
         )
@@ -3203,7 +3205,9 @@ class CoreTests(unittest.TestCase):
         latest = self.db.one(
             "SELECT detail_json FROM audit_events WHERE entity_id='arm-repeat-no-code' ORDER BY id DESC LIMIT 1"
         )
-        self.assertTrue(json.loads(latest["detail_json"])["matches_previous_attempt"])
+        detail = json.loads(latest["detail_json"])
+        self.assertTrue(detail["matches_previous_attempt"])
+        self.assertEqual(detail["rule_trigger"], "repeated_trace_early")
 
     def test_system_turn_companion_is_not_treated_as_manual_followup(self):
         prompt = "Build the requested project"
