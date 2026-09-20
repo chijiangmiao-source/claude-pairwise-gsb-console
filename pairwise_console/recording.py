@@ -242,6 +242,15 @@ class RecordingManager:
         failed = [item for item in checks if isinstance(item, dict) and not item.get("passed")]
         if not failed:
             return False
+        # A verify command that times out is not a business-test failure.  It
+        # usually means the generated Compose file named its long-running API
+        # service ``verify``.  Re-launching that API for a browser walkthrough
+        # repeats the same contract mistake, so record the real command failure.
+        for item in failed:
+            if (str(item.get("name") or "") == "verify_service"
+                    and (int(item.get("exit_code") or 0) == 124
+                         or "不能启动常驻服务" in str(item.get("detail") or ""))):
+                return False
         blocking = re.compile(
             r"compose|dockerfile|clean_start|containers?_running|health|startup|published_port",
             re.IGNORECASE,

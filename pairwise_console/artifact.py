@@ -3,6 +3,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -126,16 +127,30 @@ class ArtifactChecker:
             has_verify = "verify" in service_names
             self._record(checks, "verify_service_present", has_verify, ", ".join(sorted(service_names)))
             if has_verify:
-                verify = run_command(
-                    base + ["run", "--rm", "verify"],
-                    cwd=workspace, check=False, timeout=1200, env=compose_env,
+                verify_command = base + ["run", "--rm", "verify"]
+                verify_timeout = max(
+                    30, min(600, int(self.db.setting("artifact_verify_timeout_seconds", 300))),
                 )
-                self._record(
-                    checks, "verify_service", verify.returncode == 0,
-                    redact(verify.stdout + "\n" + verify.stderr),
-                    "docker compose -p %s -f %s run --rm verify" % (project, compose.name),
-                    verify.returncode,
-                )
+                try:
+                    verify = run_command(
+                        verify_command, cwd=workspace, check=False,
+                        timeout=verify_timeout, env=compose_env,
+                    )
+                    self._record(
+                        checks, "verify_service", verify.returncode == 0,
+                        redact(verify.stdout + "\n" + verify.stderr),
+                        "docker compose -p %s -f %s run --rm verify" % (project, compose.name),
+                        verify.returncode,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    output = "%s\n%s" % (exc.stdout or "", exc.stderr or "")
+                    self._record(
+                        checks, "verify_service", False,
+                        "verify 服务超过 %d 秒仍未退出；它必须执行验收后自动退出，不能启动常驻服务。\n%s"
+                        % (verify_timeout, redact(output)),
+                        "docker compose -p %s -f %s run --rm verify" % (project, compose.name),
+                        124,
+                    )
             down = run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=compose_env)
             self._record(
                 checks, "cleanup", down.returncode == 0, redact(down.stderr or down.stdout),

@@ -16,7 +16,7 @@ from pairwise_console.config import OLD_APP_DIR, load_config
 from pairwise_console.db import Database, now_iso
 from pairwise_console.gitops import GitOps
 from pairwise_console.analytics import dashboard
-from pairwise_console.artifact import isolated_compose_environment
+from pairwise_console.artifact import ArtifactChecker, isolated_compose_environment
 from pairwise_console.api import Handler
 from pairwise_console.exports import build_xlsx
 from pairwise_console.importer import import_historical_tasks
@@ -91,9 +91,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("development_max_attempts"), 2)
         self.assertTrue(self.db.setting("task_generation_zero_to_one_only"))
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
+        self.assertEqual(self.db.setting("artifact_verify_timeout_seconds"), 300)
         self.assertIsNone(self.db.setting("task_mix_zero_to_one"))
         self.assertIsNone(self.db.setting("task_mix_feature"))
         self.assertIsNone(self.db.setting("task_mix_bugfix"))
+
+    def test_artifact_verify_timeout_is_recorded_and_cleaned_up(self):
+        workspace = self.root / "artifact-timeout"
+        workspace.mkdir()
+        (workspace / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        (workspace / "compose.yml").write_text(
+            "services:\n  verify:\n    build: .\n", encoding="utf-8",
+        )
+        self.db.set_setting("artifact_verify_timeout_seconds", 30)
+
+        def command(args, **kwargs):
+            from pairwise_console.commands import CommandResult
+            if args[-4:] == ["--profile", "*", "config", "--services"]:
+                return CommandResult(args, str(workspace), 0, "verify\n", "")
+            if args[-3:] == ["run", "--rm", "verify"]:
+                raise __import__("subprocess").TimeoutExpired(args, 30, "partial output", "")
+            stdout = '[{"State":"running"}]' if args[-3:] == ["ps", "--format", "json"] else "ok"
+            return CommandResult(args, str(workspace), 0, stdout, "")
+
+        with patch("pairwise_console.artifact.run_command", side_effect=command), \
+             patch("pairwise_console.artifact.time.sleep"):
+            result = ArtifactChecker(self.db)._probe(workspace, "timeout-test")
+
+        verify = next(item for item in result["checks"] if item["name"] == "verify_service")
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(verify["passed"])
+        self.assertEqual(verify["exit_code"], 124)
+        self.assertIn("不能启动常驻服务", verify["detail"])
+        self.assertEqual(result["checks"][-1]["name"], "cleanup")
 
     def test_service_restart_closes_stale_generation_batches(self):
         stamp = now_iso()
@@ -1818,6 +1848,18 @@ class CoreTests(unittest.TestCase):
         self.assertIn("exit code 1", html)
         self.assertIn("border-radius:50%", html)
         wait.assert_called_once()
+
+    def test_timed_out_verify_service_uses_failure_evidence_recording(self):
+        compose = self.root / "compose.yml"
+        compose.write_text("services:\n  verify:\n    image: example\n", encoding="utf-8")
+        check = {
+            "status": "observed_failed",
+            "checks_json": json.dumps([{
+                "name": "verify_service", "passed": False, "exit_code": 124,
+                "detail": "verify 服务超过 300 秒仍未退出；它必须执行验收后自动退出，不能启动常驻服务。",
+            }]),
+        }
+        self.assertFalse(RecordingManager._runtime_recording_is_allowed(check, compose))
 
     def test_failed_artifact_is_preserved_for_gsb_without_claude_repair(self):
         self.insert_ready_task()

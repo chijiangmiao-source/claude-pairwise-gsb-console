@@ -173,6 +173,7 @@ class PairwiseService:
             "recording_width": 1280,
             "recording_height": 720,
             "recording_max_seconds": 90,
+            "artifact_verify_timeout_seconds": 300,
         }
         for key, value in defaults.items():
             if self.db.one("SELECT key FROM settings WHERE key=?", (key,)) is None:
