@@ -1,8 +1,14 @@
 """Language-only previews; never persist or rejudge a GSB review."""
 import json
 import re
+from collections import Counter
 
 VERDICTS = ("A better", "Same", "B better")
+
+
+def _numeric_facts(value):
+    """Keep every explicit number from the reviewed reason during rewriting."""
+    return Counter(re.findall(r"(?<![A-Za-z0-9_])\d+(?:\.\d+)?", value))
 
 
 def validate_source(verdict, a_reason, b_reason):
@@ -53,6 +59,27 @@ def rewrite_preview(runner, source, pair_id, locator_issues):
             if re.search(r"\*\*|^\s*(?:#{1,6}\s|[-*]\s)", value):
                 raise ValueError("口语化结果包含 Markdown，请重试")
             clean[key] = value
+        changed_numbers = [
+            key for key in ("aReason", "bReason")
+            if _numeric_facts(clean[key]) != _numeric_facts(source[key])
+            or re.search(r"\d+\s*几(?:秒|项|次|个|条|组|台|点)", clean[key])
+        ]
+        if changed_numbers:
+            if semantic_retry:
+                raise ValueError("口语化结果改变了具体数字，请重试；原文未改动")
+            semantic_retry = True
+            correction = (
+                prompt
+                + "\n\n上一次改写改变、遗漏或写坏了具体数字："
+                + "、".join(changed_numbers)
+                + "。请逐项保留原文中的每个数字及单位，不得把 1 秒写成几秒或 1几秒。"
+                + "\n上一次输出："
+                + json.dumps(clean, ensure_ascii=False)
+            )
+            result = runner.run(
+                "gsb_colloquial", correction, schema, pair_id=pair_id, timeout=180, retries=0,
+            )
+            continue
         # Do not invent locators for legacy text which did not have any to
         # begin with. If the first rewrite drops the last reviewable locator,
         # ask once for a corrected rewrite instead of making the whole button

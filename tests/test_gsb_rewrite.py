@@ -54,6 +54,48 @@ class RewriteTests(unittest.TestCase):
         self.assertEqual(self.runner.run.call_count, 2)
         self.assertIn("遗漏了可核对证据", self.runner.run.call_args.args[1])
 
+    def test_retries_when_rewrite_changes_or_corrupts_numbers(self):
+        source = validate_source(
+            "Same",
+            "A 在 planner.py 复核 [0,0] 起始窗，曝光 1 秒时错误返回空计划。",
+            "B 在 planner.py 复核相同 [0,0] 起始窗，曝光 1 秒时也错误返回空计划。",
+        )
+        corrupted = dict(
+            source,
+            aReason="A 在 planner.py 复核 [0,0] 起始窗，曝光几秒时错误返回空计划。",
+            bReason="B 在 planner.py 复核相同 [0,0] 起始窗，曝光 1几秒时也错误返回空计划。",
+        )
+        corrected = dict(
+            source,
+            aReason="A 在 planner.py 复核 [0,0] 起始窗，曝光 1 秒时确实错误返回空计划。",
+            bReason="B 在 planner.py 复核相同 [0,0] 起始窗，曝光 1 秒时也确实错误返回空计划。",
+        )
+        self.runner.run.side_effect = [corrupted, corrected]
+        result = rewrite_preview(
+            self.runner, source, "pair-test", PairwiseService._gsb_locator_issues,
+        )
+        self.assertEqual(result, corrected)
+        self.assertEqual(self.runner.run.call_count, 2)
+        self.assertIn("不得把 1 秒写成几秒或 1几秒", self.runner.run.call_args.args[1])
+
+    def test_rejects_number_corruption_after_retry(self):
+        source = validate_source(
+            "Same",
+            "A 在 planner.py 复核曝光 1 秒时错误返回空计划。",
+            "B 在 planner.py 复核曝光 1 秒时也错误返回空计划。",
+        )
+        corrupted = dict(
+            source,
+            aReason="A 在 planner.py 复核曝光几秒时错误返回空计划。",
+            bReason="B 在 planner.py 复核曝光 1几秒时也错误返回空计划。",
+        )
+        self.runner.run.return_value = corrupted
+        with self.assertRaisesRegex(ValueError, "具体数字"):
+            rewrite_preview(
+                self.runner, source, "pair-test", PairwiseService._gsb_locator_issues,
+            )
+        self.assertEqual(self.runner.run.call_count, 2)
+
     def test_module_name_is_a_reviewable_locator(self):
         self.runner.run.return_value = dict(
             self.result,
