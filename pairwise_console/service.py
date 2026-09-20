@@ -165,6 +165,7 @@ class PairwiseService:
             "first_prompt_warning_minutes": 15,
             "first_prompt_stop_minutes": 75,
             "repeated_no_code_trace_minutes": 40,
+            "business_progress_idle_minutes": 60,
             "development_max_attempts": 2,
             "terminal_idle_seconds": 120,
             "claude_api_auto_retry_enabled": True,
@@ -346,6 +347,7 @@ class PairwiseService:
                WHERE stage IN ('replaced','replacement_failed') AND status<>'failed'""",
             (now_iso(),),
         )
+        self._expire_exhausted_waiting_arm_retries()
         rows = self.db.all(
             """SELECT a.id arm_id,a.pair_id,t.prompt FROM arm_runs a
                JOIN pairs p ON p.id=a.pair_id JOIN tasks t ON t.id=p.task_id
@@ -589,7 +591,13 @@ class PairwiseService:
         with self._terminal_capacity_lock:
             arm = self.db.one("SELECT status FROM arm_runs WHERE id=?", (arm_id,)) or {}
             if arm.get("status") in ("launching", "running", "developing"):
-                return True
+                # Another recovery worker already owns this Arm. Returning
+                # true made the stale worker launch the same retry again after
+                # the winning worker had materialized the repository.
+                self.db.audit("claude.terminal_reservation_already_claimed", "arm_run", arm_id, {
+                    "status": arm.get("status"), "action": "skip_duplicate_launch",
+                })
+                return False
             active = self._active_terminal_count()
             limit = self._terminal_limit()
             if active >= limit:
@@ -746,6 +754,7 @@ class PairwiseService:
         if not self._automation_lock.acquire(blocking=False):
             return self.automation_status()
         try:
+            self._expire_exhausted_waiting_arm_retries()
             waiting_development_arms = self._waiting_development_arm_count()
             waiting_api_arms = int((self.db.one(
                 """SELECT COUNT(*) count FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
@@ -859,6 +868,39 @@ class PairwiseService:
         finally:
             self._automation_lock.release()
 
+    def _expire_exhausted_waiting_arm_retries(self) -> int:
+        """Fail stale retry rows that have already spent this Arm's budget."""
+        maximum = max(1, int(self.db.setting("development_max_attempts", 2)))
+        rows = self.db.all(
+            """SELECT a.* FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
+                WHERE a.prompt_sent_at IS NULL AND p.stage='development'
+                  AND p.status IN ('queued','running','review','waiting_api_retry')
+                  AND a.status IN ('queued','launching','running','waiting_retry',
+                                   'waiting_terminal_slot','waiting_api_retry')
+                  AND COALESCE(a.error_retry_count,0)+COALESCE(a.api_retry_count,0)>=?""",
+            (maximum,),
+        )
+        for arm in rows:
+            reason = "该侧失败次数已达上限，不再自动重启"
+            try:
+                self.claude.archive_failed_attempt(
+                    arm, reason, prepare_retry=False,
+                    count_development_failure=False, count_error_retry=False,
+                )
+            except Exception as exc:
+                stamp = now_iso()
+                self.db.execute(
+                    """UPDATE arm_runs SET status='failed',error=?,finished_at=?,updated_at=?
+                         WHERE id=?""",
+                    ((reason + "；保存现场时出现错误：" + redact(str(exc)))[-3000:],
+                     stamp, stamp, arm["id"]),
+                )
+            self.db.audit("claude.exhausted_retry_blocked", "arm_run", arm["id"], {
+                "pair_id": arm["pair_id"], "arm": arm.get("arm") or "",
+                "maximum": maximum, "action": "mark_failed_without_restart",
+            })
+        return len(rows)
+
     def _waiting_development_arm_count(self) -> int:
         """Count resumable A/B sides that must run before a new Pair starts."""
         return int((self.db.one(
@@ -870,12 +912,19 @@ class PairwiseService:
         ) or {"count": 0})["count"])
 
     def _schedule_next_waiting_development_arm(self) -> bool:
-        """Give the oldest queued Arm the next free Claude terminal slot."""
+        """Fill an existing one-sided Pair before opening another Pair side."""
         if self._api_cooldown_active() or self._active_terminal_count() >= self._terminal_limit():
             return False
         api_enabled = bool(self.db.setting("claude_api_auto_retry_enabled", True))
         row = self.db.one(
             """SELECT a.id arm_id,a.pair_id,a.status,p.status pair_status,t.prompt,
+                      CASE WHEN EXISTS(
+                        SELECT 1 FROM arm_runs peer
+                         WHERE peer.pair_id=a.pair_id AND peer.id<>a.id
+                           AND (peer.prompt_sent_at IS NOT NULL OR peer.commit_sha<>''
+                                OR peer.status IN ('running','developing','completed',
+                                                   'checkpointing','exported'))
+                      ) THEN 0 ELSE 1 END partial_pair_rank,
                       COALESCE((
                         SELECT MAX(e.created_at) FROM audit_events e
                          WHERE e.entity_id=a.id AND e.event_type IN (
@@ -897,7 +946,7 @@ class PairwiseService:
                     OR (a.status='waiting_api_retry' AND ?=1
                         AND (a.api_retry_after IS NULL OR a.api_retry_after<=?))
                   )
-                ORDER BY queued_at,a.updated_at,a.id LIMIT 1""",
+                ORDER BY partial_pair_rank,queued_at,a.updated_at,a.id LIMIT 1""",
             (1 if api_enabled else 0, now_iso()),
         )
         if not row:
@@ -924,6 +973,7 @@ class PairwiseService:
         self.db.audit("claude.queued_arm_prioritized", "arm_run", row["arm_id"], {
             "pair_id": row["pair_id"], "queued_at": row.get("queued_at") or "",
             "queue_status": row["status"], "new_pair_launches_blocked": True,
+            "existing_one_sided_pair_first": int(row.get("partial_pair_rank") or 0) == 0,
         })
         return True
 
@@ -4410,9 +4460,10 @@ class PairwiseService:
                 )
             elapsed = time.monotonic() - started
             workspace = Path(arm["workspace_path"])
-            has_code = self.claude.has_business_code(
+            business_progress = self.claude.business_progress(
                 workspace, self._arm_comparison_sha(pair_id, str(arm["arm"])),
             )
+            has_code = bool(business_progress.get("has_code"))
             if elapsed >= int(self.db.setting("first_prompt_warning_minutes", 15)) * 60 and not has_code and not warned:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
@@ -4466,6 +4517,38 @@ class PairwiseService:
                 started = time.monotonic()
                 warned = False
                 continue
+            if has_code:
+                last_progress = float(business_progress.get("last_modified") or 0.0)
+                tool_activity = str(state.get("last_tool_activity_at") or "")
+                if tool_activity:
+                    try:
+                        parsed_activity = datetime.fromisoformat(tool_activity.replace("Z", "+00:00"))
+                        if parsed_activity.tzinfo is None:
+                            parsed_activity = parsed_activity.replace(tzinfo=timezone.utc)
+                        last_progress = max(last_progress, parsed_activity.timestamp())
+                    except ValueError:
+                        pass
+                idle_minutes = max(1, int(self.db.setting("business_progress_idle_minutes", 60)))
+                idle_seconds = max(0.0, time.time() - last_progress) if last_progress else 0.0
+                if last_progress and idle_seconds >= idle_minutes * 60:
+                    reason = "已有业务代码，但连续 %d 分钟没有业务文件、提交或工具执行进展" % idle_minutes
+                    self.db.audit("claude.business_progress_timeout", "arm_run", arm_id, {
+                        "pair_id": pair_id,
+                        "arm": arm.get("arm") or "",
+                        "idleSeconds": int(idle_seconds),
+                        "idleMinutes": idle_minutes,
+                        "lastProgressAt": datetime.fromtimestamp(
+                            last_progress, timezone.utc,
+                        ).isoformat(),
+                        "businessPaths": list(business_progress.get("paths") or [])[:12],
+                        "rule": "business_code_idle_timeout",
+                    })
+                    retried = self._handle_attempt_failure(pair_id, arm, prompt, reason)
+                    if retried.get("status") == "failed":
+                        return retried
+                    started = time.monotonic()
+                    warned = False
+                    continue
             time.sleep(5)
 
     def _restart_trace_invalid_arms(self, pair_id: str, arms: List[Dict[str, Any]],

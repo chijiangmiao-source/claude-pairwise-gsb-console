@@ -506,6 +506,8 @@ exit "$code"
             extra_user_message = ""
             automatic_companion_messages = []
             activity = []
+            last_tool_activity_at = ""
+            last_tool_activity_epoch = 0.0
             for index in range(start_index + 1, len(events)):
                 event = events[index]
                 if event.get("type") == "user":
@@ -521,10 +523,12 @@ exit "$code"
                 message = event.get("message") if isinstance(event.get("message"), dict) else {}
                 content = message.get("content")
                 blocks = content if isinstance(content, list) else []
+                used_tool = False
                 for block in blocks:
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "tool_use":
+                        used_tool = True
                         name = str(block.get("name") or "tool")
                         value = block.get("input") if isinstance(block.get("input"), dict) else {}
                         shape = " ".join(sorted(str(key) for key in value))
@@ -535,6 +539,18 @@ exit "$code"
                             re.sub(r"\s+", " ", str(block.get("text") or "").casefold()),
                         ).strip()
                         activity.append("text:" + normalized[:180])
+                if used_tool:
+                    timestamp = str(event.get("timestamp") or "")
+                    try:
+                        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        epoch = parsed.timestamp()
+                    except ValueError:
+                        epoch = 0.0
+                    if epoch >= last_tool_activity_epoch:
+                        last_tool_activity_epoch = epoch
+                        last_tool_activity_at = timestamp
                 text = "\n".join(str(x.get("text") or "") for x in blocks if isinstance(x, dict) and x.get("type") == "text").strip()
                 if event.get("isApiErrorMessage") or text.startswith("API Error:"):
                     api_error, api_index = text or "API Error", index
@@ -595,16 +611,26 @@ exit "$code"
                     json.dumps(activity_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 ).hexdigest(),
                 "activity_summary": activity_payload[:12],
+                # Only real tool calls extend the business-progress window.
+                # Free-form thinking text alone must not keep an otherwise
+                # stalled development session alive forever.
+                "last_tool_activity_at": last_tool_activity_at,
             })
         empty_signature = hashlib.sha256(b'["no-trace-activity"]').hexdigest()
         return finish({"complete": False, "api_error": "", "path": "",
                        "activity_signature": empty_signature, "activity_summary": ["no-trace-activity"]})
 
     @staticmethod
-    def has_business_code(workspace: Path, baseline_sha: str = "") -> bool:
+    def business_progress(workspace: Path, baseline_sha: str = "") -> Dict[str, Any]:
+        """Return whether delivery code exists and when it last changed.
+
+        Dependency trees and generated build output are intentionally ignored.
+        The timestamp covers changed delivery files and a commit made after the
+        shared baseline, so a monitor restart does not reset the idle clock.
+        """
         status = run_command(["git", "status", "--porcelain"], cwd=workspace, check=False, timeout=30)
         if status.returncode != 0:
-            return False
+            return {"has_code": False, "last_modified": 0.0, "paths": []}
         extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".cpp", ".c", ".h", ".vue", ".svelte", ".html", ".css", ".sql", ".sh"}
         ignored_parts = {
             ".venv", "venv", "env", "node_modules", ".pnpm-store",
@@ -621,27 +647,60 @@ exit "$code"
             return any(part.casefold() in ignored_parts for part in parts)
 
         paths = [line[3:].split(" -> ")[-1].strip() for line in status.stdout.splitlines()]
+        committed_after_baseline = False
         if baseline_sha:
             committed = run_command(
                 ["git", "diff", "--name-only", "%s..HEAD" % baseline_sha],
                 cwd=workspace, check=False, timeout=30,
             )
             if committed.returncode == 0:
-                paths.extend(line.strip() for line in committed.stdout.splitlines() if line.strip())
+                committed_paths = [line.strip() for line in committed.stdout.splitlines() if line.strip()]
+                paths.extend(committed_paths)
+                committed_after_baseline = bool(committed_paths)
+        business_paths = []
+        latest = 0.0
+
+        def record(item: Path) -> None:
+            nonlocal latest
+            business_paths.append(str(item.relative_to(workspace)))
+            try:
+                latest = max(latest, item.stat().st_mtime)
+            except OSError:
+                try:
+                    latest = max(latest, item.parent.stat().st_mtime)
+                except OSError:
+                    pass
+
         for path in paths:
             item = workspace / path
             if ignored(item):
                 continue
             if item.name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml") or item.suffix.casefold() in extensions:
-                return True
+                record(item)
+                continue
             if item.is_dir():
                 for child in item.rglob("*"):
                     if child.is_file() and not ignored(child) and (
                         child.name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml")
                         or child.suffix.casefold() in extensions
                     ):
-                        return True
-        return False
+                        record(child)
+        if committed_after_baseline and business_paths:
+            committed_at = run_command(
+                ["git", "show", "-s", "--format=%ct", "HEAD"],
+                cwd=workspace, check=False, timeout=30,
+            )
+            if committed_at.returncode == 0 and committed_at.stdout.strip().isdigit():
+                latest = max(latest, float(committed_at.stdout.strip()))
+        return {
+            "has_code": bool(business_paths),
+            "last_modified": latest,
+            "paths": sorted(set(business_paths))[:20],
+        }
+
+    @staticmethod
+    def has_business_code(workspace: Path, baseline_sha: str = "") -> bool:
+        return bool(ClaudeRunner.business_progress(workspace, baseline_sha)["has_code"])
 
     @staticmethod
     def _screen_running(name: str) -> bool:

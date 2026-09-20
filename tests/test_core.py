@@ -89,6 +89,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("max_claude_terminals"), 4)
         self.assertEqual(self.db.setting("first_prompt_stop_minutes"), 75)
         self.assertEqual(self.db.setting("repeated_no_code_trace_minutes"), 40)
+        self.assertEqual(self.db.setting("business_progress_idle_minutes"), 60)
         self.assertEqual(self.db.setting("development_max_attempts"), 2)
         self.assertTrue(self.db.setting("task_generation_zero_to_one_only"))
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
@@ -1973,7 +1974,13 @@ class CoreTests(unittest.TestCase):
              "Docker 产物验收失败：未通过清洁 Compose 验收", stamp, stamp),
         )
         prepared = repo_root / "A"
-        with patch.object(self.service.claude, "reset_unsent_arm"), \
+        def reset_unsent(arm):
+            self.db.execute(
+                "UPDATE arm_runs SET status='queued',updated_at=? WHERE id=?",
+                (now_iso(), arm["id"]),
+            )
+
+        with patch.object(self.service.claude, "reset_unsent_arm", side_effect=reset_unsent), \
              patch.object(self.service.git, "prepare_arm_commit", return_value=prepared) as prepare, \
              patch.object(self.service.claude, "launch"), \
              patch.object(self.service.claude, "wait_until_ready"), \
@@ -3221,7 +3228,9 @@ class CoreTests(unittest.TestCase):
         }
         with patch.object(self.service.claude, "trace_state", return_value=state), \
              patch.object(self.service.claude, "runtime_alive", return_value=True), \
-             patch.object(self.service.claude, "has_business_code", return_value=False), \
+             patch.object(self.service.claude, "business_progress", return_value={
+                 "has_code": False, "last_modified": 0.0, "paths": [],
+             }), \
              patch.object(self.service, "_handle_attempt_failure", return_value={"status": "failed"}) as failure:
             self.service._monitor_arm(
                 pair["id"], "arm-repeat-no-code", "Build a hard project with Docker Compose",
@@ -3234,6 +3243,47 @@ class CoreTests(unittest.TestCase):
         detail = json.loads(latest["detail_json"])
         self.assertTrue(detail["matches_previous_attempt"])
         self.assertEqual(detail["rule_trigger"], "repeated_trace_early")
+
+    def test_monitor_restarts_business_code_after_one_hour_without_progress(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.set_setting("business_progress_idle_minutes", 60)
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        workspace = self.root / "idle-business"
+        workspace.mkdir()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,attempt_no,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,1,?,?)""",
+            ("arm-idle-business", pair["id"], "A", "A", str(workspace),
+             "container-idle", "screen-idle", "auto_model/urm", "image", stamp, stamp, stamp),
+        )
+        stale = time.time() - 61 * 60
+        state = {
+            "complete": False, "api_error": "", "activity_signature": "active-before-idle",
+            "activity_summary": ["tool:Write:file_path content"],
+            "last_tool_activity_at": datetime.fromtimestamp(stale, timezone.utc).isoformat(),
+        }
+        progress = {"has_code": True, "last_modified": stale, "paths": ["app/main.py"]}
+        with patch.object(self.service.claude, "trace_state", return_value=state), \
+             patch.object(self.service.claude, "runtime_alive", return_value=True), \
+             patch.object(self.service.claude, "business_progress", return_value=progress), \
+             patch.object(self.service, "_handle_attempt_failure", return_value={"status": "failed"}) as failure:
+            result = self.service._monitor_arm(
+                pair["id"], "arm-idle-business", "Build a hard project with Docker Compose",
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("连续 60 分钟没有", failure.call_args.args[3])
+        event = self.db.one(
+            "SELECT detail_json FROM audit_events WHERE event_type='claude.business_progress_timeout' "
+            "AND entity_id='arm-idle-business' ORDER BY id DESC LIMIT 1"
+        )
+        detail = json.loads(event["detail_json"])
+        self.assertEqual(detail["idleMinutes"], 60)
+        self.assertEqual(detail["businessPaths"], ["app/main.py"])
 
     def test_system_turn_companion_is_not_treated_as_manual_followup(self):
         prompt = "Build the requested project"
@@ -3614,6 +3664,61 @@ class CoreTests(unittest.TestCase):
             "AND entity_id='arm-old-api' ORDER BY id DESC LIMIT 1"
         )
         self.assertTrue(json.loads(event["detail_json"])["new_pair_launches_blocked"])
+
+    def test_exhausted_waiting_arm_is_failed_instead_of_restarted(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,attempt_no,error_retry_count,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'waiting_terminal_slot',NULL,3,2,?,?)""",
+            ("arm-exhausted", pair["id"], "A", "A", str(self.root / "exhausted"),
+             "container-exhausted", "screen-exhausted", "auto_model/urm", "image", stamp, stamp),
+        )
+
+        def archive(arm, error, **kwargs):
+            self.db.execute(
+                "UPDATE arm_runs SET status='failed',error=?,updated_at=? WHERE id=?",
+                (error, now_iso(), arm["id"]),
+            )
+            return self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],))
+
+        with patch.object(self.service.claude, "archive_failed_attempt", side_effect=archive) as stopped:
+            count = self.service._expire_exhausted_waiting_arm_retries()
+        self.assertEqual(count, 1)
+        stopped.assert_called_once()
+        self.assertEqual(
+            self.db.one("SELECT status FROM arm_runs WHERE id='arm-exhausted'")["status"], "failed",
+        )
+        self.assertIsNotNone(self.db.one(
+            "SELECT id FROM audit_events WHERE event_type='claude.exhausted_retry_blocked' "
+            "AND entity_id='arm-exhausted'",
+        ))
+
+    def test_terminal_reservation_rejects_duplicate_active_arm_owner(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?,?)""",
+            ("arm-already-owned", pair["id"], "A", "A", str(self.root / "owned"),
+             "container-owned", "screen-owned", "auto_model/urm", "image", stamp, stamp, stamp),
+        )
+        self.assertFalse(self.service._reserve_terminal_slot("arm-already-owned"))
+        self.assertEqual(
+            self.db.one("SELECT status FROM arm_runs WHERE id='arm-already-owned'")["status"],
+            "developing",
+        )
+        self.assertIsNotNone(self.db.one(
+            "SELECT id FROM audit_events WHERE event_type='claude.terminal_reservation_already_claimed' "
+            "AND entity_id='arm-already-owned'",
+        ))
 
     def test_waiting_arm_of_active_pair_resumes_when_pair_limit_is_full(self):
         self.db.set_setting("max_pairs_parallel", 1)
