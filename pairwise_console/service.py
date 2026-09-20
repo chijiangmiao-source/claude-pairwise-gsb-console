@@ -103,7 +103,7 @@ class PairwiseService:
         self._start_locks_lock = threading.Lock()
         self._start_locks: Dict[str, threading.Lock] = {}
         # Pair capacity and terminal capacity are separate. Two Pair projects
-        # may stay active while only three Claude terminals run at once.
+        # may stay active while up to four Claude terminals run at once.
         self._terminal_capacity_lock = threading.Lock()
         self._prompt_locks_lock = threading.Lock()
         self._prompt_locks: Dict[str, threading.Lock] = {}
@@ -145,7 +145,7 @@ class PairwiseService:
             "claude_model": self.config.claude_model,
             "claude_image": self.config.claude_image,
             "max_pairs_parallel": self.config.max_pairs_parallel,
-            "max_claude_terminals": 3,
+            "max_claude_terminals": 4,
             "ab_prompt_stagger_seconds": 30,
             "task_generation_max_parallel": self.config.task_generation_max_parallel,
             "task_pool_min_ready": 6,
@@ -574,7 +574,7 @@ class PairwiseService:
         }
 
     def _terminal_limit(self) -> int:
-        configured = int(self.db.setting("max_claude_terminals", 3))
+        configured = int(self.db.setting("max_claude_terminals", 4))
         return max(1, min(MAX_PAIR_PROJECTS * 2, configured))
 
     def _active_terminal_count(self) -> int:
