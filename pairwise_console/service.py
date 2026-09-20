@@ -926,6 +926,14 @@ class PairwiseService:
             )
 
     def _finish_checkpointed_arm(self, pair_id: str, arm_id: str) -> Dict[str, Any]:
+        # Scheduler recovery and the live monitor can observe the same exported
+        # trace at nearly the same time.  Serialize the full check/push/complete
+        # transition so a stale worker cannot compare the workspace against the
+        # branch SHA just pushed by the winning worker and call it "no code".
+        with self._pair_failure_lock(pair_id):
+            return self._finish_checkpointed_arm_locked(pair_id, arm_id)
+
+    def _finish_checkpointed_arm_locked(self, pair_id: str, arm_id: str) -> Dict[str, Any]:
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=? AND pair_id=?", (arm_id, pair_id)) or {}
         pair = self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair_id,)) or {}
         if arm.get("status") not in ("checkpointing", "exported") or pair.get("status") not in ("running", "review"):
@@ -3874,7 +3882,23 @@ class PairwiseService:
         active peer keeps its own development window before the Pair is replaced.
         API failures use the same budget.
         """
+        reported_attempt = max(1, int(arm.get("attempt_no") or 1))
         arm = self.db.one("SELECT * FROM arm_runs WHERE id=?", (arm["id"],)) or arm
+        if arm.get("status") == "completed" and arm.get("commit_sha"):
+            self.db.audit("claude.stale_failure_ignored", "arm_run", arm["id"], {
+                "reason": "arm_already_completed",
+                "commit_sha": arm.get("commit_sha"),
+                "reported_error": redact(error)[-1000:],
+            })
+            return arm
+        if max(1, int(arm.get("attempt_no") or 1)) != reported_attempt:
+            self.db.audit("claude.stale_failure_ignored", "arm_run", arm["id"], {
+                "reason": "attempt_already_replaced",
+                "reported_attempt": reported_attempt,
+                "current_attempt": int(arm.get("attempt_no") or 1),
+                "reported_error": redact(error)[-1000:],
+            })
+            return arm
         attempt = max(1, int(arm.get("attempt_no") or 1))
         if self._is_claude_api_error(error):
             return self._queue_api_retry(pair_id, arm, error)

@@ -1951,6 +1951,87 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["commit_sha"], delivered)
         self.assertEqual(result["error"], "")
 
+    def test_concurrent_checkpoint_workers_cannot_restart_completed_arm(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        traces = self.root / "completed-traces"
+        traces.mkdir()
+        workspace = self.root / "workspace-A"
+        workspace.mkdir()
+        delivered = "f" * 40
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,trace_path,result,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'checkpointing',?,?,?,?)""",
+            ("arm-concurrent-A", pair["id"], "A", "A", str(workspace),
+             "container-A", "screen-A", "auto_model/urm", "image", str(traces),
+             "finished", stamp, stamp),
+        )
+        first_push_started = threading.Event()
+        release_first_push = threading.Event()
+
+        def push_once(*_args):
+            first_push_started.set()
+            self.assertTrue(release_first_push.wait(2))
+            return delivered
+
+        results = []
+        with patch.object(self.service.claude, "has_business_code", return_value=True), \
+             patch.object(self.service.git, "push_arm", side_effect=push_once) as push, \
+             patch.object(self.service, "_handle_attempt_failure") as failure:
+            first = threading.Thread(
+                target=lambda: results.append(self.service._finish_checkpointed_arm(
+                    pair["id"], "arm-concurrent-A",
+                )),
+            )
+            second = threading.Thread(
+                target=lambda: results.append(self.service._finish_checkpointed_arm(
+                    pair["id"], "arm-concurrent-A",
+                )),
+            )
+            first.start()
+            self.assertTrue(first_push_started.wait(2))
+            second.start()
+            release_first_push.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertEqual(push.call_count, 1)
+        failure.assert_not_called()
+        current = self.db.one("SELECT status,commit_sha FROM arm_runs WHERE id='arm-concurrent-A'")
+        self.assertEqual(current, {"status": "completed", "commit_sha": delivered})
+        self.assertEqual(sorted(item.get("status", "") for item in results), ["", "completed"])
+
+    def test_stale_failure_callback_cannot_replace_completed_arm(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        delivered = "1" * 40
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,attempt_no,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,1,?,?)""",
+            ("arm-stale-completed-A", pair["id"], "A", "A", str(self.root / "workspace-A"),
+             "container-A", "screen-A", "auto_model/urm", "image", delivered, stamp, stamp),
+        )
+        stale = self.db.one("SELECT * FROM arm_runs WHERE id='arm-stale-completed-A'")
+        with patch.object(self.service, "_record_pair_development_failure") as record, \
+             patch.object(self.service, "_restart_arm_from_baseline") as restart:
+            result = self.service._handle_attempt_failure(
+                pair["id"], stale, "prompt", "late no-code result",
+            )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["commit_sha"], delivered)
+        record.assert_not_called()
+        restart.assert_not_called()
+
     def test_compose_port_variables_are_all_isolated(self):
         compose = self.root / "docker-compose.yml"
         compose.write_text(
