@@ -168,21 +168,16 @@ class RecordingManager:
                     "status": "failed", "error": str(exc)[-1000:], "mode": "failure",
                 })
             return
-        env, assigned_ports = isolated_compose_environment(compose)
-        port = int(
-            assigned_ports.get("WEB_PORT")
-            or assigned_ports.get("HTTP_PORT")
-            or assigned_ports.get("APP_PORT")
-            or assigned_ports.get("API_PORT")
-            or next(iter(assigned_ports.values()))
-        )
+        env, _ = isolated_compose_environment(compose)
         base = ["docker", "compose", "-p", project, "-f", str(compose)]
         try:
             run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=env)
             up = run_command(base + ["up", "-d", "--build"], cwd=workspace, check=False, timeout=1200, env=env)
             if up.returncode != 0:
                 raise RuntimeError("演示项目启动失败：" + redact(up.stderr or up.stdout))
-            discovered = self._published_port(base, workspace, env) or port
+            discovered = self._ensure_published_port(base, workspace, env)
+            if not discovered:
+                raise RuntimeError("演示项目没有发布可供浏览器访问的宿主机端口")
             entry_url = self._wait_for_url(discovered)
             with self._lock:
                 if attempt_id in self._cancelled:
@@ -467,6 +462,62 @@ pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-b
             for item in row.get("Publishers") or []:
                 value = int(item.get("PublishedPort") or 0)
                 if value: return value
+        return 0
+
+    @classmethod
+    def _ensure_published_port(cls, base, workspace: Path, env) -> int:
+        """Expose an app port when Docker Desktop suppresses it on internal networks.
+
+        On Docker Desktop for macOS a container attached only to a Compose
+        ``internal`` network keeps its requested HostConfig port binding, but
+        the engine does not activate that binding.  The browser recorder then
+        sees ``PublishedPort: 0`` even though the application is healthy.  Add
+        the standard bridge network only for this short-lived recording
+        runtime and let Docker activate the already-declared binding.
+        """
+        published = cls._published_port(base, workspace, env)
+        if published:
+            return published
+        result = run_command(
+            base + ["ps", "--format", "json"], cwd=workspace,
+            check=False, timeout=60, env=env,
+        )
+        try:
+            payload = json.loads(result.stdout)
+            rows = payload if isinstance(payload, list) else [payload]
+        except ValueError:
+            rows = []
+            for line in result.stdout.splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+        preferred = {"web": 0, "frontend": 1, "ui": 2, "client": 3,
+                     "api": 4, "app": 5, "server": 6, "backend": 7}
+        rows.sort(key=lambda row: preferred.get(
+            str(row.get("Service") or "").casefold(), 100,
+        ))
+        for row in rows:
+            container = str(row.get("ID") or row.get("Name") or "").strip()
+            if not container:
+                continue
+            binding = run_command(
+                ["docker", "inspect", container, "--format", "{{json .HostConfig.PortBindings}}"],
+                check=False, timeout=30,
+            )
+            if binding.returncode != 0 or not re.search(r'"HostPort"\s*:\s*"(?:0|[1-9][0-9]*)"', binding.stdout):
+                continue
+            connected = run_command(
+                ["docker", "network", "connect", "bridge", container],
+                check=False, timeout=30,
+            )
+            if connected.returncode != 0 and "already exists" not in (connected.stderr or "").casefold():
+                continue
+            for _ in range(10):
+                published = cls._published_port(base, workspace, env)
+                if published:
+                    return published
+                time.sleep(0.2)
         return 0
 
     @staticmethod

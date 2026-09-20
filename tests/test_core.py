@@ -2334,6 +2334,32 @@ class CoreTests(unittest.TestCase):
             port = RecordingManager._published_port(["docker", "compose"], self.root, {})
         self.assertEqual(port, 52002)
 
+    def test_recording_activates_declared_port_for_internal_network(self):
+        hidden = json.dumps([{
+            "ID": "container-app", "Service": "app",
+            "Publishers": [{"PublishedPort": 0}],
+        }])
+        visible = json.dumps([{
+            "ID": "container-app", "Service": "app",
+            "Publishers": [{"PublishedPort": 53001}],
+        }])
+        responses = [
+            MagicMock(stdout=hidden, returncode=0),
+            MagicMock(stdout=hidden, returncode=0),
+            MagicMock(stdout='{"80/tcp":[{"HostPort":"53001"}]}', returncode=0),
+            MagicMock(stdout="", stderr="", returncode=0),
+            MagicMock(stdout=visible, returncode=0),
+        ]
+        with patch("pairwise_console.recording.run_command", side_effect=responses) as command:
+            port = RecordingManager._ensure_published_port(
+                ["docker", "compose"], self.root, {},
+            )
+        self.assertEqual(port, 53001)
+        command.assert_any_call(
+            ["docker", "network", "connect", "bridge", "container-app"],
+            check=False, timeout=30,
+        )
+
     def test_artifact_failure_pair_reopens_for_commit_based_repair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
