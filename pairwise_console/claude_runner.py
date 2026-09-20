@@ -448,16 +448,24 @@ exit "$code"
 
     def trace_state(self, arm_run: Dict[str, Any], prompt: str) -> Dict[str, Any]:
         root = self.runtime_dir / arm_run["id"]
-        snapshot = root / ".trace-snapshot"
-        if snapshot.exists():
-            shutil.rmtree(snapshot)
+        # A recovered scheduler can briefly have two monitor workers for the
+        # same Arm.  A shared snapshot directory let one worker remove the
+        # JSONL while the other was reading it, which falsely consumed a
+        # development attempt.  Each inspection therefore owns an immutable
+        # snapshot and removes only its own copy.
+        snapshot = root / (".trace-snapshot-" + uuid.uuid4().hex)
         snapshot.mkdir(parents=True)
+
+        def finish(value: Dict[str, Any]) -> Dict[str, Any]:
+            shutil.rmtree(snapshot, ignore_errors=True)
+            return value
+
         copied = run_command(
             ["docker", "cp", "%s:%s/." % (arm_run["container_name"], CONTAINER_TRACE_PATH), str(snapshot)],
             check=False, timeout=120,
         )
         if copied.returncode != 0:
-            return {"complete": False, "api_error": "", "path": ""}
+            return finish({"complete": False, "api_error": "", "path": ""})
         for path in sorted(snapshot.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
             events = []
             try:
@@ -566,7 +574,7 @@ exit "$code"
                 completion_mode = "native_turn_end_after_tool"
                 finished = True
             activity_payload = activity[:80] or ["no-assistant-activity"]
-            return {
+            return finish({
                 "complete": finished,
                 "result": final_text or native_text or visible_text,
                 "completion_mode": completion_mode if finished else "",
@@ -587,10 +595,10 @@ exit "$code"
                     json.dumps(activity_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 ).hexdigest(),
                 "activity_summary": activity_payload[:12],
-            }
+            })
         empty_signature = hashlib.sha256(b'["no-trace-activity"]').hexdigest()
-        return {"complete": False, "api_error": "", "path": "",
-                "activity_signature": empty_signature, "activity_summary": ["no-trace-activity"]}
+        return finish({"complete": False, "api_error": "", "path": "",
+                       "activity_signature": empty_signature, "activity_summary": ["no-trace-activity"]})
 
     @staticmethod
     def has_business_code(workspace: Path, baseline_sha: str = "") -> bool:

@@ -4241,6 +4241,17 @@ class PairwiseService:
             # handed to the independent cooldown queue below. A trace that
             # already contains a later normal completion remains deliverable.
             error = str(state.get("monitor_error") or "")
+            if error and self.claude.runtime_alive(arm):
+                # Reading a live trace is observational. A transient copy or
+                # filesystem race must never terminate Claude or consume the
+                # Pair's development-failure budget.
+                self.db.audit("claude.trace_monitor_retry", "arm_run", arm_id, {
+                    "error": redact(error)[-1000:],
+                    "action": "keep_live_session_and_retry",
+                    "counts_toward_pair_failure_limit": False,
+                })
+                time.sleep(2)
+                continue
             if state.get("followup_detected"):
                 error = "检测到首轮后的追加消息，当前 Session 作废并从共同基线重跑：%s" % state.get("followup_text", "")
             if (not error and not state.get("complete") and not state.get("api_error")

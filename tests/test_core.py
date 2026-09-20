@@ -2688,6 +2688,49 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(state["completion_mode"], "native_turn_end")
         self.assertIn("Implemented", state["result"])
 
+    def test_parallel_trace_inspections_use_independent_snapshots(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-parallel-trace", "container_name": "container-parallel-trace"}
+        events = [
+            {"type": "user", "promptId": "prompt-1", "message": {"content": prompt}},
+            {"type": "assistant", "message": {
+                "stop_reason": "end_turn", "content": [{"type": "text", "text": "Finished"}],
+            }},
+            {"type": "system", "subtype": "turn_duration"},
+        ]
+        barrier = threading.Barrier(2)
+        snapshots = []
+        results = []
+        errors = []
+
+        def fake_copy(command, **_kwargs):
+            snapshot = Path(command[-1])
+            snapshots.append(snapshot)
+            (snapshot / "session.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8",
+            )
+            barrier.wait(timeout=2)
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        def inspect():
+            try:
+                results.append(self.service.claude.trace_state(arm, prompt))
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
+            workers = [threading.Thread(target=inspect) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=3)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item["complete"] for item in results))
+        self.assertEqual(len(set(snapshots)), 2)
+        self.assertTrue(all(not item.exists() for item in snapshots))
+
     def test_tool_use_progress_text_is_not_treated_as_completion(self):
         prompt = "Build the requested project"
         arm = {"id": "arm-tool-progress", "container_name": "container-tool-progress"}
@@ -2812,6 +2855,53 @@ class CoreTests(unittest.TestCase):
             "SELECT event_type FROM audit_events WHERE entity_id='arm-live-mismatch' ORDER BY id DESC LIMIT 1"
         )
         self.assertEqual(event["event_type"], "claude.live_prompt_mismatch")
+
+    def test_monitor_read_error_keeps_live_session_and_retries_without_counting_failure(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,prompt_sent_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'developing',?,?,?)""",
+            ("arm-monitor-retry", pair["id"], "A", "A", str(self.root / "A"),
+             "container-monitor-retry", "screen-monitor-retry", "auto_model/urm", "image",
+             stamp, stamp, stamp),
+        )
+        completed_state = {
+            "complete": True, "result": "Finished", "api_error": "",
+            "prompt_matches": True, "session_id": "session-monitor-retry",
+            "prompt_id": "prompt-monitor-retry",
+        }
+        finished = {"id": "arm-monitor-retry", "status": "completed"}
+        with patch.object(
+            self.service.claude, "trace_state",
+            side_effect=[FileNotFoundError("session.jsonl"), completed_state],
+        ), patch.object(
+            self.service.claude, "runtime_alive", return_value=True,
+        ), patch.object(
+            self.service.claude, "export_and_stop", return_value=self.root / "trace",
+        ), patch.object(
+            self.service, "_finish_checkpointed_arm", return_value=finished,
+        ), patch.object(
+            self.service, "_handle_attempt_failure",
+        ) as failure, patch("pairwise_console.service.time.sleep"):
+            result = self.service._monitor_arm(pair["id"], "arm-monitor-retry", "Build the requested project")
+
+        self.assertEqual(result, finished)
+        failure.assert_not_called()
+        pair_state = self.db.one(
+            "SELECT development_failure_count FROM pairs WHERE id=?", (pair["id"],),
+        )
+        self.assertEqual(pair_state["development_failure_count"], 0)
+        event = self.db.one(
+            "SELECT detail_json FROM audit_events WHERE event_type='claude.trace_monitor_retry' "
+            "AND entity_id='arm-monitor-retry' ORDER BY id DESC LIMIT 1"
+        )
+        self.assertFalse(json.loads(event["detail_json"])["counts_toward_pair_failure_limit"])
 
     def test_terminal_api_error_after_visible_progress_keeps_the_session_deliverable(self):
         prompt = "Build the requested project"
