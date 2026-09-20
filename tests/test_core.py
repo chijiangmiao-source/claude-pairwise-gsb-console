@@ -101,15 +101,15 @@ class CoreTests(unittest.TestCase):
         workspace.mkdir()
         (workspace / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
         (workspace / "compose.yml").write_text(
-            "services:\n  verify:\n    build: .\n", encoding="utf-8",
+            "services:\n  app:\n    build: .\n  verify:\n    build: .\n", encoding="utf-8",
         )
         self.db.set_setting("artifact_verify_timeout_seconds", 30)
 
         def command(args, **kwargs):
             from pairwise_console.commands import CommandResult
             if args[-4:] == ["--profile", "*", "config", "--services"]:
-                return CommandResult(args, str(workspace), 0, "verify\n", "")
-            if args[-3:] == ["run", "--rm", "verify"]:
+                return CommandResult(args, str(workspace), 0, "app\nverify\n", "")
+            if args[-4:] == ["run", "--rm", "--build", "verify"]:
                 raise __import__("subprocess").TimeoutExpired(args, 30, "partial output", "")
             stdout = '[{"State":"running"}]' if args[-3:] == ["ps", "--format", "json"] else "ok"
             return CommandResult(args, str(workspace), 0, stdout, "")
@@ -124,6 +124,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(verify["exit_code"], 124)
         self.assertIn("不能启动常驻服务", verify["detail"])
         self.assertEqual(result["checks"][-1]["name"], "cleanup")
+
+    def test_artifact_starts_apps_and_runs_verify_only_once(self):
+        workspace = self.root / "artifact-one-shot"
+        workspace.mkdir()
+        (workspace / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        (workspace / "compose.yml").write_text(
+            "services:\n  api:\n    build: .\n  web:\n    build: .\n  verify:\n    build: .\n",
+            encoding="utf-8",
+        )
+        calls = []
+
+        def command(args, **kwargs):
+            from pairwise_console.commands import CommandResult
+            calls.append(args)
+            if args[-4:] == ["--profile", "*", "config", "--services"]:
+                return CommandResult(args, str(workspace), 0, "api\nweb\nverify\n", "")
+            stdout = '[{"State":"running"}]' if args[-3:] == ["ps", "--format", "json"] else "ok"
+            return CommandResult(args, str(workspace), 0, stdout, "")
+
+        with patch("pairwise_console.artifact.run_command", side_effect=command), \
+             patch("pairwise_console.artifact.time.sleep"):
+            result = ArtifactChecker(self.db)._probe(workspace, "one-shot-test")
+
+        self.assertEqual(result["status"], "passed")
+        up = next(args for args in calls if "up" in args)
+        self.assertEqual(up[-5:], ["up", "-d", "--build", "api", "web"])
+        verify_calls = [args for args in calls if "run" in args]
+        self.assertEqual(len(verify_calls), 1)
+        self.assertEqual(verify_calls[0][-4:], ["run", "--rm", "--build", "verify"])
 
     def test_service_restart_closes_stale_generation_batches(self):
         stamp = now_iso()
@@ -184,7 +213,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(any("分号最多" in issue for issue in issues))
 
     def test_generated_task_scope_budget_accepts_old_system_shape(self):
-        prompt = "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供名为 verify 的可执行验收服务。" + "".join(("甲" * 60 + "。") for _ in range(4))
+        prompt = "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供名为 verify、执行后自行退出的一次性验收服务。" + "".join(("甲" * 60 + "。") for _ in range(4))
         issues = generated_task_prompt_issues(
             "zero_to_one", prompt, ["a", "b", "c"], {
                 "engineeringCore": "跨层状态裁决",
@@ -202,6 +231,20 @@ class CoreTests(unittest.TestCase):
         prompt = "".join(("甲" * 62 + "。") for _ in range(5))
         issues = generated_task_prompt_issues("zero_to_one", prompt, ["a", "b", "c"])
         self.assertTrue(any("verify" in issue for issue in issues))
+
+    def test_new_generated_zero_to_one_requires_one_shot_verify(self):
+        prompt = "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供名为 verify 的可执行验收服务。" + "".join(("甲" * 60 + "。") for _ in range(4))
+        candidate = {
+            "engineeringCore": "跨层状态裁决",
+            "mainUserFlow": "导入后核验并处理冲突",
+            "implementationModules": ["parser", "service", "api"],
+            "runtimeComponents": ["api"],
+            "auxiliaryMechanisms": [],
+            "newOperations": ["导入", "核验"],
+            "newStateSets": ["处理状态"],
+        }
+        issues = generated_task_prompt_issues("zero_to_one", prompt, ["a", "b", "c"], candidate)
+        self.assertTrue(any("一次性" in issue for issue in issues))
 
     def test_generated_feature_does_not_repeat_existing_verify_requirement(self):
         prompt = "".join(("甲" * 62 + "。") for _ in range(5))

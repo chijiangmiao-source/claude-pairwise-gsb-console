@@ -102,11 +102,26 @@ class ArtifactChecker:
             if config.returncode != 0:
                 raise RuntimeError("Compose 配置无效")
             base = ["docker", "compose", "-p", project, "-f", str(compose)]
+            services = run_command(
+                base + ["--profile", "*", "config", "--services"],
+                cwd=workspace, check=False, timeout=60, env=compose_env,
+            )
+            service_names = {line.strip() for line in services.stdout.splitlines() if line.strip()}
+            has_verify = "verify" in service_names
+            application_services = sorted(service_names - {"verify"})
             run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=compose_env)
-            up = run_command(base + ["up", "-d", "--build"], cwd=workspace, check=False, timeout=1200, env=compose_env)
+            # `verify` is a one-shot acceptance service. Starting it as part of
+            # `compose up` and then running it again below executes destructive
+            # or non-idempotent acceptance scenarios twice. Start only the
+            # application services and run verify exactly once afterwards.
+            up_command = base + ["up", "-d", "--build"] + application_services
+            up = run_command(up_command, cwd=workspace, check=False, timeout=1200, env=compose_env)
             self._record(
                 checks, "clean_start", up.returncode == 0, redact(up.stderr or up.stdout),
-                "docker compose -p %s -f %s up -d --build" % (project, compose.name),
+                "docker compose -p %s -f %s up -d --build%s" % (
+                    project, compose.name,
+                    (" " + " ".join(application_services)) if application_services else "",
+                ),
                 up.returncode,
             )
             if up.returncode != 0:
@@ -119,15 +134,9 @@ class ArtifactChecker:
                 "docker compose -p %s -f %s ps --format json" % (project, compose.name),
                 ps.returncode,
             )
-            services = run_command(
-                base + ["--profile", "*", "config", "--services"],
-                cwd=workspace, check=False, timeout=60, env=compose_env,
-            )
-            service_names = {line.strip() for line in services.stdout.splitlines() if line.strip()}
-            has_verify = "verify" in service_names
             self._record(checks, "verify_service_present", has_verify, ", ".join(sorted(service_names)))
             if has_verify:
-                verify_command = base + ["run", "--rm", "verify"]
+                verify_command = base + ["run", "--rm", "--build", "verify"]
                 verify_timeout = max(
                     30, min(600, int(self.db.setting("artifact_verify_timeout_seconds", 300))),
                 )
@@ -139,7 +148,7 @@ class ArtifactChecker:
                     self._record(
                         checks, "verify_service", verify.returncode == 0,
                         redact(verify.stdout + "\n" + verify.stderr),
-                        "docker compose -p %s -f %s run --rm verify" % (project, compose.name),
+                        "docker compose -p %s -f %s run --rm --build verify" % (project, compose.name),
                         verify.returncode,
                     )
                 except subprocess.TimeoutExpired as exc:
@@ -148,7 +157,7 @@ class ArtifactChecker:
                         checks, "verify_service", False,
                         "verify 服务超过 %d 秒仍未退出；它必须执行验收后自动退出，不能启动常驻服务。\n%s"
                         % (verify_timeout, redact(output)),
-                        "docker compose -p %s -f %s run --rm verify" % (project, compose.name),
+                        "docker compose -p %s -f %s run --rm --build verify" % (project, compose.name),
                         124,
                     )
             down = run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=compose_env)
