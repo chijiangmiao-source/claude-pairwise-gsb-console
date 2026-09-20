@@ -734,13 +734,22 @@ class PairwiseService:
         if not self._automation_lock.acquire(blocking=False):
             return self.automation_status()
         try:
+            waiting_development_arms = self._waiting_development_arm_count()
             waiting_api_arms = int((self.db.one(
                 """SELECT COUNT(*) count FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
                      WHERE a.status='waiting_api_retry' AND p.stage='development'
                        AND p.status IN ('running','waiting_api_retry')"""
             ) or {"count": 0})["count"])
             api_cooling = self._api_cooldown_active()
-            start_blocked = api_cooling or waiting_api_arms > 0 or self._pair_start_blocked()
+            queued_arm_scheduled = False
+            if waiting_development_arms and not api_cooling:
+                queued_arm_scheduled = self._schedule_next_waiting_development_arm()
+            # Existing Arm work always owns the next terminal slot. A ready
+            # project must not jump ahead while a prior A/B side is queued.
+            start_blocked = (
+                api_cooling or waiting_api_arms > 0
+                or waiting_development_arms > 0 or self._pair_start_blocked()
+            )
             pair_start_scheduled = False
             active_pairs = self.db.all(
                 """SELECT * FROM pairs WHERE status IN ('queued','running','review')
@@ -809,7 +818,8 @@ class PairwiseService:
             if waiting_api_arms:
                 if (bool(self.db.setting("claude_api_auto_retry_enabled", True))
                         and not self._api_cooldown_active()
-                        and not self._api_probe_blocked()):
+                        and not self._api_probe_blocked()
+                        and not queued_arm_scheduled):
                     active_count += self._schedule_due_api_retries(
                         max(0, pair_limit - active_count),
                     )
@@ -836,6 +846,70 @@ class PairwiseService:
             return self.automation_status()
         finally:
             self._automation_lock.release()
+
+    def _waiting_development_arm_count(self) -> int:
+        """Count resumable A/B sides that must run before a new Pair starts."""
+        return int((self.db.one(
+            """SELECT COUNT(*) count FROM arm_runs a
+                 JOIN pairs p ON p.id=a.pair_id
+                WHERE a.prompt_sent_at IS NULL AND p.stage='development'
+                  AND p.status IN ('queued','running','review','waiting_api_retry')
+                  AND a.status IN ('queued','waiting_retry','waiting_terminal_slot','waiting_api_retry')"""
+        ) or {"count": 0})["count"])
+
+    def _schedule_next_waiting_development_arm(self) -> bool:
+        """Give the oldest queued Arm the next free Claude terminal slot."""
+        if self._api_cooldown_active() or self._active_terminal_count() >= self._terminal_limit():
+            return False
+        api_enabled = bool(self.db.setting("claude_api_auto_retry_enabled", True))
+        row = self.db.one(
+            """SELECT a.id arm_id,a.pair_id,a.status,p.status pair_status,t.prompt,
+                      COALESCE((
+                        SELECT MIN(e.created_at) FROM audit_events e
+                         WHERE e.entity_id=a.id AND e.event_type IN (
+                           'claude.api_retry_queued','claude.terminal_slot_waiting',
+                           'claude.retry_waiting_terminal_slot',
+                           'claude.false_monitor_failure_requeued'
+                         )
+                      ),a.updated_at) queued_at
+                 FROM arm_runs a JOIN pairs p ON p.id=a.pair_id
+                 JOIN tasks t ON t.id=p.task_id
+                WHERE a.prompt_sent_at IS NULL AND p.stage='development'
+                  AND p.status IN ('queued','running','review','waiting_api_retry')
+                  AND (
+                    a.status IN ('queued','waiting_retry','waiting_terminal_slot')
+                    OR (a.status='waiting_api_retry' AND ?=1
+                        AND (a.api_retry_after IS NULL OR a.api_retry_after<=?))
+                  )
+                ORDER BY queued_at,a.updated_at,a.id LIMIT 1""",
+            (1 if api_enabled else 0, now_iso()),
+        )
+        if not row:
+            return False
+        is_api_retry = row["status"] == "waiting_api_retry"
+        operation = ("api-retry-" if is_api_retry else "retry-recover-") + row["arm_id"]
+        target = self._recover_api_retry if is_api_retry else self._recover_pending_retry
+        submitted = self._submit_monitor(
+            operation, target, row["pair_id"], row["arm_id"], row["prompt"],
+        )
+        if not submitted:
+            return False
+        if is_api_retry:
+            stamp = now_iso()
+            self.db.execute(
+                """UPDATE pairs SET status='running',error='',updated_at=?
+                     WHERE id=? AND status='waiting_api_retry' AND stage='development'""",
+                (stamp, row["pair_id"]),
+            )
+            self.db.set_setting(
+                "claude_api_probe_after",
+                (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="seconds"),
+            )
+        self.db.audit("claude.queued_arm_prioritized", "arm_run", row["arm_id"], {
+            "pair_id": row["pair_id"], "queued_at": row.get("queued_at") or "",
+            "queue_status": row["status"], "new_pair_launches_blocked": True,
+        })
+        return True
 
     def _schedule_next_automatic_recording(self, pairs: List[Dict[str, Any]]) -> None:
         if self.db.one(
@@ -955,14 +1029,8 @@ class PairwiseService:
             return
         for arm in self.db.all(
             """SELECT * FROM arm_runs WHERE pair_id=? AND prompt_sent_at IS NULL
-               AND status IN ('queued','launching','waiting_retry','waiting_terminal_slot','running')""", (pair_id,),
+               AND status IN ('queued','launching','waiting_retry','running')""", (pair_id,),
         ):
-            if arm.get("status") == "waiting_terminal_slot":
-                self._submit_monitor(
-                    "retry-recover-" + arm["id"], self._recover_pending_retry,
-                    pair_id, arm["id"], prompt,
-                )
-                continue
             try:
                 updated = datetime.fromisoformat(
                     str(arm.get("updated_at") or "").replace("Z", "+00:00")

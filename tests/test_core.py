@@ -3450,6 +3450,49 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-spare'")["status"], "ready")
         refill.assert_not_called()
 
+    def test_oldest_queued_arm_wins_across_api_and_terminal_waits(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            "UPDATE pairs SET status='running',stage='development' WHERE id=?", (pair["id"],),
+        )
+        for arm_id, arm, status in (
+            ("arm-old-api", "A", "waiting_api_retry"),
+            ("arm-new-terminal", "B", "waiting_terminal_slot"),
+        ):
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,prompt_sent_at,api_retry_count,api_retry_after,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,NULL,1,?,?,?)""",
+                (arm_id, pair["id"], arm, arm, str(self.root / arm_id),
+                 "container-" + arm_id, "screen-" + arm_id, "auto_model/urm", "image", status,
+                 "2000-01-01T00:00:00+00:00" if status == "waiting_api_retry" else None,
+                 stamp, stamp),
+            )
+        self.db.execute(
+            """INSERT INTO audit_events(event_type,entity_type,entity_id,detail_json,created_at)
+               VALUES('claude.api_retry_queued','arm_run','arm-old-api','{}','2026-01-01T00:00:00+00:00')"""
+        )
+        self.db.execute(
+            """INSERT INTO audit_events(event_type,entity_type,entity_id,detail_json,created_at)
+               VALUES('claude.terminal_slot_waiting','arm_run','arm-new-terminal','{}','2026-02-01T00:00:00+00:00')"""
+        )
+        submitted = []
+        with patch.object(self.service, "_active_terminal_count", return_value=0), \
+             patch.object(
+                 self.service, "_submit_monitor",
+                 side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+             ):
+            scheduled = self.service._schedule_next_waiting_development_arm()
+        self.assertTrue(scheduled)
+        self.assertEqual(submitted, ["api-retry-arm-old-api"])
+        event = self.db.one(
+            "SELECT detail_json FROM audit_events WHERE event_type='claude.queued_arm_prioritized' "
+            "AND entity_id='arm-old-api' ORDER BY id DESC LIMIT 1"
+        )
+        self.assertTrue(json.loads(event["detail_json"])["new_pair_launches_blocked"])
+
     def test_waiting_arm_of_active_pair_resumes_when_pair_limit_is_full(self):
         self.db.set_setting("max_pairs_parallel", 1)
         self.insert_ready_task()
