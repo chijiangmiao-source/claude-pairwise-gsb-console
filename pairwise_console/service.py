@@ -2933,7 +2933,7 @@ class PairwiseService:
         )
         failure_arms = [row.get("arm") for row in checks if row.get("status") == "observed_failed"]
         completion_note = (
-            "原始交付的 Docker/测试验收失败，已保存短录像并按轨迹完成 GSB：" + "、".join(failure_arms)
+            "原始交付存在 Docker/业务测试缺陷，已按真实运行状态保存录像并完成 GSB：" + "、".join(failure_arms)
             if failure_arms else ""
         )
         self.db.execute(

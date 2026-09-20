@@ -391,7 +391,7 @@ pre{height:410px;overflow:auto;margin:0;padding:24px;white-space:pre-wrap;word-b
                 )
                 failed_arms = [str(item.get("arm") or "") for item in failed_checks]
                 completion_note = (
-                    "原始交付的 Docker/测试验收失败，已保存短录像并按轨迹完成 GSB："
+                    "原始交付存在 Docker/业务测试缺陷，已按真实运行状态保存录像并完成 GSB："
                     + "、".join(failed_arms)
                     if failed_arms else ""
                 )
