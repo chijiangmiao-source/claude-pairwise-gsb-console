@@ -1784,7 +1784,11 @@ class PairwiseService:
         if remaining <= 0:
             return scheduled
         seed_sources = self.db.all(
-            """SELECT p.id FROM pairs p JOIN tasks t ON t.id=p.task_id
+            """SELECT p.id,COUNT(f.id) failed_seed_attempts
+               FROM pairs p JOIN tasks t ON t.id=p.task_id
+               LEFT JOIN audit_events f
+                 ON f.event_type='bug.seed_generation_failed'
+                AND f.entity_type='pair' AND f.entity_id=p.id
                WHERE p.status='completed' AND t.task_type='zero_to_one'
                  AND NOT EXISTS (
                    SELECT 1 FROM delivery_submissions d
@@ -1802,7 +1806,8 @@ class PairwiseService:
                     WHERE a.pair_id=p.id AND a.status='completed'
                       AND a.arm=CASE WHEN p.winner='B better' THEN 'B' ELSE 'A' END
                  )
-               ORDER BY p.completed_at DESC,p.id"""
+               GROUP BY p.id
+               ORDER BY failed_seed_attempts ASC,p.completed_at DESC,p.id"""
         )
         with self._future_lock:
             active_seeds = sum(
