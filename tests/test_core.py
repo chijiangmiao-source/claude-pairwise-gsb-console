@@ -547,7 +547,7 @@ class CoreTests(unittest.TestCase):
         start.assert_called_once_with("pair-bug")
         self.assertEqual(result["replacementTaskId"], "task-replacement-bug")
 
-    def test_manual_bug_label_cannot_bypass_structured_hard_review(self):
+    def test_manual_bug_label_cannot_bypass_structured_review(self):
         stamp = now_iso()
         self.db.execute(
             """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
@@ -563,7 +563,7 @@ class CoreTests(unittest.TestCase):
 
         task = self.db.one("SELECT status,rejection_reason FROM tasks WHERE id='task-unreviewed-bug'")
         self.assertEqual(task["status"], "rejected")
-        self.assertIn("困难/地狱", task["rejection_reason"])
+        self.assertIn("独立审核记录", task["rejection_reason"])
 
     def test_latest_bug_review_rejection_supersedes_earlier_pass(self):
         stamp = now_iso()
@@ -613,6 +613,63 @@ class CoreTests(unittest.TestCase):
             "injected_lines": 16, "review": review,
         })
         self.assertIn("超过 120 分钟", self.service._bug_task_review_rejection(task))
+
+        review.update(difficulty="中等", estimatedRepairMinutes=35, estimatedChangedLines=50)
+        self.db.audit("bug.manual_task_review_passed", "task", "task-time-bounded-bug", {
+            "injected_lines": 16, "review": review,
+        })
+        self.assertEqual(self.service._bug_task_review_rejection(task), "")
+
+        review["estimatedChangedLines"] = 49
+        self.db.audit("bug.manual_task_review_passed", "task", "task-time-bounded-bug", {
+            "injected_lines": 16, "review": review,
+        })
+        self.assertIn("中等且修复不少于 50 行", self.service._bug_task_review_rejection(task))
+
+    def test_substantial_medium_bug_is_selected_and_refilled(self):
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+               difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'中等','[]',?,'ready',?,?)""",
+            ("task-medium-bug", "manual_seeded_bug", "bugfix", "cross-module repair",
+             "Fix the reproducible cross-module state corruption", "medium-bug", stamp, stamp),
+        )
+        self.db.audit("bug.manual_task_review_passed", "task", "task-medium-bug", {
+            "injected_lines": 18,
+            "review": {
+                "accepted": True, "difficulty": "中等",
+                "estimatedRepairMinutes": 80, "estimatedChangedLines": 50,
+                "estimatedChangedFiles": 3, "answerLeak": False,
+            },
+        })
+        self.db.set_setting("task_selection_task_type", "bugfix")
+        self.assertEqual(self.service._next_ready_task()["id"], "task-medium-bug")
+        self.db.execute(
+            "INSERT INTO project_chains(id,root_task_id,created_at,updated_at) VALUES(?,?,?,?)",
+            ("chain-medium-bug", "task-medium-bug", stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO pairs(id,task_id,chain_id,status,stage,created_at,updated_at)
+               VALUES(?,?,?,'completed','completed',?,?)""",
+            ("pair-medium-bug", "task-medium-bug", "chain-medium-bug", stamp, stamp),
+        )
+
+        self.db.execute(
+            """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,
+               preconditions,reproduction_steps_json,actual_result,expected_result,difficulty,
+               difficulty_evidence_json,reproduction_commands_json,reproduce_count,
+               reproduction_results_json,status,error,created_at,updated_at)
+               VALUES(?,?,?,?,?,'','[]','','','中等','[]','[]',2,'[]','reproduced','',?,?)""",
+            ("bug-medium", "pair-medium-bug", "A", "a" * 40, "substantial medium bug", stamp, stamp),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_auto",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ):
+            self.assertEqual(self.service._schedule_bugfix_refill_jobs(1), 1)
+        self.assertEqual(submitted, ["bug-convert-bug-medium"])
 
     def test_bugfix_only_refill_does_not_fall_back_to_new_zero_to_one(self):
         self.db.set_setting("task_selection_task_type", "bugfix")
@@ -1317,7 +1374,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(delivery["status"], "discarded")
         self.assertIn("低于困难/地狱", delivery["error"])
 
-    def test_actual_difficulty_review_rejects_medium_bugfix(self):
+    def test_actual_difficulty_review_allows_medium_bugfix(self):
         pair = self._prepare_pair_for_difficulty_review()
         self.db.execute("UPDATE tasks SET task_type='bugfix' WHERE id='task-1'")
         result = {
@@ -1327,13 +1384,13 @@ class CoreTests(unittest.TestCase):
         }
         with patch.object(self.service.codex, "run", return_value=result):
             review = self.service.reassess_actual_difficulty(pair["id"])
-        self.assertEqual(review["status"], "rejected")
+        self.assertEqual(review["status"], "passed")
         self.assertEqual(review["assessed_difficulty"], "中等")
         self.assertEqual(
             self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
-            {"status": "failed", "stage": "difficulty_rejected"},
+            {"status": "running", "stage": "recording"},
         )
-        self.assertEqual(self.db.one("SELECT difficulty FROM tasks WHERE id='task-1'")["difficulty"], "困难")
+        self.assertEqual(self.db.one("SELECT difficulty FROM tasks WHERE id='task-1'")["difficulty"], "中等")
 
     def test_evidence_filter_finds_any_manual_rerecord_attempt(self):
         pair = self._prepare_pair_for_difficulty_review()
@@ -2752,8 +2809,23 @@ class CoreTests(unittest.TestCase):
     def test_recording_starts_application_services_without_one_shot_acceptance(self):
         services = RecordingManager._application_services([
             "backend", "web", "verify", "browser-verify", "e2e-tests",
+            "acceptance", "api-acceptance", "acceptance-replay",
         ])
         self.assertEqual(services, ["backend", "web"])
+
+    def test_recording_cleanup_includes_disabled_profile_containers(self):
+        remaining = {"night-planner", "acceptance"}
+
+        def compose(command, **kwargs):
+            if "--profile" in command and command[command.index("--profile") + 1] == "*":
+                remaining.clear()
+            else:
+                remaining.discard("night-planner")
+            return MagicMock(returncode=0)
+
+        with patch("pairwise_console.recording.run_command", side_effect=compose):
+            RecordingManager._cleanup_runtime(["docker", "compose", "-p", "demo"], self.root, {})
+        self.assertEqual(remaining, set())
 
     def test_recording_prefers_api_published_port_over_database(self):
         compose_ps = json.dumps([
@@ -3453,7 +3525,7 @@ class CoreTests(unittest.TestCase):
         )
         self.assertFalse(json.loads(event["detail_json"])["counts_toward_pair_failure_limit"])
 
-    def test_terminal_api_error_after_visible_progress_keeps_the_session_deliverable(self):
+    def test_terminal_api_error_after_visible_progress_is_not_success(self):
         prompt = "Build the requested project"
         arm = {"id": "arm-api-turn-end", "container_name": "container-api-turn-end"}
         events = [
@@ -3477,10 +3549,53 @@ class CoreTests(unittest.TestCase):
 
         with patch("pairwise_console.claude_runner.run_command", side_effect=fake_copy):
             state = self.service.claude.trace_state(arm, prompt)
-        self.assertTrue(state["complete"])
-        self.assertEqual(state["completion_mode"], "native_turn_end")
+        self.assertFalse(state["complete"])
+        self.assertEqual(state["completion_mode"], "")
         self.assertIn("504", state["api_error"])
         self.assertIn("Implemented", state["result"])
+
+    def test_terminal_done_footer_is_a_fallback_for_missing_trace_end(self):
+        prompt = "Build the requested project"
+        arm = {"id": "arm-terminal-done", "container_name": "container-done", "screen_name": "screen-done"}
+        footer = "✻ Baked for 31m 48s · done 5:49 PM"
+        for api_error in (False, True):
+            with self.subTest(api_error=api_error):
+                events = [
+                    {"type": "user", "message": {"content": prompt}},
+                    {"type": "assistant", "message": {"stop_reason": "tool_use", "content": [
+                        {"type": "text", "text": "Running final verification."},
+                        {"type": "tool_use", "name": "Bash", "input": {"command": "test"}},
+                    ]}},
+                    {"type": "user", "message": {"content": [{"type": "tool_result", "content": "passed"}]}},
+                ]
+                if api_error:
+                    events.append({"type": "assistant", "isApiErrorMessage": True, "message": {
+                        "content": [{"type": "text", "text": "API Error: 504 Gateway Time-out"}],
+                    }})
+
+                def fake_command(command, **_kwargs):
+                    path = Path(command[-1])
+                    if command[0] == "screen":
+                        path.write_text(footer + "\n❯ \n", encoding="utf-8")
+                    else:
+                        (path / "session.jsonl").write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+                    return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+                with patch("pairwise_console.claude_runner.run_command", side_effect=fake_command):
+                    state = self.service.claude.trace_state(arm, prompt)
+                self.assertEqual(state["complete"], not api_error)
+                self.assertEqual(state["terminal_done"], footer)
+                self.assertEqual(state["completion_mode"], "" if api_error else "terminal_done")
+
+    def test_terminal_done_ignores_tool_text_and_old_footer_above_running_work(self):
+        detect = self.service.claude.terminal_done_marker
+        footer = "✻ Baked for 31m 48s · done 5:49 PM"
+        self.assertEqual(detect(footer), footer)
+        self.assertTrue(detect("✻Brewed for 44m 20s· done 6:15 PM"))
+        self.assertFalse(detect("test done 5:49 PM"))
+        self.assertFalse(detect("echo '" + footer + "'"))
+        self.assertFalse(detect(footer + "\n* Thinking…\nesc to interrupt"))
+        self.assertFalse(detect(footer + "\n⏺ Bash(npm test)\nRunning…"))
 
     def test_native_turn_end_after_tool_result_is_complete_without_final_text(self):
         prompt = "Build the requested project"
@@ -4435,7 +4550,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(regenerated["status"], "ready")
         self.assertEqual(regenerated["prompt"], natural_prompt)
 
-    def test_medium_bug_cannot_reproduce_or_convert(self):
+    def test_simple_bug_cannot_reproduce_or_convert(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
         stamp = now_iso()
@@ -4445,12 +4560,12 @@ class CoreTests(unittest.TestCase):
                difficulty_evidence_json,status,created_at,updated_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             ("bug-medium", pair["id"], "A", "abc123", "small validation gap", "valid request",
-             '["submit request"]', "wrong message", "right message", 2, "中等",
+             '["submit request"]', "wrong message", "right message", 2, "简单",
              '["局部校验"]', "reproduced", stamp, stamp),
         )
-        with self.assertRaisesRegex(ValueError, "困难或地狱"):
+        with self.assertRaisesRegex(ValueError, "简单"):
             self.service.convert_bug_to_task("bug-medium")
-        with self.assertRaisesRegex(ValueError, "困难或地狱"):
+        with self.assertRaisesRegex(ValueError, "简单"):
             self.service.reproduce_bug("bug-medium")
 
     def test_discovered_bug_review_rejects_answer_leak(self):
