@@ -17,7 +17,8 @@ from .artifact import ArtifactChecker
 from .claude_runner import ClaudeRunner
 from .classification import normalize_project_category, normalize_stack
 from .codex_runner import (
-    ACTUAL_DIFFICULTY_SCHEMA, BUG_DISCOVERY_SCHEMA, BUG_TASK_PROMPT_SCHEMA, CodexRunner,
+    ACTUAL_DIFFICULTY_SCHEMA, BUG_DISCOVERY_SCHEMA, BUG_TASK_PROMPT_SCHEMA,
+    SEEDED_BUG_REVIEW_SCHEMA, SEEDED_BUG_SCHEMA, CodexRunner,
     GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA,
 )
 from .config import Config, MAX_PAIR_PROJECTS
@@ -28,7 +29,7 @@ from .importer import fingerprint, import_historical_tasks
 from .prompts import (
     actual_difficulty_review_prompt, bug_discovery_prompt, bugfix_task_prompt, feature_generation_prompt,
     generated_task_prompt_issues, gsb_prompt, gsb_recheck_prompt, task_generation_prompt,
-    task_validation_prompt,
+    task_validation_prompt, seeded_bug_prompt, seeded_bug_review_prompt,
 )
 from .recording import RecordingManager
 from .commands import redact, run_command
@@ -134,6 +135,12 @@ class PairwiseService:
                finished_at=?,updated_at=? WHERE status='running'""",
             (stamp, stamp),
         )
+        self.db.execute(
+            """UPDATE bug_candidates SET status='awaiting_reproduction',
+               error='服务重启时复现作业仍处于运行态，已释放并重新排队',updated_at=?
+               WHERE status='reproducing'""",
+            (stamp,),
+        )
 
     def _seed_settings(self) -> None:
         defaults = {
@@ -148,8 +155,10 @@ class PairwiseService:
             "max_claude_terminals": 4,
             "ab_prompt_stagger_seconds": 30,
             "task_generation_max_parallel": self.config.task_generation_max_parallel,
+            "bug_reproduction_max_parallel": 2,
+            "bug_seed_max_parallel": 1,
             "task_pool_min_ready": 6,
-            "task_pool_target_ready": 12,
+            "task_pool_target_ready": 6,
             "auto_refill_enabled": True,
             "auto_refill_interval_seconds": 60,
             "task_generation_zero_to_one_only": True,
@@ -1557,8 +1566,8 @@ class PairwiseService:
                     "bug-reproduce-" + candidate["id"], self.reproduce_bug, candidate["id"],
                 )
             source = self.db.one(
-                """SELECT p.id FROM pairs p
-                   WHERE p.status='completed'
+                """SELECT p.id FROM pairs p JOIN tasks t ON t.id=p.task_id
+                   WHERE p.status='completed' AND t.task_type='zero_to_one'
                      AND NOT EXISTS (
                        SELECT 1 FROM delivery_submissions d
                         WHERE d.pair_id=p.id AND d.status='discarded'
@@ -1567,6 +1576,13 @@ class PairwiseService:
                        SELECT 1 FROM audit_events e
                         WHERE e.event_type='bug.discovery_completed'
                           AND e.entity_type='pair' AND e.entity_id=p.id
+                     )
+                     AND EXISTS (
+                       SELECT 1 FROM arm_runs a JOIN artifact_checks c
+                         ON c.pair_id=a.pair_id AND c.arm=a.arm
+                        AND c.commit_sha=a.commit_sha AND c.status='passed'
+                        WHERE a.pair_id=p.id AND a.status='completed'
+                          AND a.arm=CASE WHEN p.winner='B better' THEN 'B' ELSE 'A' END
                      )
                    ORDER BY p.completed_at,p.id LIMIT 1"""
             )
@@ -1579,6 +1595,129 @@ class PairwiseService:
             return self._schedule_task_source("zero_to_one")
         raise ValueError("未知任务类型：" + task_type)
 
+    def _schedule_bugfix_refill_jobs(self, limit: int) -> int:
+        """Advance enough independent Bug sources to refill the ready pool.
+
+        The older scheduler inspected only the first source each minute. While
+        that source was still running, its idempotency key blocked the retry
+        and the remaining completed projects were never inspected. Walk all
+        stages and sources so the configured generation capacity is actually
+        used, while every individual candidate/source remains idempotent.
+        """
+        remaining = max(0, int(limit))
+        scheduled = 0
+        for row in self.db.all(
+            """SELECT id FROM bug_candidates WHERE status='reproduced'
+                 ORDER BY updated_at,id"""
+        ):
+            if self._submit_auto(
+                "bug-convert-" + row["id"], self.convert_bug_to_task, row["id"],
+            ):
+                scheduled += 1
+                remaining -= 1
+                if remaining <= 0:
+                    break
+        if remaining <= 0:
+            return scheduled
+        with self._future_lock:
+            active_reproductions = sum(
+                1 for key, future in self._futures.items()
+                if key.startswith("bug-reproduce-") and not future.done()
+            )
+        reproduction_slots = max(
+            0,
+            int(self.db.setting("bug_reproduction_max_parallel", 2)) - active_reproductions,
+        )
+        for row in self.db.all(
+            """SELECT id FROM bug_candidates WHERE status='awaiting_reproduction'
+                 ORDER BY created_at,id"""
+        ):
+            if reproduction_slots <= 0:
+                break
+            if self._submit_auto(
+                "bug-reproduce-" + row["id"], self.reproduce_bug, row["id"],
+            ):
+                scheduled += 1
+                remaining -= 1
+                reproduction_slots -= 1
+                if remaining <= 0:
+                    break
+        if remaining <= 0:
+            return scheduled
+        sources = self.db.all(
+            """SELECT p.id FROM pairs p JOIN tasks t ON t.id=p.task_id
+               WHERE p.status='completed'
+                 AND t.task_type='zero_to_one'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM delivery_submissions d
+                    WHERE d.pair_id=p.id AND d.status='discarded'
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM audit_events e
+                    WHERE e.event_type='bug.discovery_completed'
+                      AND e.entity_type='pair' AND e.entity_id=p.id
+                 )
+                 AND EXISTS (
+                   SELECT 1 FROM arm_runs a JOIN artifact_checks c
+                     ON c.pair_id=a.pair_id AND c.arm=a.arm
+                    AND c.commit_sha=a.commit_sha AND c.status='passed'
+                    WHERE a.pair_id=p.id AND a.status='completed'
+                      AND a.arm=CASE WHEN p.winner='B better' THEN 'B' ELSE 'A' END
+                 )
+               ORDER BY p.completed_at DESC,p.id"""
+        )
+        for source in sources:
+            if self._submit_auto(
+                "bugs-" + source["id"], self.discover_bugs, source["id"],
+            ):
+                scheduled += 1
+                remaining -= 1
+                if remaining <= 0:
+                    break
+        if remaining <= 0:
+            return scheduled
+        seed_sources = self.db.all(
+            """SELECT p.id FROM pairs p JOIN tasks t ON t.id=p.task_id
+               WHERE p.status='completed' AND t.task_type='zero_to_one'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM delivery_submissions d
+                    WHERE d.pair_id=p.id AND d.status='discarded'
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM tasks seeded
+                    WHERE seeded.source='auto_seeded_bug'
+                      AND seeded.parent_pair_id=p.id
+                 )
+                 AND EXISTS (
+                   SELECT 1 FROM arm_runs a JOIN artifact_checks c
+                     ON c.pair_id=a.pair_id AND c.arm=a.arm
+                    AND c.commit_sha=a.commit_sha AND c.status='passed'
+                    WHERE a.pair_id=p.id AND a.status='completed'
+                      AND a.arm=CASE WHEN p.winner='B better' THEN 'B' ELSE 'A' END
+                 )
+               ORDER BY p.completed_at DESC,p.id"""
+        )
+        with self._future_lock:
+            active_seeds = sum(
+                1 for key, future in self._futures.items()
+                if key.startswith("bug-seed-") and not future.done()
+            )
+        seed_slots = max(
+            0, int(self.db.setting("bug_seed_max_parallel", 1)) - active_seeds,
+        )
+        for source in seed_sources:
+            if seed_slots <= 0:
+                break
+            if self._submit_auto(
+                "bug-seed-" + source["id"], self.seed_bug_from_completed_pair, source["id"],
+            ):
+                scheduled += 1
+                remaining -= 1
+                seed_slots -= 1
+                if remaining <= 0:
+                    break
+        return scheduled
+
     def _schedule_refill_once(self) -> None:
         selected_type = self._selected_task_type()
         type_clause = " AND task_type=?" if selected_type else ""
@@ -1589,9 +1728,13 @@ class PairwiseService:
             type_params,
         ) or {"count": 0})["count"]
         minimum = int(self.db.setting("task_pool_min_ready", 6))
-        target = int(self.db.setting("task_pool_target_ready", 12))
+        target = max(minimum, int(self.db.setting("task_pool_target_ready", 6)))
         with self._future_lock:
-            active = sum(1 for key, future in self._futures.items() if key.startswith("validate-") and not future.done())
+            active = sum(
+                1 for key, future in self._futures.items()
+                if key.startswith(("validate-", "generate-", "bug-convert-", "bug-reproduce-", "bug-seed-", "bugs-"))
+                and not future.done()
+            )
             generation_active = any(key.startswith("generate-") and not future.done() for key, future in self._futures.items())
         capacity = max(0, int(self.db.setting("task_generation_max_parallel", 6)) - active)
         if ready >= minimum:
@@ -1603,9 +1746,15 @@ class PairwiseService:
             + type_clause + " ORDER BY created_at LIMIT ?",
             type_params + (min(capacity, needed),),
         )
+        scheduled_candidates = 0
         for row in candidates:
             self.validate_task_async(row["id"])
-        if needed and capacity and not candidates and not generation_active:
+            scheduled_candidates += 1
+        remaining_capacity = max(0, capacity - scheduled_candidates)
+        remaining_needed = max(0, needed - active - scheduled_candidates)
+        if selected_type == "bugfix" and remaining_capacity and remaining_needed:
+            self._schedule_bugfix_refill_jobs(min(remaining_capacity, remaining_needed))
+        elif needed and capacity and not candidates and not generation_active:
             if selected_type:
                 self._schedule_task_source(selected_type)
             else:
@@ -2508,6 +2657,210 @@ class PairwiseService:
             "arm": selected, "searchSummary": result["searchSummary"], "candidateIds": created,
         })
         return {"pairId": pair_id, "arm": selected, "searchSummary": result["searchSummary"], "candidateIds": created}
+
+    @staticmethod
+    def _seeded_bug_path_allowed(value: str) -> bool:
+        path = str(value or "").strip().replace("\\", "/")
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            return False
+        lowered = path.casefold()
+        parts = {part.casefold() for part in Path(path).parts}
+        name = Path(path).name.casefold()
+        if parts & {"test", "tests", "__tests__", "spec", "specs", "docs", "documentation"}:
+            return False
+        if re.search(r"(?:^|[._-])(?:test|spec)(?:[._-]|$)", name):
+            return False
+        if name.startswith("readme") or name in {
+            "dockerfile", "compose.yml", "compose.yaml", "docker-compose.yml",
+            "docker-compose.yaml", "package.json", "package-lock.json", "pnpm-lock.yaml",
+            "yarn.lock", "pyproject.toml", "poetry.lock", "requirements.txt", "go.mod",
+            "go.sum", "cargo.toml", "cargo.lock",
+        }:
+            return False
+        return True
+
+    def seed_bug_from_completed_pair(self, pair_id: str) -> Dict[str, Any]:
+        """Create a clean, runnable hidden-Bug baseline when real candidates run out."""
+        pair = self._pair(pair_id)
+        if pair.get("status") != "completed":
+            raise ValueError("只有已完成 Pair 可作为自动造 Bug 的来源")
+        source_task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+        if source_task.get("task_type") != "zero_to_one":
+            raise ValueError("自动造 Bug 只使用已完成的 0–1 项目")
+        existing = self.db.one(
+            """SELECT * FROM tasks WHERE source='auto_seeded_bug' AND parent_pair_id=?
+                 ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (pair_id,),
+        )
+        if existing:
+            return existing
+        selected = "B" if pair.get("winner") == "B better" else "A"
+        arm = self.db.one(
+            """SELECT * FROM arm_runs WHERE pair_id=? AND arm=?
+                 AND status='completed' AND commit_sha<>''""",
+            (pair_id, selected),
+        ) or {}
+        check = self.db.one(
+            """SELECT id FROM artifact_checks WHERE pair_id=? AND arm=?
+                 AND commit_sha=? AND status='passed' ORDER BY created_at DESC LIMIT 1""",
+            (pair_id, selected, arm.get("commit_sha", "")),
+        )
+        source_workspace = Path(str(arm.get("workspace_path") or ""))
+        if not check or not source_workspace.is_dir() or not (source_workspace / ".git").is_dir():
+            raise ValueError("自动造 Bug 来源缺少固定提交或已通过的 Docker 验收")
+
+        seed_id = uuid.uuid4().hex[:16]
+        seed_root = self.config.data_dir / "seeded-bug-baselines" / ("auto-" + seed_id)
+        seed_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            run_command(
+                ["git", "clone", "--no-hardlinks", str(source_workspace), str(seed_root)],
+                timeout=180,
+            )
+            run_command(["git", "checkout", "--detach", arm["commit_sha"]], cwd=seed_root, timeout=60)
+            run_command(["git", "clean", "-fdx"], cwd=seed_root, timeout=120)
+            file_list = run_command(
+                ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=seed_root, timeout=60,
+            ).stdout.splitlines()[:220]
+            existing_tasks = [
+                {"title": row.get("title", ""), "summary": str(row.get("prompt") or "")[:360]}
+                for row in self.db.all(
+                    """SELECT title,prompt FROM tasks WHERE task_type='bugfix'
+                         ORDER BY created_at DESC LIMIT 40"""
+                )
+            ]
+            summary = json.dumps({
+                "sourcePairId": pair_id,
+                "selectedArm": selected,
+                "sourceCommit": arm["commit_sha"],
+                "files": file_list,
+                "stack": source_task.get("stack", ""),
+                "projectCategory": source_task.get("project_category", ""),
+            }, ensure_ascii=False)
+            result = self.codex.run(
+                "bug_seed_generation",
+                seeded_bug_prompt(
+                    str(source_task.get("prompt") or ""), summary,
+                    json.dumps(existing_tasks, ensure_ascii=False),
+                ),
+                SEEDED_BUG_SCHEMA,
+                cwd=seed_root, pair_id=pair_id, task_id=pair["task_id"],
+                timeout=2400, sandbox="workspace-write",
+            )
+            status = run_command(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=seed_root, timeout=60,
+            ).stdout.splitlines()
+            changed_paths = []
+            for line in status:
+                raw = line[3:] if len(line) > 3 else ""
+                path = raw.split(" -> ")[-1].strip()
+                if path:
+                    changed_paths.append(path)
+            changed_paths = sorted(set(changed_paths))
+            declared_paths = sorted(set(str(item) for item in result.get("changedPaths") or []))
+            if not changed_paths:
+                raise RuntimeError("自动造 Bug 没有修改生产代码")
+            if any(not self._seeded_bug_path_allowed(path) for path in changed_paths):
+                raise RuntimeError("自动造 Bug 修改了测试、文档、容器、依赖或其他禁止文件")
+            if not set(declared_paths).issubset(set(changed_paths)):
+                raise RuntimeError("自动造 Bug 返回的 changedPaths 与实际修改不一致")
+            diff_check = run_command(["git", "diff", "--check"], cwd=seed_root, check=False, timeout=60)
+            if diff_check.returncode != 0:
+                raise RuntimeError("自动造 Bug 的代码变更存在格式错误：%s" % redact(diff_check.stdout or diff_check.stderr))
+            numstat = run_command(["git", "diff", "--numstat"], cwd=seed_root, timeout=60).stdout
+            injected_lines = 0
+            for line in numstat.splitlines():
+                fields = line.split("\t", 2)
+                if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+                    injected_lines += int(fields[0]) + int(fields[1])
+            if injected_lines < 2:
+                raise RuntimeError("自动造 Bug 的生产代码改动过少，无法形成稳定隐藏缺陷")
+            prompt = str(result.get("prompt") or "").strip()
+            prompt_issues = self._bugfix_prompt_issues(prompt)
+            if prompt_issues:
+                raise RuntimeError("自动造 Bug 题面未通过规则：%s" % "；".join(prompt_issues))
+            duplicate = self._deterministic_task_duplicate({
+                "source": "auto_seeded_bug", "task_type": "bugfix",
+                "title": result.get("title", ""), "prompt": prompt,
+            })
+            if duplicate:
+                raise RuntimeError(duplicate)
+            diff_text = run_command(
+                ["git", "diff", "--no-ext-diff", "--unified=40"],
+                cwd=seed_root, timeout=60,
+            ).stdout
+            review = self.codex.run(
+                "bug_seed_review",
+                seeded_bug_review_prompt(
+                    str(result.get("title") or ""), prompt, diff_text, summary,
+                ),
+                SEEDED_BUG_REVIEW_SCHEMA,
+                cwd=seed_root, pair_id=pair_id, task_id=pair["task_id"],
+                timeout=1800,
+            )
+            review_ok = bool(
+                review.get("accepted")
+                and review.get("difficulty") in ("困难", "地狱")
+                and 45 <= int(review.get("estimatedRepairMinutes") or 0) <= 90
+                and int(review.get("estimatedChangedLines") or 0) >= 20
+                and int(review.get("estimatedChangedFiles") or 0) >= 1
+                and not review.get("answerLeak")
+            )
+            if not review_ok:
+                raise RuntimeError("自动造 Bug 独立复核未通过：%s" % (
+                    review.get("reason") or "难度、答案泄露或预计代码量不合格"
+                ))
+            baseline_check = self.artifacts.preflight(seed_root, "seed-" + seed_id)
+            if baseline_check.get("status") != "passed":
+                raise RuntimeError("自动造 Bug 基线预检失败：%s" % (
+                    baseline_check.get("error") or "Compose/verify 未全部通过"
+                ))
+
+            shutil.rmtree(seed_root / ".git")
+            run_command(["git", "init", "-b", "main"], cwd=seed_root, timeout=60)
+            run_command(
+                ["git", "config", "user.name", str(self.db.setting("git_author_name", self.config.git_author_name))],
+                cwd=seed_root, timeout=30,
+            )
+            run_command(
+                ["git", "config", "user.email", str(self.db.setting("git_author_email", self.config.git_author_email))],
+                cwd=seed_root, timeout=30,
+            )
+            run_command(["git", "add", "-A"], cwd=seed_root, timeout=60)
+            run_command(["git", "commit", "-m", "Initialize Bug repair baseline"], cwd=seed_root, timeout=120)
+            baseline_sha = run_command(["git", "rev-parse", "HEAD"], cwd=seed_root, timeout=30).stdout.strip()
+            task_id = "task-" + uuid.uuid4().hex[:16]
+            stamp = now_iso()
+            key = fingerprint("bugfix", prompt, baseline_sha)
+            stack = normalize_stack(result.get("stack") or source_task.get("stack"))
+            category = normalize_project_category(
+                result.get("projectCategory") or source_task.get("project_category"),
+                stack, prompt,
+            )
+            self.db.execute(
+                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,
+                   difficulty,difficulty_evidence_json,baseline_path,baseline_sha,parent_pair_id,
+                   fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,'bugfix',?,?,?,?,?,?,?,?,?,?, 'ready',?,?)""",
+                (task_id, "auto_seeded_bug", "auto-seeded-" + seed_id,
+                 str(result["title"]), prompt, stack, category, "困难",
+                 json.dumps(result["difficultyEvidence"], ensure_ascii=False), str(seed_root),
+                 baseline_sha, pair_id, key, stamp, stamp),
+            )
+            self.db.audit("bug.seeded_task_ready", "task", task_id, {
+                "source_pair_id": pair_id, "source_arm": selected,
+                "baseline_sha": baseline_sha, "changed_paths": changed_paths,
+                "injected_lines": injected_lines, "baseline_preflight": "passed",
+                "seed_review": review,
+            })
+            return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
+        except Exception as exc:
+            shutil.rmtree(seed_root, ignore_errors=True)
+            self.db.audit("bug.seed_generation_failed", "pair", pair_id, {
+                "error": redact(str(exc))[-2000:],
+            })
+            raise
 
     def reproduce_bug_async(self, candidate_id: str) -> str:
         operation = "reproduce-" + candidate_id

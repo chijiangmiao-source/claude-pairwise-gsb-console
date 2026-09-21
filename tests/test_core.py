@@ -467,6 +467,156 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(scheduled)
         submit.assert_not_called()
 
+    def test_bugfix_pool_below_six_schedules_six_independent_sources(self):
+        self.db.set_setting("task_selection_task_type", "bugfix")
+        self.db.set_setting("task_pool_min_ready", 6)
+        self.db.set_setting("task_pool_target_ready", 6)
+        self.db.set_setting("task_generation_max_parallel", 6)
+        stamp = now_iso()
+        for index in range(6):
+            task_id = "task-refill-source-%d" % index
+            chain_id = "chain-refill-source-%d" % index
+            pair_id = "pair-refill-source-%d" % index
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+                   difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'困难','[]',?,'used',?,?)""",
+                (task_id, "test", "zero_to_one", "source %d" % index,
+                 "distinct hard source %d" % index, task_id, stamp, stamp),
+            )
+            self.db.execute(
+                "INSERT INTO project_chains(id,root_task_id,status,created_at,updated_at) VALUES(?,?,'completed',?,?)",
+                (chain_id, task_id, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO pairs(id,task_id,chain_id,status,stage,winner,completed_at,created_at,updated_at)
+                   VALUES(?,?,?,'completed','completed','A better',?,?,?)""",
+                (pair_id, task_id, chain_id, stamp, stamp, stamp),
+            )
+            commit = ("%x" % index) * 40
+            self.db.execute(
+                """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+                   model,image,status,commit_sha,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+                (pair_id + "-a", pair_id, "A", "A", str(self.root), "container", "screen",
+                 "auto_model/urm", "image", commit, stamp, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,created_at,updated_at)
+                   VALUES(?,?,'A',?,'passed','[]',?,?)""",
+                (pair_id + "-check", pair_id, commit, stamp, stamp),
+            )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_auto",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ):
+            self.service._schedule_refill_once()
+        self.assertEqual(len(submitted), 6)
+        self.assertTrue(all(item.startswith("bugs-pair-refill-source-") for item in submitted))
+
+    def test_bugfix_refill_seeds_verified_zero_to_one_after_real_scan_is_exhausted(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        self.mark_completed_feature_source(pair["id"])
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO audit_events(event_type,entity_type,entity_id,detail_json,created_at)
+               VALUES('bug.discovery_completed','pair',?,'{}',?)""",
+            (pair["id"], stamp),
+        )
+        submitted = []
+        with patch.object(
+            self.service, "_submit_auto",
+            side_effect=lambda operation, fn, *args: submitted.append(operation) or True,
+        ):
+            count = self.service._schedule_bugfix_refill_jobs(1)
+        self.assertEqual(count, 1)
+        self.assertEqual(submitted, ["bug-seed-" + pair["id"]])
+
+    def test_seeded_bug_is_preflighted_and_reinitialized_as_one_clean_commit(self):
+        source = self.root / "seed-source"
+        source.mkdir()
+        (source / "app.py").write_text("def choose(values):\n    return min(values)\n", encoding="utf-8")
+        (source / "Dockerfile").write_text("FROM python:3.13-slim\n", encoding="utf-8")
+        (source / "compose.yml").write_text(
+            "services:\n  app:\n    build: .\n  verify:\n    build: .\n",
+            encoding="utf-8",
+        )
+        run_command(["git", "init", "-b", "main"], cwd=source)
+        run_command(["git", "config", "user.name", "Test"], cwd=source)
+        run_command(["git", "config", "user.email", "test@example.com"], cwd=source)
+        run_command(["git", "add", "-A"], cwd=source)
+        run_command(["git", "commit", "-m", "source"], cwd=source)
+        sha = run_command(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """UPDATE pairs SET status='completed',stage='completed',winner='A better',
+               completed_at=?,updated_at=? WHERE id=?""",
+            (stamp, stamp, pair["id"]),
+        )
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+            ("seed-arm-a", pair["id"], "A", "A", str(source), "container", "screen",
+             "auto_model/urm", "image", sha, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO artifact_checks(id,pair_id,arm,commit_sha,status,checks_json,created_at,updated_at)
+               VALUES('seed-check',?,'A',?,'passed','[]',?,?)""",
+            (pair["id"], sha, stamp, stamp),
+        )
+        natural_prompt = (
+            "批量选择接口在一组候选同时具有相同最低代价、其中部分候选已失效时，会稳定返回仍含失效项的组合，"
+            "页面随后把该组合显示成可执行结果；重新排序相同输入后，错误组合还会变化。"
+            "业务约定要求先排除失效项，再在剩余同优组合中保持确定的规范顺序，且重复请求必须返回相同结果。"
+            "请修复这一行为，不要改变现有接口字段和正常输入的排序；使用 Docker Compose 启动服务，"
+            "自动化验收要通过真实业务入口覆盖失效项与同优项同时存在、输入换序以及连续重复请求，并核对页面展示和接口响应一致。"
+        )
+
+        def edit_code(job_type, prompt, schema, cwd=None, **kwargs):
+            if job_type == "bug_seed_review":
+                return {
+                    "accepted": True,
+                    "difficulty": "困难",
+                    "estimatedRepairMinutes": 60,
+                    "estimatedChangedLines": 32,
+                    "estimatedChangedFiles": 2,
+                    "answerLeak": False,
+                    "reason": "需要重新核对筛选和规范排序的跨层契约，并覆盖稳定性回归。",
+                    "issues": [],
+                }
+            (Path(cwd) / "app.py").write_text(
+                "def choose(values):\n    return min(values[1:])\n", encoding="utf-8",
+            )
+            return {
+                "title": "失效候选参与同优选择导致规范结果漂移",
+                "prompt": natural_prompt,
+                "difficultyEvidence": ["需要同时修正筛选和规范排序", "需保持接口与页面跨层一致"],
+                "changedPaths": ["app.py"],
+                "stack": "Python 3.13, FastAPI",
+                "projectCategory": "纯后端",
+            }
+
+        with patch.object(self.service.codex, "run", side_effect=edit_code), \
+             patch.object(self.service.artifacts, "preflight", return_value={
+                 "status": "passed", "checks": [], "error": "",
+             }):
+            task = self.service.seed_bug_from_completed_pair(pair["id"])
+        self.assertEqual(task["source"], "auto_seeded_bug")
+        self.assertEqual(task["status"], "ready")
+        baseline = Path(task["baseline_path"])
+        self.assertEqual(
+            run_command(["git", "rev-list", "--count", "HEAD"], cwd=baseline).stdout.strip(),
+            "1",
+        )
+        self.assertEqual(task["baseline_sha"], run_command(
+            ["git", "rev-parse", "HEAD"], cwd=baseline,
+        ).stdout.strip())
+
     def test_ready_task_selection_prefers_new_zero_to_one_and_rejects_duplicate_title(self):
         rows = [
             ("task-used", "test", "共享标题", "已经开发过的复杂状态恢复任务", "used", "2019-01-01T00:00:00+00:00"),

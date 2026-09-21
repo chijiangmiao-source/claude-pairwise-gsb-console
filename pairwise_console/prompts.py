@@ -357,3 +357,45 @@ Bug 候选与两次真实复现证据：
 {correction}
 
 只按 Schema 返回。prompt 是最终完整题面；evidenceUsed 简要列出题面实际采用的候选字段、命令输出或源码位置，供系统内部核对，不把这份列表追加进题面。"""
+
+
+def seeded_bug_prompt(original_task: str, project_summary: str,
+                      existing_tasks: str) -> str:
+    return f"""你要为一个隔离的 A/B 修复基准制作带缺陷的初始仓库。直接检查并修改当前目录里的生产代码，只引入一个真实、稳定、可由现有业务入口触发的 Bug；预期修复工作量约一小时，难度必须达到困难，且需要理解跨模块状态、持久化、并发、异常恢复、精确算法或前后端契约中的至少一项关键关系。
+
+只改实现该缺陷所必需的生产代码。不要新增或修改测试、README、注释、Dockerfile、Compose、verify 脚本、锁文件和依赖清单，也不要留下 TODO、故障开关、补丁说明、答案提示或故意报错文本。不得硬编码只针对一个示例的分支。修改后原有启动、健康检查和 verify 仍应通过，缺陷只在题面给出的特定业务场景中显现。
+
+同时生成自然中文修复题面。题面说明真实触发条件、操作、实际现象、正确行为和回归验收，但不能透露根因、修改位置、实现方案或你改过哪些文件；不要套用“前置条件/复现步骤/实际结果/预期结果”四段模板。题面须保留现有 Docker Compose 启动方式，并要求用真实业务入口完成自动化验收。不要加入仓库内已有测试可以直接抄出的答案。
+
+原项目要求：
+{original_task}
+
+当前项目摘要：
+{project_summary}
+
+已有 Bug 题摘要，新的核心缺陷和题面组织都不能重复：
+{existing_tasks or '无'}
+
+完成代码修改后再按 Schema 返回。changedPaths 只列实际改动的生产代码路径；difficultyEvidence 说明为什么修复需要困难级别的工程判断；stack 只写主要语言与应用框架。"""
+
+
+def seeded_bug_review_prompt(title: str, task_prompt: str, diff_text: str,
+                             project_summary: str) -> str:
+    return f"""独立复核一个准备进入 A/B 的隐藏 Bug 基准。你可以读取当前仓库，下面还提供了注入变更的内部 diff；这些内部信息不会发给开发者。
+
+只在同时满足以下条件时 accepted=true：Bug 可由题面描述的真实业务入口稳定触发；修复需要理解关键状态、算法、并发、持久化、异常恢复或跨层契约，实际难度至少为困难；熟悉项目的开发者预计需要约 45 至 90 分钟；合理修复预计至少涉及 20 行有效生产代码，可以只改一个核心文件，但不能只是改常量、恢复一行条件或照题面抄答案；题面没有出现内部文件名、函数名、修改位置、根因、补丁策略或其他解法提示；注入本身不是显眼的故障开关、特例硬编码、故意抛错或破坏启动。
+
+estimatedChangedLines 和 estimatedChangedFiles 评估的是正确修复的合理改动量，不是下面注入 diff 的行数。answerLeak 只要题面足以直接定位实现位置或基本给出修法就为 true。不要因为题面文字长或涉及多个名词就判困难。
+
+题目标题：{title}
+
+发给开发者的题面：
+{task_prompt}
+
+项目摘要：
+{project_summary}
+
+内部注入 diff：
+{diff_text[:20000]}
+
+只按 Schema 返回。"""

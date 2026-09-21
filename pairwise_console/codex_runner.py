@@ -86,6 +86,7 @@ class CodexRunner:
         retries: int = 2,
         model_override: str = "",
         effort_override: str = "",
+        sandbox: str = "read-only",
     ) -> Dict[str, Any]:
         job_id = "codex-" + uuid.uuid4().hex[:16]
         model = model_override or str(self.db.setting("codex_model", self.config.codex_model))
@@ -112,9 +113,11 @@ class CodexRunner:
             (job_id, pair_id, task_id, job_type, model, effort, "running",
              str(cwd or ""), str(input_path), str(schema_path), str(events_path), str(output_path), stamp, stamp),
         )
+        if sandbox not in ("read-only", "workspace-write"):
+            raise ValueError("unsupported Codex sandbox: %s" % sandbox)
         command = [
             "codex", "exec", "--model", model,
-            "--sandbox", "read-only", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+            "--sandbox", sandbox, "--ephemeral", "--ignore-user-config", "--ignore-rules",
             "--skip-git-repo-check", "--json", "--config", 'model_reasoning_effort="%s"' % effort,
             "--output-schema", str(schema_path), "--output-last-message", str(output_path),
             "--cd", str((cwd or self.config.data_dir).resolve()), "-",
@@ -294,6 +297,56 @@ BUG_TASK_PROMPT_SCHEMA = {
         "prompt": {"type": "string", "minLength": 200, "maxLength": 3000},
         "evidenceUsed": {
             "type": "array", "minItems": 3, "maxItems": 12,
+            "items": {"type": "string", "maxLength": 300},
+        },
+    },
+}
+
+
+SEEDED_BUG_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "title", "prompt", "difficultyEvidence", "changedPaths",
+        "stack", "projectCategory",
+    ],
+    "properties": {
+        "title": {"type": "string", "minLength": 4, "maxLength": 160},
+        "prompt": {"type": "string", "minLength": 200, "maxLength": 1800},
+        "difficultyEvidence": {
+            "type": "array", "minItems": 2, "maxItems": 6,
+            "items": {"type": "string", "maxLength": 300},
+        },
+        "changedPaths": {
+            "type": "array", "minItems": 1, "maxItems": 8,
+            "items": {"type": "string", "maxLength": 300},
+        },
+        "stack": {"type": "string", "minLength": 2, "maxLength": 255},
+        "projectCategory": {
+            "type": "string", "enum": ["纯后端", "纯前端", "全栈"],
+        },
+    },
+}
+
+
+SEEDED_BUG_REVIEW_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "accepted", "difficulty", "estimatedRepairMinutes",
+        "estimatedChangedLines", "estimatedChangedFiles", "answerLeak",
+        "reason", "issues",
+    ],
+    "properties": {
+        "accepted": {"type": "boolean"},
+        "difficulty": {"type": "string", "enum": ["简单", "中等", "困难", "地狱"]},
+        "estimatedRepairMinutes": {"type": "integer", "minimum": 1, "maximum": 480},
+        "estimatedChangedLines": {"type": "integer", "minimum": 1, "maximum": 2000},
+        "estimatedChangedFiles": {"type": "integer", "minimum": 1, "maximum": 100},
+        "answerLeak": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 20, "maxLength": 800},
+        "issues": {
+            "type": "array", "maxItems": 10,
             "items": {"type": "string", "maxLength": 300},
         },
     },
