@@ -1584,8 +1584,8 @@ class PairwiseService:
             return "Bug 题的独立审核记录无法解析"
         if not review.get("accepted") or review.get("difficulty") not in ("困难", "地狱"):
             return "Bug 题未通过困难/地狱级独立审核"
-        if not 45 <= int(review.get("estimatedRepairMinutes") or 0) <= 90:
-            return "Bug 题预计修复时间不在 45 至 90 分钟"
+        if int(review.get("estimatedRepairMinutes") or 0) > 120:
+            return "Bug 题预计修复时间超过 120 分钟"
         if int(review.get("estimatedChangedLines") or 0) < 20:
             return "Bug 题的合理修复预计不足 20 行有效生产代码"
         if int(review.get("estimatedChangedFiles") or 0) < 1:
@@ -2372,7 +2372,7 @@ class PairwiseService:
                 review_ok = bool(
                     last_review.get("accepted")
                     and last_review.get("difficulty") in ("困难", "地狱")
-                    and 45 <= int(last_review.get("estimatedRepairMinutes") or 0) <= 90
+                    and int(last_review.get("estimatedRepairMinutes") or 0) <= 120
                     and int(last_review.get("estimatedChangedLines") or 0) >= 20
                     and int(last_review.get("estimatedChangedFiles") or 0) >= 1
                     and not last_review.get("answerLeak")
@@ -2415,7 +2415,7 @@ class PairwiseService:
             last_review
             and (
                 last_review.get("difficulty") not in ("困难", "地狱")
-                or not 45 <= int(last_review.get("estimatedRepairMinutes") or 0) <= 90
+                or int(last_review.get("estimatedRepairMinutes") or 0) > 120
                 or int(last_review.get("estimatedChangedLines") or 0) < 20
             )
         )
@@ -3145,7 +3145,7 @@ class PairwiseService:
             review_ok = bool(
                 review.get("accepted")
                 and review.get("difficulty") in ("困难", "地狱")
-                and 45 <= int(review.get("estimatedRepairMinutes") or 0) <= 90
+                and int(review.get("estimatedRepairMinutes") or 0) <= 120
                 and int(review.get("estimatedChangedLines") or 0) >= 20
                 and int(review.get("estimatedChangedFiles") or 0) >= 1
                 and not review.get("answerLeak")

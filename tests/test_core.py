@@ -587,6 +587,33 @@ class CoreTests(unittest.TestCase):
         task = self.db.one("SELECT * FROM tasks WHERE id='task-reviewed-then-rejected'")
         self.assertIn("最新的独立审核未通过", self.service._bug_task_review_rejection(task))
 
+    def test_hard_bug_review_has_no_minimum_time_but_rejects_over_two_hours(self):
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+               difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
+            ("task-time-bounded-bug", "manual_seeded_bug", "bugfix", "state recovery bug",
+             "Fix a reproducible cross-module recovery failure",
+             "time-bounded-bug", stamp, stamp),
+        )
+        review = {
+            "accepted": True, "difficulty": "困难",
+            "estimatedRepairMinutes": 20, "estimatedChangedLines": 28,
+            "estimatedChangedFiles": 2, "answerLeak": False,
+        }
+        self.db.audit("bug.manual_task_review_passed", "task", "task-time-bounded-bug", {
+            "injected_lines": 16, "review": review,
+        })
+        task = self.db.one("SELECT * FROM tasks WHERE id='task-time-bounded-bug'")
+        self.assertEqual(self.service._bug_task_review_rejection(task), "")
+
+        review["estimatedRepairMinutes"] = 121
+        self.db.audit("bug.manual_task_review_passed", "task", "task-time-bounded-bug", {
+            "injected_lines": 16, "review": review,
+        })
+        self.assertIn("超过 120 分钟", self.service._bug_task_review_rejection(task))
+
     def test_bugfix_only_refill_does_not_fall_back_to_new_zero_to_one(self):
         self.db.set_setting("task_selection_task_type", "bugfix")
         with patch.object(self.service, "_submit_auto") as submit:
