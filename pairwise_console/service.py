@@ -2837,7 +2837,11 @@ class PairwiseService:
             baseline_check = self.artifacts.preflight(
                 Path(repo["local_root"]) / "A", pair_id,
             )
-            if baseline_check.get("status") != "passed":
+            baseline_allowed = baseline_check.get("status") == "passed"
+            baseline_mode = "passed"
+            if task.get("source") in ("auto_seeded_bug", "manual_seeded_bug"):
+                baseline_allowed, baseline_mode = seeded_bug_preflight_allowed(baseline_check)
+            if not baseline_allowed:
                 reason = "开发前 Docker 基线预检失败：%s" % (
                     baseline_check.get("error") or "Compose 或依赖路径不可用"
                 )
@@ -2855,6 +2859,7 @@ class PairwiseService:
                 return self.pair_detail(pair_id)
             self.db.audit("task.baseline_preflight_passed", "pair", pair_id, {
                 "task_id": task.get("id"), "compose_file": baseline_check.get("compose_file", ""),
+                "mode": baseline_mode,
             })
         # Also migrates pre-fix queued rows whose workspace pointed directly at
         # the non-empty canonical clone.
