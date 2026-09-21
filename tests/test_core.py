@@ -60,6 +60,22 @@ class CoreTests(unittest.TestCase):
              "困难", '["跨模块状态","异常恢复"]', "fingerprint-1", "ready", stamp, stamp),
         )
 
+    def mark_manual_bug_reviewed(self, task_id):
+        stamp = now_iso()
+        detail = {
+            "injected_lines": 16,
+            "review": {
+                "accepted": True, "difficulty": "困难",
+                "estimatedRepairMinutes": 60, "estimatedChangedLines": 32,
+                "estimatedChangedFiles": 2, "answerLeak": False,
+            },
+        }
+        self.db.execute(
+            """INSERT INTO audit_events(event_type,entity_type,entity_id,detail_json,created_at)
+               VALUES('bug.manual_task_review_passed','task',?,?,?)""",
+            (task_id, json.dumps(detail, ensure_ascii=False), stamp),
+        )
+
     def mark_completed_feature_source(self, pair_id, completed_at=None):
         stamp = completed_at or now_iso()
         commit = (pair_id.replace("pair-", "") + "a" * 40)[:40]
@@ -422,6 +438,7 @@ class CoreTests(unittest.TestCase):
                 (task_id, "test", task_type, task_id, "hard " + task_type,
                  task_id, stamp, stamp),
             )
+        self.mark_manual_bug_reviewed("task-bug")
         self.db.set_setting("task_selection_task_type", "bugfix")
 
         selected = self.service._next_ready_task()
@@ -444,6 +461,7 @@ class CoreTests(unittest.TestCase):
              "Fix a reproducible concurrency bug in the existing service",
              "replacement-bug", stamp, stamp),
         )
+        self.mark_manual_bug_reviewed("task-replacement-bug")
         self.db.execute(
             "UPDATE pairs SET status='failed',stage='task_replacement' WHERE id=?",
             (retired["id"],),
@@ -459,6 +477,24 @@ class CoreTests(unittest.TestCase):
         prepare.assert_called_once_with("pair-bug")
         start.assert_called_once_with("pair-bug")
         self.assertEqual(result["replacementTaskId"], "task-replacement-bug")
+
+    def test_manual_bug_label_cannot_bypass_structured_hard_review(self):
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+               difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
+            ("task-unreviewed-bug", "manual_seeded_bug", "bugfix", "looks hard",
+             "A long prompt that only claims this repair is difficult",
+             "unreviewed-bug", stamp, stamp),
+        )
+
+        with self.assertRaisesRegex(ValueError, "独立审核记录"):
+            self.service.create_pair("task-unreviewed-bug")
+
+        task = self.db.one("SELECT status,rejection_reason FROM tasks WHERE id='task-unreviewed-bug'")
+        self.assertEqual(task["status"], "rejected")
+        self.assertIn("困难/地狱", task["rejection_reason"])
 
     def test_bugfix_only_refill_does_not_fall_back_to_new_zero_to_one(self):
         self.db.set_setting("task_selection_task_type", "bugfix")

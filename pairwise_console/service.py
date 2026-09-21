@@ -1384,36 +1384,97 @@ class PairwiseService:
             retired += int(self._retire_outdated_ready_bug_task(task))
         return retired
 
-    def _retire_unreviewed_ready_bug_tasks(self) -> int:
-        """Keep legacy natural Bug drafts out until they pass the stricter gate."""
-        retired = 0
-        rows = self.db.all(
-            """SELECT t.* FROM tasks t
-                 WHERE t.source='bug_discovery' AND t.task_type='bugfix' AND t.status='ready'
-                   AND NOT EXISTS (
-                     SELECT 1 FROM audit_events e
-                      WHERE e.event_type='bug.task_review_passed'
-                        AND e.entity_type='bug_candidate' AND e.entity_id=t.source_id
-                   )"""
-        )
-        for task in rows:
-            reason = "缺少困难级别、45 至 90 分钟、至少 20 行生产代码及无答案泄露的独立复核"
-            stamp = now_iso()
-            self.db.execute(
-                """UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=?
-                     WHERE id=? AND status='ready'""",
-                (reason, stamp, task["id"]),
+    def _bug_task_review_rejection(self, task: Dict[str, Any]) -> str:
+        """Return why a Bug task cannot enter A/B, independent of its label."""
+        if str(task.get("task_type") or "") != "bugfix":
+            return ""
+        source = str(task.get("source") or "")
+        if source == "bug_discovery":
+            event = self.db.one(
+                """SELECT detail_json FROM audit_events
+                     WHERE event_type='bug.task_review_passed'
+                       AND entity_type='bug_candidate' AND entity_id=?
+                     ORDER BY id DESC LIMIT 1""",
+                (str(task.get("source_id") or ""),),
             )
-            if task.get("source_id"):
-                self.db.execute(
-                    """UPDATE bug_candidates SET status='prompt_generation_failed',error=?,updated_at=?
-                         WHERE id=? AND status='converted'""",
-                    (reason, stamp, task["source_id"]),
-                )
-            retired += 1
-            self.db.audit("bug.unreviewed_ready_task_retired", "task", task["id"], {
-                "candidate_id": task.get("source_id") or "", "reason": reason,
-            })
+            review_key = "review"
+            injected_lines = None
+        elif source == "auto_seeded_bug":
+            event = self.db.one(
+                """SELECT detail_json FROM audit_events
+                     WHERE event_type='bug.seeded_task_ready'
+                       AND entity_type='task' AND entity_id=?
+                     ORDER BY id DESC LIMIT 1""",
+                (str(task.get("id") or ""),),
+            )
+            review_key = "seed_review"
+            injected_lines = 0
+        else:
+            # Hand-written or imported Bug tasks must carry the same
+            # machine-auditable review record; a difficulty label alone is
+            # never sufficient to start A/B.
+            event = self.db.one(
+                """SELECT detail_json FROM audit_events
+                     WHERE event_type='bug.manual_task_review_passed'
+                       AND entity_type='task' AND entity_id=?
+                     ORDER BY id DESC LIMIT 1""",
+                (str(task.get("id") or ""),),
+            )
+            review_key = "review"
+            injected_lines = 0
+        if not event:
+            return "Bug 题缺少可复核的困难/地狱级独立审核记录"
+        try:
+            detail = json.loads(str(event.get("detail_json") or "{}"))
+            review = detail.get(review_key) or {}
+        except (TypeError, ValueError):
+            return "Bug 题的独立审核记录无法解析"
+        if not review.get("accepted") or review.get("difficulty") not in ("困难", "地狱"):
+            return "Bug 题未通过困难/地狱级独立审核"
+        if not 45 <= int(review.get("estimatedRepairMinutes") or 0) <= 90:
+            return "Bug 题预计修复时间不在 45 至 90 分钟"
+        if int(review.get("estimatedChangedLines") or 0) < 20:
+            return "Bug 题的合理修复预计不足 20 行有效生产代码"
+        if int(review.get("estimatedChangedFiles") or 0) < 1:
+            return "Bug 题缺少可核对的生产代码修复范围"
+        if review.get("answerLeak"):
+            return "Bug 题泄露了根因或实现答案"
+        if injected_lines is not None:
+            injected_lines = int(detail.get("injected_lines") or 0)
+            if injected_lines < MIN_SEEDED_BUG_INJECTED_LINES:
+                return "植入型 Bug 的有效生产代码变更不足 %d 行" % MIN_SEEDED_BUG_INJECTED_LINES
+        return ""
+
+    def _reject_bug_task_at_review_gate(self, task: Dict[str, Any], reason: str) -> bool:
+        stamp = now_iso()
+        changed = self.db.execute(
+            """UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=?
+                 WHERE id=? AND status='ready'""",
+            (reason, stamp, task["id"]),
+        )
+        if not changed:
+            return False
+        if task.get("source") == "bug_discovery" and task.get("source_id"):
+            self.db.execute(
+                """UPDATE bug_candidates SET status='prompt_generation_failed',error=?,updated_at=?
+                     WHERE id=? AND status='converted'""",
+                (reason, stamp, task["source_id"]),
+            )
+        self.db.audit("bug.review_gate_rejected", "task", task["id"], {
+            "candidate_id": task.get("source_id") or "", "source": task.get("source") or "",
+            "reason": reason,
+        })
+        return True
+
+    def _retire_unreviewed_ready_bug_tasks(self) -> int:
+        """Keep every unverified Bug source out of A/B development."""
+        retired = 0
+        for task in self.db.all(
+            "SELECT * FROM tasks WHERE task_type='bugfix' AND status='ready'"
+        ):
+            reason = self._bug_task_review_rejection(task)
+            if reason:
+                retired += int(self._reject_bug_task_at_review_gate(task, reason))
         return retired
 
     def _retire_overloaded_ready_tasks(self) -> int:
@@ -1465,6 +1526,10 @@ class PairwiseService:
         for task in tasks:
             task_type = str(task.get("task_type") or "")
             if self._retire_outdated_ready_bug_task(task):
+                continue
+            bug_rejection = self._bug_task_review_rejection(task)
+            if bug_rejection:
+                self._reject_bug_task_at_review_gate(task, bug_rejection)
                 continue
             if task_type == "feature" and self._feature_project_rank(task) > MAX_FEATURE_TASKS_PER_PROJECT:
                 reason = "同一基线项目最多保留 3 个 Feature 迭代，超出额度后应重新创建 0–1 项目"
@@ -2460,6 +2525,10 @@ class PairwiseService:
             raise KeyError("任务不存在")
         if task["status"] != "ready" or not task_difficulty_allowed(task["task_type"], task["difficulty"]):
             raise ValueError("0–1、Feature 和 Bug 修复都只允许困难或地狱")
+        bug_rejection = self._bug_task_review_rejection(task)
+        if bug_rejection:
+            self._reject_bug_task_at_review_gate(task, bug_rejection)
+            raise ValueError(bug_rejection)
         active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')") or {"count": 0})["count"]
         configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
@@ -2933,22 +3002,31 @@ class PairwiseService:
                 result.get("projectCategory") or source_task.get("project_category"),
                 stack, prompt,
             )
-            self.db.execute(
-                """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,
-                   difficulty,difficulty_evidence_json,baseline_path,baseline_sha,parent_pair_id,
-                   fingerprint,status,created_at,updated_at)
-                   VALUES(?,?,?,'bugfix',?,?,?,?,?,?,?,?,?,?, 'ready',?,?)""",
-                (task_id, "auto_seeded_bug", "auto-seeded-" + seed_id,
-                 str(result["title"]), prompt, stack, category, "困难",
-                 json.dumps(result["difficultyEvidence"], ensure_ascii=False), str(seed_root),
-                 baseline_sha, pair_id, key, stamp, stamp),
-            )
-            self.db.audit("bug.seeded_task_ready", "task", task_id, {
+            audit_detail = {
                 "source_pair_id": pair_id, "source_arm": selected,
                 "baseline_sha": baseline_sha, "changed_paths": changed_paths,
                 "injected_lines": injected_lines, "baseline_preflight": "passed",
                 "seed_review": review,
-            })
+            }
+            # Publish the ready task and its mandatory review evidence in one
+            # transaction so the scheduler can never observe an unreviewed
+            # seeded task during the small gap between two writes.
+            with self.db.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,stack,project_category,
+                       difficulty,difficulty_evidence_json,baseline_path,baseline_sha,parent_pair_id,
+                       fingerprint,status,created_at,updated_at)
+                       VALUES(?,?,?,'bugfix',?,?,?,?,?,?,?,?,?,?, 'ready',?,?)""",
+                    (task_id, "auto_seeded_bug", "auto-seeded-" + seed_id,
+                     str(result["title"]), prompt, stack, category, "困难",
+                     json.dumps(result["difficultyEvidence"], ensure_ascii=False), str(seed_root),
+                     baseline_sha, pair_id, key, stamp, stamp),
+                )
+                conn.execute(
+                    """INSERT INTO audit_events(event_type,entity_type,entity_id,detail_json,created_at)
+                       VALUES('bug.seeded_task_ready','task',?,?,?)""",
+                    (task_id, json.dumps(audit_detail, ensure_ascii=False), stamp),
+                )
             return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
         except Exception as exc:
             shutil.rmtree(seed_root, ignore_errors=True)
