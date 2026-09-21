@@ -2117,7 +2117,7 @@ class PairwiseService:
             r"(?:自动化|端到端|e2e)\s*(?:的)?\s*浏览器|真实点击脚本",
             text, re.IGNORECASE,
         ):
-            issues.append("Bug 题不得要求浏览器自动化或浏览器 E2E 验收")
+            issues.append("Bug 题面不要提及浏览器自动化或浏览器 E2E，包括禁用说明")
         return issues
 
     def _generate_bugfix_task_prompt(self, candidate: Dict[str, Any], arm: Dict[str, Any],

@@ -357,7 +357,7 @@ class CoreTests(unittest.TestCase):
             "",
         )
 
-    def test_bugfix_prompt_rejects_browser_automation_but_allows_page_symptoms(self):
+    def test_bugfix_prompt_omits_browser_automation_but_allows_page_symptoms(self):
         browser_prompt = (
             "页面提交合法批次后会显示错误结果，Docker Compose 可以正常启动。"
             "修复后使用 Playwright 浏览器 E2E 重放真实点击，并完成自动化验收。"
@@ -365,6 +365,14 @@ class CoreTests(unittest.TestCase):
         )
         issues = self.service._bugfix_prompt_issues(browser_prompt)
         self.assertTrue(any("浏览器自动化" in issue for issue in issues))
+
+        prohibition_prompt = (
+            "页面提交合法批次后会显示错误结果，Docker Compose 可以正常启动。"
+            "自动化验收使用公开接口完成，不得使用 Playwright 或浏览器测试。"
+            "同时核对重复提交和异常输入，确认结果稳定且错误提示不丢失。" * 3
+        )
+        issues = self.service._bugfix_prompt_issues(prohibition_prompt)
+        self.assertTrue(any("禁用说明" in issue for issue in issues))
 
         api_prompt = (
             "页面提交合法批次后会显示错误结果，现有 Docker Compose 可以正常启动并保留原始输入。"
