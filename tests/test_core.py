@@ -787,9 +787,22 @@ class CoreTests(unittest.TestCase):
             "请修复这一行为，不要改变现有接口字段和正常输入的排序；使用 Docker Compose 启动服务，"
             "自动化验收要通过真实业务入口覆盖失效项与同优项同时存在、输入换序以及连续重复请求，并核对页面展示和接口响应一致。"
         )
+        review_calls = []
 
         def edit_code(job_type, prompt, schema, cwd=None, **kwargs):
             if job_type == "bug_seed_review":
+                review_calls.append(job_type)
+                if len(review_calls) == 1:
+                    return {
+                        "accepted": False,
+                        "difficulty": "困难",
+                        "estimatedRepairMinutes": 60,
+                        "estimatedChangedLines": 32,
+                        "estimatedChangedFiles": 2,
+                        "answerLeak": True,
+                        "reason": "首版标题直接概括内部筛选根因，但缺陷本身与代码量均合格。",
+                        "issues": ["标题泄露根因"],
+                    }
                 return {
                     "accepted": True,
                     "difficulty": "困难",
@@ -799,6 +812,11 @@ class CoreTests(unittest.TestCase):
                     "answerLeak": False,
                     "reason": "需要重新核对筛选和规范排序的跨层契约，并覆盖稳定性回归。",
                     "issues": [],
+                }
+            if job_type == "bug_seed_prompt_rewrite":
+                return {
+                    "title": "同优批次在输入换序后返回失效候选",
+                    "prompt": natural_prompt,
                 }
             (Path(cwd) / "app.py").write_text(
                 "def choose(values):\n"
@@ -832,6 +850,8 @@ class CoreTests(unittest.TestCase):
             task = self.service.seed_bug_from_completed_pair(pair["id"])
         self.assertEqual(task["source"], "auto_seeded_bug")
         self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["title"], "同优批次在输入换序后返回失效候选")
+        self.assertEqual(len(review_calls), 2)
         baseline = Path(task["baseline_path"])
         self.assertEqual(
             run_command(["git", "rev-list", "--count", "HEAD"], cwd=baseline).stdout.strip(),

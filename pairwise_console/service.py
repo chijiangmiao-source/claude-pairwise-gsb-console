@@ -18,7 +18,8 @@ from .claude_runner import ClaudeRunner
 from .classification import normalize_project_category, normalize_stack
 from .codex_runner import (
     ACTUAL_DIFFICULTY_SCHEMA, BUG_DISCOVERY_SCHEMA, BUG_TASK_PROMPT_SCHEMA,
-    SEEDED_BUG_REVIEW_SCHEMA, SEEDED_BUG_SCHEMA, CodexRunner,
+    SEEDED_BUG_PROMPT_REWRITE_SCHEMA, SEEDED_BUG_REVIEW_SCHEMA,
+    SEEDED_BUG_SCHEMA, CodexRunner,
     GSB_RECHECK_SCHEMA, GSB_SCHEMA, TASK_SCHEMA,
 )
 from .config import Config, MAX_PAIR_PROJECTS
@@ -30,7 +31,7 @@ from .prompts import (
     actual_difficulty_review_prompt, bug_discovery_prompt, bugfix_task_prompt, feature_generation_prompt,
     generated_task_prompt_issues, gsb_prompt, gsb_recheck_prompt, task_generation_prompt,
     task_validation_prompt, seeded_bug_prompt, seeded_bug_review_prompt,
-    discovered_bug_review_prompt,
+    seeded_bug_prompt_rewrite_prompt, discovered_bug_review_prompt,
 )
 from .recording import RecordingManager
 from .commands import redact, run_command
@@ -3150,6 +3151,60 @@ class PairwiseService:
                 cwd=seed_root, pair_id=pair_id, task_id=pair["task_id"],
                 timeout=1800,
             )
+            # A sound injected defect should not be discarded merely because
+            # its first public wording exposed the implementation answer.  If
+            # every structural gate already passes, rewrite only the public
+            # title/prompt once and run the independent review again.  The
+            # read-only rewrite cannot touch the seeded code.
+            repairable_leak = bool(
+                review.get("answerLeak")
+                and bug_review_scope_allowed(review)
+                and int(review.get("estimatedRepairMinutes") or 0) <= 120
+                and int(review.get("estimatedChangedFiles") or 0) >= 1
+            )
+            if repairable_leak:
+                original_title = str(result.get("title") or "")
+                rewritten = self.codex.run(
+                    "bug_seed_prompt_rewrite",
+                    seeded_bug_prompt_rewrite_prompt(
+                        str(result.get("title") or ""), prompt,
+                        str(review.get("reason") or ""),
+                        json.dumps(existing_tasks, ensure_ascii=False),
+                    ),
+                    SEEDED_BUG_PROMPT_REWRITE_SCHEMA,
+                    cwd=seed_root, pair_id=pair_id, task_id=pair["task_id"],
+                    timeout=1200,
+                )
+                rewritten_title = str(rewritten.get("title") or "").strip()
+                rewritten_prompt = str(rewritten.get("prompt") or "").strip()
+                rewritten_issues = self._bugfix_prompt_issues(rewritten_prompt)
+                if rewritten_issues:
+                    raise RuntimeError(
+                        "自动造 Bug 题面修复后仍未通过规则：%s" % "；".join(rewritten_issues)
+                    )
+                rewritten_duplicate = self._deterministic_task_duplicate({
+                    "source": "auto_seeded_bug", "task_type": "bugfix",
+                    "title": rewritten_title, "prompt": rewritten_prompt,
+                })
+                if rewritten_duplicate:
+                    raise RuntimeError(rewritten_duplicate)
+                result["title"] = rewritten_title
+                result["prompt"] = rewritten_prompt
+                prompt = rewritten_prompt
+                self.db.audit("bug.seed_prompt_rewritten", "pair", pair_id, {
+                    "old_title": original_title,
+                    "new_title": rewritten_title,
+                    "review_reason": str(review.get("reason") or "")[-1000:],
+                })
+                review = self.codex.run(
+                    "bug_seed_review",
+                    seeded_bug_review_prompt(
+                        rewritten_title, rewritten_prompt, diff_text, summary,
+                    ),
+                    SEEDED_BUG_REVIEW_SCHEMA,
+                    cwd=seed_root, pair_id=pair_id, task_id=pair["task_id"],
+                    timeout=1800,
+                )
             review_ok = bool(
                 review.get("accepted")
                 and bug_review_scope_allowed(review)

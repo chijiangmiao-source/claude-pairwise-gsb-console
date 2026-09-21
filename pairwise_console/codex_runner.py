@@ -329,6 +329,17 @@ SEEDED_BUG_SCHEMA = {
 }
 
 
+SEEDED_BUG_PROMPT_REWRITE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["title", "prompt"],
+    "properties": {
+        "title": {"type": "string", "minLength": 4, "maxLength": 160},
+        "prompt": {"type": "string", "minLength": 200, "maxLength": 1800},
+    },
+}
+
+
 SEEDED_BUG_REVIEW_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
