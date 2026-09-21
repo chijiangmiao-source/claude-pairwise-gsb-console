@@ -496,6 +496,28 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(task["status"], "rejected")
         self.assertIn("困难/地狱", task["rejection_reason"])
 
+    def test_latest_bug_review_rejection_supersedes_earlier_pass(self):
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,source_id,task_type,title,prompt,difficulty,
+               difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+               VALUES(?,?,?,'bugfix',?,?,'困难','[]',?,'ready',?,?)""",
+            ("task-reviewed-then-rejected", "bug_discovery", "bug-evidence-gap",
+             "hard-looking bug", "business symptom", "reviewed-then-rejected", stamp, stamp),
+        )
+        accepted = {
+            "review": {"accepted": True, "difficulty": "困难",
+                       "estimatedRepairMinutes": 60, "estimatedChangedLines": 30,
+                       "estimatedChangedFiles": 2, "answerLeak": False},
+        }
+        self.db.audit("bug.task_review_passed", "bug_candidate", "bug-evidence-gap", accepted)
+        self.db.audit("bug.task_review_rejected", "bug_candidate", "bug-evidence-gap", {
+            "reason": "复现绕过了公开业务入口", "review": accepted["review"],
+        })
+
+        task = self.db.one("SELECT * FROM tasks WHERE id='task-reviewed-then-rejected'")
+        self.assertIn("最新的独立审核未通过", self.service._bug_task_review_rejection(task))
+
     def test_bugfix_only_refill_does_not_fall_back_to_new_zero_to_one(self):
         self.db.set_setting("task_selection_task_type", "bugfix")
         with patch.object(self.service, "_submit_auto") as submit:

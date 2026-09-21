@@ -1391,8 +1391,8 @@ class PairwiseService:
         source = str(task.get("source") or "")
         if source == "bug_discovery":
             event = self.db.one(
-                """SELECT detail_json FROM audit_events
-                     WHERE event_type='bug.task_review_passed'
+                """SELECT event_type,detail_json FROM audit_events
+                     WHERE event_type IN ('bug.task_review_passed','bug.task_review_rejected')
                        AND entity_type='bug_candidate' AND entity_id=?
                      ORDER BY id DESC LIMIT 1""",
                 (str(task.get("source_id") or ""),),
@@ -1424,6 +1424,8 @@ class PairwiseService:
             injected_lines = 0
         if not event:
             return "Bug 题缺少可复核的困难/地狱级独立审核记录"
+        if source == "bug_discovery" and event.get("event_type") != "bug.task_review_passed":
+            return "Bug 题最新的独立审核未通过"
         try:
             detail = json.loads(str(event.get("detail_json") or "{}"))
             review = detail.get(review_key) or {}
@@ -2229,6 +2231,19 @@ class PairwiseService:
                     issues.append("该候选实际修复难度未达到困难，不能仅靠扩写题面提升难度")
                 if int(last_review.get("estimatedChangedLines") or 0) < 20:
                     issues.append("合理修复预计不足 20 行有效生产代码")
+                review_text = "；".join(
+                    [str(last_review.get("reason") or "")]
+                    + [str(item) for item in (last_review.get("issues") or [])]
+                ).casefold()
+                if any(marker in review_text for marker in (
+                    "公开业务入口", "真实业务入口", "公开入口",
+                    "直接调用内部", "直接导入内部", "读取、转译并直接调用",
+                    "复现证据不完全一致", "复现证据不足", "绕过产品入口",
+                )):
+                    # Rewording can remove an answer leak, but it cannot turn
+                    # an internal function call into missing black-box proof.
+                    # Stop here and require fresh reproduction evidence.
+                    break
             previous = prompt
             correction = "；".join(dict.fromkeys(issues))
         stamp = now_iso()
