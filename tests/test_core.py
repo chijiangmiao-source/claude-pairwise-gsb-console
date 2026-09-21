@@ -2698,6 +2698,12 @@ class CoreTests(unittest.TestCase):
             port = RecordingManager._published_port(["docker", "compose"], self.root, {})
         self.assertEqual(port, 51002)
 
+    def test_recording_starts_application_services_without_one_shot_acceptance(self):
+        services = RecordingManager._application_services([
+            "backend", "web", "verify", "browser-verify", "e2e-tests",
+        ])
+        self.assertEqual(services, ["backend", "web"])
+
     def test_recording_prefers_api_published_port_over_database(self):
         compose_ps = json.dumps([
             {"Service": "db", "Publishers": [{"PublishedPort": 52001}]},

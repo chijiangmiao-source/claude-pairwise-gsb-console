@@ -172,7 +172,22 @@ class RecordingManager:
         base = ["docker", "compose", "-p", project, "-f", str(compose)]
         try:
             run_command(base + ["down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180, env=env)
-            up = run_command(base + ["up", "-d", "--build"], cwd=workspace, check=False, timeout=1200, env=env)
+            services = run_command(
+                base + ["--profile", "*", "config", "--services"],
+                cwd=workspace, check=False, timeout=60, env=env,
+            )
+            if services.returncode != 0:
+                raise RuntimeError("无法读取演示项目服务：" + redact(services.stderr or services.stdout))
+            application_services = self._application_services(services.stdout.splitlines())
+            if not application_services:
+                raise RuntimeError("演示项目没有可启动的应用服务")
+            # Recording only needs the delivered application.  One-shot
+            # acceptance services can install browsers or run destructive
+            # scenarios and must not be built merely to open the demo page.
+            up = run_command(
+                base + ["up", "-d", "--build"] + application_services,
+                cwd=workspace, check=False, timeout=1200, env=env,
+            )
             if up.returncode != 0:
                 raise RuntimeError("演示项目启动失败：" + redact(up.stderr or up.stdout))
             discovered = self._ensure_published_port(base, workspace, env)
@@ -214,6 +229,14 @@ class RecordingManager:
                 (redact(str(exc))[-3000:], now_iso(), now_iso(), attempt_id),
             )
             self.db.audit("recording.finished", "recording_attempt", attempt_id, {"status": "failed", "error": str(exc)[-1000:]})
+
+    @staticmethod
+    def _application_services(service_names) -> list:
+        one_shot = re.compile(r"(?:^|[-_])(?:verify|verification|e2e|test|tests)(?:$|[-_])", re.IGNORECASE)
+        return sorted({
+            str(name).strip() for name in service_names
+            if str(name).strip() and not one_shot.search(str(name).strip())
+        })
 
     @staticmethod
     def _runtime_recording_is_allowed(check: Dict[str, Any], compose: Optional[Path]) -> bool:
