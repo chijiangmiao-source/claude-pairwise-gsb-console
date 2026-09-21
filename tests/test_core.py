@@ -25,7 +25,7 @@ from pairwise_console.prompts import (
     task_generation_prompt, task_validation_prompt,
 )
 from pairwise_console.recording import RecordingManager
-from pairwise_console.service import PairwiseService
+from pairwise_console.service import PairwiseService, seeded_bug_preflight_allowed
 
 
 class CoreTests(unittest.TestCase):
@@ -860,6 +860,29 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(task["baseline_sha"], run_command(
             ["git", "rev-parse", "HEAD"], cwd=baseline,
         ).stdout.strip())
+
+    def test_seeded_bug_preflight_accepts_only_business_verify_failure(self):
+        allowed, mode = seeded_bug_preflight_allowed({
+            "status": "failed",
+            "checks": [
+                {"name": "clean_start", "passed": True},
+                {"name": "containers_running", "passed": True},
+                {"name": "verify_service", "passed": False},
+                {"name": "cleanup", "passed": True},
+            ],
+        })
+        self.assertTrue(allowed)
+        self.assertEqual(mode, "expected_bug_verify_failure")
+
+        allowed, mode = seeded_bug_preflight_allowed({
+            "status": "failed",
+            "checks": [
+                {"name": "clean_start", "passed": False},
+                {"name": "verify_service", "passed": False},
+            ],
+        })
+        self.assertFalse(allowed)
+        self.assertIn("clean_start", mode)
 
     def test_ready_task_selection_prefers_new_zero_to_one_and_rejects_duplicate_title(self):
         rows = [

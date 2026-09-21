@@ -87,6 +87,27 @@ def bug_review_scope_allowed(review: Dict[str, Any]) -> bool:
     )
 
 
+def seeded_bug_preflight_allowed(check: Dict[str, Any]) -> Tuple[bool, str]:
+    """Allow the injected business defect itself to fail an existing verify.
+
+    The source commit was already accepted with a passing artifact check and
+    seeding cannot edit tests or container files.  Therefore a new failure
+    limited to the one-shot verify service is useful reproduction evidence,
+    while build, start, health/configuration and cleanup failures still make
+    the baseline unusable.
+    """
+    if check.get("status") == "passed":
+        return True, "passed"
+    failed = {
+        str(item.get("name") or "")
+        for item in list(check.get("checks") or [])
+        if not item.get("passed")
+    }
+    if failed == {"verify_service"}:
+        return True, "expected_bug_verify_failure"
+    return False, "failed:" + ",".join(sorted(failed))
+
+
 class PairwiseService:
     def __init__(self, config: Config, db: Database):
         self.config = config
@@ -3217,9 +3238,11 @@ class PairwiseService:
                     review.get("reason") or "难度、答案泄露或预计代码量不合格"
                 ))
             baseline_check = self.artifacts.preflight(seed_root, "seed-" + seed_id)
-            if baseline_check.get("status") != "passed":
-                raise RuntimeError("自动造 Bug 基线预检失败：%s" % (
-                    baseline_check.get("error") or "Compose/verify 未全部通过"
+            preflight_allowed, preflight_mode = seeded_bug_preflight_allowed(baseline_check)
+            if not preflight_allowed:
+                raise RuntimeError("自动造 Bug 基线预检失败（%s）：%s" % (
+                    preflight_mode,
+                    baseline_check.get("error") or "Compose 启动或基础运行检查未通过",
                 ))
 
             shutil.rmtree(seed_root / ".git")
@@ -3246,7 +3269,8 @@ class PairwiseService:
             audit_detail = {
                 "source_pair_id": pair_id, "source_arm": selected,
                 "baseline_sha": baseline_sha, "changed_paths": changed_paths,
-                "injected_lines": injected_lines, "baseline_preflight": "passed",
+                "injected_lines": injected_lines, "baseline_preflight": preflight_mode,
+                "baseline_preflight_checks": baseline_check.get("checks") or [],
                 "seed_review": review,
             }
             # Publish the ready task and its mandatory review evidence in one
