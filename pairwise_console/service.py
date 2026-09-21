@@ -56,6 +56,7 @@ GSB_STEP_REFERENCE = re.compile(
 )
 ELIGIBLE_TASK_SQL = "difficulty IN ('困难','地狱')"
 MAX_FEATURE_TASKS_PER_PROJECT = 3
+MIN_SEEDED_BUG_INJECTED_LINES = 12
 PROJECT_CATEGORY_ORDER = ("全栈", "纯前端", "纯后端")
 PROJECT_CATEGORY_DEFAULT_WEIGHTS = {"纯后端": 15, "纯前端": 40, "全栈": 45}
 A9_REJECTED_PROMPT_FRAGMENTS = (
@@ -2864,8 +2865,12 @@ class PairwiseService:
                 fields = line.split("\t", 2)
                 if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
                     injected_lines += int(fields[0]) + int(fields[1])
-            if injected_lines < 2:
-                raise RuntimeError("自动造 Bug 的生产代码改动过少，无法形成稳定隐藏缺陷")
+            if injected_lines < MIN_SEEDED_BUG_INJECTED_LINES:
+                raise RuntimeError(
+                    "自动造 Bug 的生产代码只改动 %d 行，低于困难任务门槛 %d 行；"
+                    "不允许用单行公式、常量或条件替换充当困难 Bug"
+                    % (injected_lines, MIN_SEEDED_BUG_INJECTED_LINES)
+                )
             prompt = str(result.get("prompt") or "").strip()
             prompt_issues = self._bugfix_prompt_issues(prompt)
             if prompt_issues:

@@ -590,7 +590,20 @@ class CoreTests(unittest.TestCase):
                     "issues": [],
                 }
             (Path(cwd) / "app.py").write_text(
-                "def choose(values):\n    return min(values[1:])\n", encoding="utf-8",
+                "def choose(values):\n"
+                "    active = []\n"
+                "    for value in values:\n"
+                "        if not value.get('valid', True):\n"
+                "            continue\n"
+                "        active.append(value)\n"
+                "    if not active:\n"
+                "        return None\n"
+                "    minimum = min(value['cost'] for value in active)\n"
+                "    tied = [value for value in active if value['cost'] == minimum]\n"
+                "    tied.sort(key=lambda value: value['id'])\n"
+                "    selected = tied[0]\n"
+                "    return selected\n",
+                encoding="utf-8",
             )
             return {
                 "title": "失效候选参与同优选择导致规范结果漂移",
