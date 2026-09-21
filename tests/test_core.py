@@ -1476,7 +1476,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(status["readyTasks"], 0)
         self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 4)
         self.assertEqual(len([item for item in submitted if item.startswith("repo-pair-")]), 4)
-        refill.assert_not_called()
+        refill.assert_called_once_with()
 
     def test_automation_scheduler_respects_configured_pair_target(self):
         self.db.set_setting("max_pairs_parallel", 3)
@@ -1500,7 +1500,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(status["readyTasks"], 1)
         self.assertEqual(len(self.db.all("SELECT id FROM pairs")), 3)
         self.assertEqual(len([item for item in submitted if item.startswith("repo-pair-")]), 3)
-        refill.assert_not_called()
+        refill.assert_called_once_with()
 
     def test_automation_refills_when_a_completed_pair_releases_a_slot(self):
         stamp = now_iso()

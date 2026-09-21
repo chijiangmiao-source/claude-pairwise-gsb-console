@@ -880,10 +880,10 @@ class PairwiseService:
                 self._submit_auto("repo-" + pair["id"], self.prepare_pair_repository, pair["id"])
                 active_count += 1
 
-            # Existing approved questions are consumed first. Refill begins
-            # only when no additional approved question can fill the target.
-            if active_count < pair_limit:
-                self._schedule_refill_once()
+            # Pair capacity and the ready-task reserve are separate targets.
+            # Keep replenishing the approved pool even while every Pair slot
+            # is occupied, otherwise the next completion sees an empty queue.
+            self._schedule_refill_once()
             return self.automation_status()
         finally:
             self._automation_lock.release()
