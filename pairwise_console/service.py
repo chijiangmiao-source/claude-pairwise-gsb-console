@@ -3144,6 +3144,54 @@ class PairwiseService:
             )
             raise
 
+    def _materialize_discovered_bug_baseline(
+        self, candidate: Dict[str, Any], arm: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """Copy the complete fixed source snapshot into a fresh Git baseline."""
+        source = Path(str(arm.get("workspace_path") or ""))
+        source_sha = str(candidate.get("source_sha") or "")
+        if not source.is_dir() or not (source / ".git").is_dir():
+            raise ValueError("Bug 来源产物缺少完整 Git 工作区")
+        if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+            raise ValueError("Bug 来源产物缺少固定提交")
+
+        baselines = self.config.data_dir / "discovered-bug-baselines"
+        baselines.mkdir(parents=True, exist_ok=True)
+        destination = baselines / str(candidate["id"])
+        temporary = baselines / (str(candidate["id"]) + ".tmp-" + uuid.uuid4().hex[:8])
+        shutil.rmtree(temporary, ignore_errors=True)
+        try:
+            run_command(
+                ["git", "clone", "--no-hardlinks", str(source), str(temporary)],
+                timeout=180,
+            )
+            run_command(["git", "checkout", "--detach", source_sha], cwd=temporary, timeout=60)
+            run_command(["git", "clean", "-fdx"], cwd=temporary, timeout=120)
+            shutil.rmtree(temporary / ".git")
+            run_command(["git", "init", "-b", "main"], cwd=temporary, timeout=60)
+            run_command(
+                ["git", "config", "user.name", str(self.db.setting("git_author_name", self.config.git_author_name))],
+                cwd=temporary, timeout=30,
+            )
+            run_command(
+                ["git", "config", "user.email", str(self.db.setting("git_author_email", self.config.git_author_email))],
+                cwd=temporary, timeout=30,
+            )
+            run_command(["git", "add", "-A"], cwd=temporary, timeout=120)
+            run_command(
+                ["git", "commit", "-m", "Initialize Bug repair baseline"],
+                cwd=temporary, timeout=180,
+            )
+            baseline_sha = run_command(
+                ["git", "rev-parse", "HEAD"], cwd=temporary, timeout=30,
+            ).stdout.strip()
+            shutil.rmtree(destination, ignore_errors=True)
+            temporary.rename(destination)
+            return str(destination), baseline_sha
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+
     def convert_bug_to_task(self, candidate_id: str) -> Dict[str, Any]:
         candidate = self.db.one("SELECT * FROM bug_candidates WHERE id=?", (candidate_id,))
         if not candidate:
@@ -3175,8 +3223,9 @@ class PairwiseService:
                 "reason": duplicate, "title": candidate["title"],
             })
             raise ValueError(duplicate)
+        baseline_path, baseline_sha = self._materialize_discovered_bug_baseline(candidate, arm)
         task_id = "task-" + uuid.uuid4().hex[:16]
-        key = fingerprint("bugfix", prompt, candidate["source_sha"])
+        key = fingerprint("bugfix", prompt, baseline_sha)
         stamp = now_iso()
         stack = normalize_stack(source_task.get("stack"))
         category = normalize_project_category(
@@ -3189,7 +3238,7 @@ class PairwiseService:
                    difficulty_evidence_json=?,baseline_path=?,baseline_sha=?,parent_pair_id=?,fingerprint=?,
                    status='ready',rejection_reason='',used_at=NULL,updated_at=? WHERE id=?""",
                 (candidate["title"], prompt, stack, category, candidate["difficulty"],
-                 candidate["difficulty_evidence_json"], arm.get("workspace_path", ""), candidate["source_sha"],
+                 candidate["difficulty_evidence_json"], baseline_path, baseline_sha,
                  candidate["source_pair_id"], key, stamp, task_id),
             )
         else:
@@ -3199,11 +3248,14 @@ class PairwiseService:
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (task_id, "bug_discovery", candidate_id, "bugfix", candidate["title"], prompt,
                  stack, category, candidate["difficulty"], candidate["difficulty_evidence_json"],
-                 arm.get("workspace_path", ""), candidate["source_sha"], candidate["source_pair_id"],
+                 baseline_path, baseline_sha, candidate["source_pair_id"],
                  key, "ready", stamp, stamp),
             )
         self.db.execute("UPDATE bug_candidates SET status='converted',updated_at=? WHERE id=?", (stamp, candidate_id))
-        self.db.audit("bug.converted_to_task", "bug_candidate", candidate_id, {"task_id": task_id})
+        self.db.audit("bug.converted_to_task", "bug_candidate", candidate_id, {
+            "task_id": task_id, "baseline_path": baseline_path,
+            "baseline_sha": baseline_sha, "source_sha": candidate["source_sha"],
+        })
         return self.db.one("SELECT * FROM tasks WHERE id=?", (task_id,)) or {}
 
     def start_recording(self, pair_id: str, arm: str, x: int = 0, y: int = 0, manual: bool = False) -> Dict[str, Any]:

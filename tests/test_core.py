@@ -4206,6 +4206,46 @@ class CoreTests(unittest.TestCase):
             self.service._schedule_auto_pipeline_once()
         self.assertIn("monitor-arm-live-after-restart", submitted)
 
+    def test_materialized_bug_baseline_copies_whole_repo_and_reinitializes_main(self):
+        source = self.root / "source-artifact"
+        source.mkdir()
+        run_command(["git", "init", "-b", "source-history"], cwd=source)
+        run_command(["git", "config", "user.name", "Source Author"], cwd=source)
+        run_command(["git", "config", "user.email", "source@example.com"], cwd=source)
+        files = {
+            "Dockerfile": "FROM python:3.13-slim\n",
+            "compose.yaml": "services:\n  api:\n    build: .\n  verify:\n    build: .\n",
+            "backend/app.py": "print('api')\n",
+            "frontend/src/App.tsx": "export default function App() { return null }\n",
+            "verify/check.py": "print('verified')\n",
+            ".env.example": "WEB_PORT=8080\n",
+        }
+        for relative, content in files.items():
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        run_command(["git", "add", "-A"], cwd=source)
+        run_command(["git", "commit", "-m", "Original history"], cwd=source)
+        source_sha = run_command(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+        (source / "untracked.tmp").write_text("do not copy", encoding="utf-8")
+
+        baseline_path, baseline_sha = self.service._materialize_discovered_bug_baseline(
+            {"id": "bug-whole-copy", "source_sha": source_sha},
+            {"workspace_path": str(source)},
+        )
+        baseline = Path(baseline_path)
+        for relative, content in files.items():
+            self.assertEqual((baseline / relative).read_text(encoding="utf-8"), content)
+        self.assertFalse((baseline / "untracked.tmp").exists())
+        self.assertEqual(run_command(["git", "branch", "--show-current"], cwd=baseline).stdout.strip(), "main")
+        self.assertEqual(run_command(["git", "rev-list", "--count", "HEAD"], cwd=baseline).stdout.strip(), "1")
+        self.assertEqual(run_command(["git", "log", "-1", "--format=%s"], cwd=baseline).stdout.strip(),
+                         "Initialize Bug repair baseline")
+        self.assertEqual(run_command(["git", "status", "--short"], cwd=baseline).stdout.strip(), "")
+        self.assertEqual(run_command(["git", "remote"], cwd=baseline).stdout.strip(), "")
+        self.assertEqual(run_command(["git", "rev-parse", "HEAD"], cwd=baseline).stdout.strip(), baseline_sha)
+        self.assertNotEqual(source_sha, baseline_sha)
+
     def test_only_twice_reproduced_hard_bug_converts_to_task(self):
         self.insert_ready_task()
         self.db.execute("UPDATE tasks SET stack='Python 3.13, FastAPI' WHERE id='task-1'")
@@ -4250,16 +4290,22 @@ class CoreTests(unittest.TestCase):
             "reason": "需要重构并发事务边界并验证冲突与非冲突路径。",
             "issues": [],
         }
+        materialized_sha = "b" * 40
         with patch.object(self.service.codex, "run", side_effect=[
             {"prompt": old_template, "evidenceUsed": ["preconditions", "steps", "actual"]},
             {"prompt": natural_prompt, "evidenceUsed": ["preconditions", "steps", "actual", "expected"]},
             accepted_review,
-        ]) as generated:
+        ]) as generated, patch.object(
+            self.service, "_materialize_discovered_bug_baseline",
+            return_value=(str(self.root / "bug-baseline"), materialized_sha),
+        ):
             task = self.service.convert_bug_to_task("bug-1")
         self.assertEqual(task["task_type"], "bugfix")
         self.assertEqual(task["parent_pair_id"], pair["id"])
         self.assertEqual(task["status"], "ready")
         self.assertEqual(task["stack"], "Python 3.13, FastAPI")
+        self.assertEqual(task["baseline_sha"], materialized_sha)
+        self.assertEqual(task["baseline_path"], str(self.root / "bug-baseline"))
         self.assertNotIn("前置条件：", task["prompt"])
         self.assertNotIn("复现步骤：", task["prompt"])
         self.assertNotIn("请修复该问题，保留现有 Docker Compose", task["prompt"])
@@ -4278,7 +4324,10 @@ class CoreTests(unittest.TestCase):
         with patch.object(self.service.codex, "run", side_effect=[{
             "prompt": natural_prompt,
             "evidenceUsed": ["preconditions", "steps", "actual", "expected"],
-        }, accepted_review]):
+        }, accepted_review]), patch.object(
+            self.service, "_materialize_discovered_bug_baseline",
+            return_value=(str(self.root / "bug-baseline"), materialized_sha),
+        ):
             regenerated = self.service.convert_bug_to_task("bug-1")
         self.assertEqual(regenerated["id"], task["id"])
         self.assertEqual(regenerated["status"], "ready")
