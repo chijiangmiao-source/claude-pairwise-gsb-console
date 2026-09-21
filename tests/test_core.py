@@ -401,6 +401,9 @@ class CoreTests(unittest.TestCase):
             "页面现象仍作为业务结果说明，录像由交付流程另行完成，接口字段和正常流程不能发生回退。" * 2
         )
         self.assertEqual(self.service._bugfix_prompt_issues(api_prompt), [])
+        # Existing runtime compatibility is verified against the baseline, not a repeated slogan.
+        business_only = api_prompt.replace("现有 Docker Compose 可以正常启动并保留原始输入", "原始输入仍然保留")
+        self.assertEqual(self.service._bugfix_prompt_issues(business_only), [])
 
     def test_submission_claim_and_remote_binding_are_idempotent(self):
         self.insert_ready_task()

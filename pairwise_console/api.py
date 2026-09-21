@@ -55,6 +55,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {row["key"]: json.loads(row["value_json"]) for row in rows})
             if path == "/api/tasks":
                 return self._json(200, self._tasks_page(query))
+            match = re.fullmatch(r"/api/tasks/([^/]+)", path)
+            if match:
+                task = self.app.db.one("SELECT * FROM tasks WHERE id=?", (match.group(1),))
+                return self._json(200, task) if task else self._json(404, {"error": "题目不存在"})
             if path == "/api/pairs":
                 return self._json(200, self._pairs_page(query))
             match = re.fullmatch(r"/api/pairs/([^/]+)", path)
@@ -136,6 +140,18 @@ class Handler(BaseHTTPRequestHandler):
                     match.group(1), str(body.get("reason", "人工停止")),
                 )
                 return self._json(202, {"operationId": operation})
+            match = re.fullmatch(r"/api/pairs/([^/]+)/reset-retries", path)
+            if match:
+                return self._json(200, self.app.service.reset_pair_retries(match.group(1)))
+            match = re.fullmatch(r"/api/pairs/([^/]+)/arms/([AB])/queue", path)
+            if match:
+                operation = self.app.service.queue_arm_manually_async(match.group(1), match.group(2))
+                return self._json(202, {"operationId": operation})
+            match = re.fullmatch(r"/api/pairs/([^/]+)/difficulty", path)
+            if match:
+                return self._json(200, self.app.service.edit_pair_difficulty(
+                    match.group(1), str(body.get("difficulty", "")), str(body.get("note", "")),
+                ))
             match = re.fullmatch(r"/api/pairs/([^/]+)/difficulty/review", path)
             if match:
                 operation = self.app.service.reassess_actual_difficulty_async(match.group(1))

@@ -128,6 +128,10 @@ class PairwiseService:
         """Close process-local jobs that cannot survive a service restart."""
         stamp = now_iso()
         self.db.execute(
+            """UPDATE arm_runs SET status='failed',error='人工排队准备被服务重启中断，请重新点击单侧排队',
+               updated_at=? WHERE status='manual_preparing'""", (stamp,),
+        )
+        self.db.execute(
             """UPDATE codex_jobs SET status='failed',error='服务重启时作业仍处于运行态，已安全释放以便重新排队',
                finished_at=?,updated_at=? WHERE status='running'""",
             (stamp, stamp),
@@ -742,6 +746,153 @@ class PairwiseService:
                 "code_and_trace_preserved": True,
             })
             return {"pairId": pair_id, "status": "cancelled", "stoppedArms": stopped}
+
+    def _require_local_retry_edit(self, pair_id: str) -> Dict[str, Any]:
+        pair = self._pair(pair_id)
+        delivery = self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
+        if delivery.get("remote_id") or delivery.get("submitted_at") or delivery.get("status") in (
+            "submitting", "submitted", "qc_pending", "qc_passed", "needs_fix",
+        ):
+            raise ValueError("已提交平台的数据不能重置开发或重新排队，请保留原交付")
+        return pair
+
+    def reset_pair_retries(self, pair_id: str) -> Dict[str, Any]:
+        """Clear retry budgets without deleting evidence or restarting either side."""
+        with self._pair_failure_lock(pair_id):
+            pair = self._require_local_retry_edit(pair_id)
+            arms = self.db.all("SELECT * FROM arm_runs WHERE pair_id=?", (pair_id,))
+            if pair.get("stage") == "task_replacement":
+                raise ValueError("正在自动换题，请等待换题结束后再重置")
+            stamp = now_iso()
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE pairs SET development_failure_count=0,updated_at=? WHERE id=?",
+                    (stamp, pair_id),
+                )
+                conn.execute(
+                    "UPDATE arm_runs SET error_retry_count=0,api_retry_count=0,updated_at=? WHERE pair_id=?",
+                    (stamp, pair_id),
+                )
+                if pair.get("status") in ("failed", "cancelled", "paused"):
+                    conn.execute(
+                        "UPDATE pairs SET status='paused',stage='manual_queue',error='',updated_at=? WHERE id=?",
+                        (stamp, pair_id),
+                    )
+                    conn.execute(
+                        """UPDATE arm_runs SET status='manual_waiting',updated_at=? WHERE pair_id=?
+                           AND prompt_sent_at IS NULL AND status IN
+                           ('queued','waiting_retry','waiting_terminal_slot','waiting_api_retry')""",
+                        (stamp, pair_id),
+                    )
+            self.db.audit("pair.retry_budget_reset", "pair", pair_id, {
+                "previousPair": pair, "previousArms": arms,
+                "action": "clear_failure_counts_only; manually_queue_A_or_B",
+                "historyPreserved": True,
+            })
+        return self.pair_detail(pair_id)
+
+    def queue_arm_manually_async(self, pair_id: str, arm_name: str) -> str:
+        if arm_name not in ("A", "B"):
+            raise ValueError("只能选择 A 或 B")
+        self._require_local_retry_edit(pair_id)
+        operation = "manual-queue-%s-%s" % (pair_id, arm_name)
+        self._submit(operation, self.queue_arm_manually, pair_id, arm_name)
+        return operation
+
+    def queue_arm_manually(self, pair_id: str, arm_name: str) -> Dict[str, Any]:
+        """Archive only the selected side, then join the existing slot-limited queue."""
+        if arm_name not in ("A", "B"):
+            raise ValueError("只能选择 A 或 B")
+        with self._pair_failure_lock(pair_id):
+            pair = self._require_local_retry_edit(pair_id)
+            arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (pair_id, arm_name))
+            if not arm or not pair.get("baseline_sha"):
+                raise ValueError("请先完成仓库与 A/B 基线准备")
+            repo = self.db.one("SELECT * FROM git_repositories WHERE pair_id=?", (pair_id,)) or {}
+            if repo.get("status") != "ready":
+                raise ValueError("仓库尚未准备完成，不能重新排队")
+            if arm.get("status") == "waiting_terminal_slot":
+                return self.pair_detail(pair_id)
+            if arm.get("status") not in ("failed", "completed", "manual_waiting", "queued"):
+                raise ValueError("该侧正在执行或收尾，不能重复排队")
+            if pair.get("stage") not in (
+                "development", "manual_queue", "ready_to_start", "completed", "cancelled",
+                "development_failed", "replaced", "replacement_failed", "difficulty_rejected",
+                "artifact_failed", "recording_failed", "artifact_failed_evaluated",
+            ):
+                raise ValueError("项目正在验收、录像或评审，请等当前阶段完成后再排队")
+            maximum = max(1, int(self.db.setting("development_max_attempts", 2)))
+            if (int(pair.get("development_failure_count") or 0) >= maximum
+                    or int(arm.get("error_retry_count") or 0) + int(arm.get("api_retry_count") or 0) >= maximum):
+                raise ValueError("失败次数已达上限，请先点击“重置失败次数”")
+            busy_checks = self.db.one(
+                "SELECT id FROM artifact_checks WHERE pair_id=? AND status='running'", (pair_id,),
+            )
+            busy_recording = self.db.one(
+                "SELECT id FROM recording_attempts WHERE pair_id=? AND status IN ('starting','recording','stopping')",
+                (pair_id,),
+            )
+            busy_job = self.db.one("SELECT id FROM codex_jobs WHERE pair_id=? AND status='running'", (pair_id,))
+            with self._future_lock:
+                monitor_busy = any(
+                    not future.done() and key != "manual-queue-%s-%s" % (pair_id, arm_name)
+                    and (arm["id"] in key or key in ("start-" + pair_id, "replace-task-" + pair_id))
+                    for key, future in self._futures.items()
+                )
+            if busy_checks or busy_recording or busy_job or monitor_busy:
+                raise ValueError("当前项目仍有后台工作正在收尾，请稍后再排队")
+            # Preserve every displaced delivery pointer, including completed-session metadata.
+            previous = {table: self.db.all("SELECT * FROM " + table + " WHERE pair_id=?", (pair_id,))
+                        for table in ("arm_runs", "artifact_checks", "recordings", "difficulty_reviews",
+                                      "gsb_reviews", "gsb_rechecks", "delivery_submissions")}
+            self.db.audit("pair.manual_requeue_snapshot", "pair", pair_id, {
+                "selectedArm": arm_name, "previousPair": pair, "previousRecords": previous,
+            })
+            # Never expose a new workspace to the scheduler until its baseline is ready.
+            self.db.execute("UPDATE arm_runs SET status='manual_preparing',updated_at=? WHERE id=?",
+                            (now_iso(), arm["id"]))
+            try:
+                self.claude.archive_failed_attempt(
+                    arm, "人工将 %s 侧重新排队，保留原代码和轨迹" % arm_name,
+                    prepare_retry=True, count_development_failure=True, count_error_retry=False,
+                    retry_status="manual_preparing",
+                )
+                self.git.reset_arm_to_baseline(pair_id, arm_name)
+            except Exception as exc:
+                self.db.execute(
+                    "UPDATE arm_runs SET status='failed',error=?,updated_at=? WHERE id=?",
+                    ("人工排队准备失败：" + redact(str(exc))[-1500:], now_iso(), arm["id"]),
+                )
+                raise
+            self._invalidate_recordings(pair_id, [arm_name], "人工重跑当前侧，原录像保留在历史记录")
+            stamp = now_iso()
+            with self.db.transaction() as conn:
+                conn.execute("DELETE FROM artifact_checks WHERE pair_id=? AND arm=?", (pair_id, arm_name))
+                for table in ("difficulty_reviews", "gsb_reviews", "gsb_rechecks"):
+                    conn.execute("DELETE FROM " + table + " WHERE pair_id=?", (pair_id,))
+                conn.execute(
+                    """UPDATE arm_runs SET status='waiting_terminal_slot',api_retry_after=NULL,
+                       last_api_error='',error='',updated_at=? WHERE id=?""", (stamp, arm["id"]),
+                )
+                if pair.get("stage") == "ready_to_start":
+                    conn.execute(
+                        """UPDATE arm_runs SET status='manual_waiting',updated_at=?
+                           WHERE pair_id=? AND arm<>? AND status='queued' AND prompt_sent_at IS NULL""",
+                        (stamp, pair_id, arm_name),
+                    )
+                conn.execute(
+                    """UPDATE pairs SET status='running',stage='development',winner='',error='',
+                       completed_at=NULL,updated_at=? WHERE id=?""", (stamp, pair_id),
+                )
+                conn.execute(
+                    """UPDATE delivery_submissions SET status='needs_review',error='',hidden_at=NULL,
+                       payload_sha256='',updated_at=? WHERE pair_id=? AND remote_id=''""", (stamp, pair_id),
+                )
+            self.db.audit("claude.manual_single_arm_retry_queued", "arm_run", arm["id"], {
+                "pair_id": pair_id, "arm": arm_name, "baseline_sha": pair["baseline_sha"],
+                "counts_toward_error_retries": False, "peer_preserved": True,
+            })
+        return self.pair_detail(pair_id)
 
     def _submit_auto(self, operation: str, fn, *args) -> bool:
         """Submit an idempotent pipeline action with a small failure backoff."""
@@ -2107,8 +2258,6 @@ class PairwiseService:
             issues.append("仍在使用已经停用的 Bug 固定句式")
         if any(fragment in normalized for fragment in A9_REJECTED_PROMPT_FRAGMENTS):
             issues.append("仍在使用 A-9 已拒绝的固定结尾")
-        if "dockercompose" not in normalized:
-            issues.append("没有保留 Docker Compose 启动与验收链路")
         if "自动化" not in text or not ("验收" in text or "测试" in text):
             issues.append("没有给出可执行的自动化验收要求")
         if re.search(
@@ -3373,6 +3522,50 @@ class PairwiseService:
             },
             "traceEvidence": trace,
         }
+
+    def edit_pair_difficulty(self, pair_id: str, difficulty: str, note: str = "") -> Dict[str, Any]:
+        if difficulty not in ("简单", "中等", "困难", "地狱"):
+            raise ValueError("请选择简单、中等、困难或地狱")
+        note = str(note or "").strip()[:800]
+        with self._pair_failure_lock(pair_id):
+            pair = self._pair(pair_id)
+            task = self.db.one("SELECT * FROM tasks WHERE id=?", (pair["task_id"],)) or {}
+            delivery = self.db.one("SELECT * FROM delivery_submissions WHERE pair_id=?", (pair_id,)) or {}
+            if delivery.get("remote_id") or delivery.get("submitted_at") or delivery.get("status") in (
+                "submitting", "submitted", "qc_pending", "qc_passed", "needs_fix",
+            ):
+                raise ValueError("已提交平台的数据不能编辑难度")
+            review = self.db.one("SELECT * FROM difficulty_reviews WHERE pair_id=?", (pair_id,))
+            if (review or {}).get("status") == "running":
+                raise ValueError("正在复评难度，请等复评结束后再编辑")
+            accepted = task_difficulty_allowed(str(task.get("task_type") or ""), difficulty)
+            resume = bool(review and accepted and pair.get("stage") == "difficulty_rejected")
+            if resume:
+                self._require_passed_artifacts(pair_id)
+            stamp = now_iso()
+            reason = "人工编辑难度：" + difficulty + ("；" + note if note else "（页面确认）")
+            with self.db.transaction() as conn:
+                conn.execute("UPDATE tasks SET difficulty=?,updated_at=? WHERE id=?", (difficulty, stamp, task["id"]))
+                if review:
+                    # Keep the automatic A/B findings and original evidence intact.
+                    conn.execute(
+                        """UPDATE difficulty_reviews SET assessed_difficulty=?,reason=?,status=?,error='',
+                           reviewed_at=?,updated_at=? WHERE pair_id=?""",
+                        (difficulty, reason, "passed" if accepted else "rejected", stamp, stamp, pair_id),
+                    )
+                conn.execute(
+                    "UPDATE delivery_submissions SET payload_sha256='',updated_at=? WHERE pair_id=?",
+                    (stamp, pair_id),
+                )
+                if resume:
+                    conn.execute("UPDATE pairs SET status='running',stage='recording',error='',updated_at=? WHERE id=?", (stamp, pair_id))
+                    conn.execute("UPDATE delivery_submissions SET status='needs_review',error='',hidden_at=NULL,updated_at=? WHERE pair_id=?", (stamp, pair_id))
+            self.db.audit("difficulty.manually_edited", "pair", pair_id, {
+                "source": "manual_ui", "difficulty": difficulty, "note": note,
+                "previousTaskDifficulty": task.get("difficulty"), "previousReview": review,
+                "resumedAfterDifficultyRejection": resume,
+            })
+        return self.pair_detail(pair_id)
 
     def reassess_actual_difficulty(self, pair_id: str) -> Dict[str, Any]:
         pair = self._pair(pair_id)

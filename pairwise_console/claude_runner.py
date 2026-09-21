@@ -113,7 +113,8 @@ class ClaudeRunner:
     def archive_failed_attempt(self, arm_run: Dict[str, Any], error: str,
                                prepare_retry: bool = True,
                                count_development_failure: bool = True,
-                               count_error_retry: bool = True) -> Dict[str, Any]:
+                               count_error_retry: bool = True,
+                               retry_status: str = "queued") -> Dict[str, Any]:
         """Preserve one failed attempt and optionally prepare a fresh session.
 
         The old container is removed only after its trace copy has been checked.
@@ -190,7 +191,7 @@ class ClaudeRunner:
             base = "pairwise-%s-%s" % (arm_run["pair_id"].replace("pair-", "")[:12], arm_run["arm"].lower())
             next_container = "%s-%s" % (base, suffix)
             next_screen = "%s-%s" % (base, suffix)
-        status = "queued" if prepare_retry else "failed"
+        status = retry_status if prepare_retry else "failed"
         finished_at = None if prepare_retry else now_iso()
         error_retry_increment = 1 if count_error_retry else 0
         self.db.execute(

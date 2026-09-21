@@ -27,3 +27,12 @@
 @media(max-width:760px){.recording-control{right:16px;bottom:16px;left:16px;max-width:none;justify-content:space-between}}
 @media(max-width:1050px){.dashboard-three{grid-template-columns:1fr 1fr}.dashboard-three>.card:last-child{grid-column:1/-1}}
 @media(max-width:650px){.dashboard-three{grid-template-columns:1fr}.dashboard-three>.card:last-child{grid-column:auto}.pair-overview-grid{grid-template-columns:1fr}.automation-strip{align-items:flex-start;flex-direction:column}}
+
+/* Complete original prompt and independent development retry controls. */
+.full-prompt,.pair-retry-controls{margin:18px 0;padding:16px;border:1px solid var(--line);border-radius:12px;min-width:0}
+.full-prompt h3,.pair-retry-controls h3{margin:0}
+.full-prompt .toolbar,.pair-retry-controls .toolbar{align-items:center;margin-bottom:10px}
+.prompt-body{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-height:42vh;overflow:auto;margin:0;font:inherit;line-height:1.8;user-select:text;padding:4px}
+.retry-arms{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.pair-retry-controls .sub{line-height:1.7;color:var(--muted)}
+@media(max-width:600px){.retry-arms{grid-template-columns:1fr}}
