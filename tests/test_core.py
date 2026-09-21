@@ -179,7 +179,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("最小实现", validation)
         self.assertIn("准确基线", validation)
         self.assertIn("近期开发完成后的真实难度案例", validation)
-        self.assertIn("Bug 修复可用这些案例校准难度", validation)
+        self.assertIn("Bug 修复若采用同类的简单或中等最小实现都应拒绝", validation)
         self.assertIn("一个可独立验收的工程核心", generated)
         self.assertIn("四至六个完整中文句子", generated)
         self.assertIn("只增加一个工程核心", feature)
@@ -1150,7 +1150,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(delivery["status"], "discarded")
         self.assertIn("低于困难/地狱", delivery["error"])
 
-    def test_actual_difficulty_review_promotes_passed_medium_bugfix_to_hard(self):
+    def test_actual_difficulty_review_rejects_medium_bugfix(self):
         pair = self._prepare_pair_for_difficulty_review()
         self.db.execute("UPDATE tasks SET task_type='bugfix' WHERE id='task-1'")
         result = {
@@ -1160,11 +1160,11 @@ class CoreTests(unittest.TestCase):
         }
         with patch.object(self.service.codex, "run", return_value=result):
             review = self.service.reassess_actual_difficulty(pair["id"])
-        self.assertEqual(review["status"], "passed")
-        self.assertEqual(review["assessed_difficulty"], "困难")
+        self.assertEqual(review["status"], "rejected")
+        self.assertEqual(review["assessed_difficulty"], "中等")
         self.assertEqual(
             self.db.one("SELECT status,stage FROM pairs WHERE id=?", (pair["id"],)),
-            {"status": "running", "stage": "recording"},
+            {"status": "failed", "stage": "difficulty_rejected"},
         )
         self.assertEqual(self.db.one("SELECT difficulty FROM tasks WHERE id='task-1'")["difficulty"], "困难")
 
@@ -4169,9 +4169,20 @@ class CoreTests(unittest.TestCase):
             "Docker Compose 启动方式。自动化验收需要在清洁环境中让两个客户端基于同一版本同步提交，"
             "核对两次请求结果与最终持久化内容，并再次运行已有冲突场景，确认 both updates persist 且旧行为没有回退。"
         )
+        accepted_review = {
+            "accepted": True,
+            "difficulty": "困难",
+            "estimatedRepairMinutes": 60,
+            "estimatedChangedLines": 36,
+            "estimatedChangedFiles": 2,
+            "answerLeak": False,
+            "reason": "需要重构并发事务边界并验证冲突与非冲突路径。",
+            "issues": [],
+        }
         with patch.object(self.service.codex, "run", side_effect=[
             {"prompt": old_template, "evidenceUsed": ["preconditions", "steps", "actual"]},
             {"prompt": natural_prompt, "evidenceUsed": ["preconditions", "steps", "actual", "expected"]},
+            accepted_review,
         ]) as generated:
             task = self.service.convert_bug_to_task("bug-1")
         self.assertEqual(task["task_type"], "bugfix")
@@ -4183,8 +4194,9 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("请修复该问题，保留现有 Docker Compose", task["prompt"])
         self.assertIn("send two requests", task["prompt"])
         self.assertIn("both updates persist", task["prompt"])
-        self.assertEqual(generated.call_count, 2)
-        self.assertIn("上一次草稿存在的问题", generated.call_args.args[1])
+        self.assertEqual(generated.call_count, 3)
+        self.assertIn("上一次草稿存在的问题", generated.call_args_list[1].args[1])
+        self.assertEqual(generated.call_args_list[2].args[0], "bug_task_review")
         self.assertFalse(self.service._retire_outdated_ready_bug_task(task))
 
         self.db.execute("UPDATE tasks SET prompt=? WHERE id=?", (old_template, task["id"]))
@@ -4192,14 +4204,77 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id=?", (task["id"],))["status"], "rejected")
         self.assertEqual(self.db.one("SELECT status FROM bug_candidates WHERE id='bug-1'")["status"], "reproduced")
 
-        with patch.object(self.service.codex, "run", return_value={
+        with patch.object(self.service.codex, "run", side_effect=[{
             "prompt": natural_prompt,
             "evidenceUsed": ["preconditions", "steps", "actual", "expected"],
-        }):
+        }, accepted_review]):
             regenerated = self.service.convert_bug_to_task("bug-1")
         self.assertEqual(regenerated["id"], task["id"])
         self.assertEqual(regenerated["status"], "ready")
         self.assertEqual(regenerated["prompt"], natural_prompt)
+
+    def test_medium_bug_cannot_reproduce_or_convert(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
+               reproduction_steps_json,actual_result,expected_result,reproduce_count,difficulty,
+               difficulty_evidence_json,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("bug-medium", pair["id"], "A", "abc123", "small validation gap", "valid request",
+             '["submit request"]', "wrong message", "right message", 2, "中等",
+             '["局部校验"]', "reproduced", stamp, stamp),
+        )
+        with self.assertRaisesRegex(ValueError, "困难或地狱"):
+            self.service.convert_bug_to_task("bug-medium")
+        with self.assertRaisesRegex(ValueError, "困难或地狱"):
+            self.service.reproduce_bug("bug-medium")
+
+    def test_discovered_bug_review_rejects_answer_leak(self):
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,model,image,
+               status,commit_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("arm-leak", pair["id"], "A", "A", str(self.root), "container", "screen", "auto_model/urm",
+             "image", "completed", "abc123", stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
+               reproduction_steps_json,actual_result,expected_result,reproduce_count,difficulty,
+               difficulty_evidence_json,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("bug-leak", pair["id"], "A", "abc123", "concurrent state loss", "two clients",
+             '["send requests"]', "state is lost", "both persist", 2, "困难",
+             '["跨事务并发"]', "reproduced", stamp, stamp),
+        )
+        leaky_prompt = (
+            "两个客户端同时提交后会丢失状态，该问题已经重复复现。请在 state.py 的 save 函数中加入锁和重试，"
+            "并保留 Docker Compose 启动方式。自动化验收需要并发提交真实请求、核对最终持久化状态，"
+            "确认两个更新都存在且冲突响应保持不变。复现时先让两个客户端读取相同版本，再分别修改互不相同的字段，"
+            "同时发出保存请求；当前两个请求都返回成功，但重新查询只保留后一份字段。修复后还要覆盖相同字段冲突、"
+            "连续重复请求和服务重启后的读回，不能通过让所有请求串行失败来规避并发问题。验收应从公开 HTTP 接口"
+            "执行这些操作，并在任何断言失败时返回非零退出码，现有普通单客户端保存行为也必须继续通过。"
+        )
+        rejected_review = {
+            "accepted": False, "difficulty": "困难", "estimatedRepairMinutes": 60,
+            "estimatedChangedLines": 40, "estimatedChangedFiles": 2, "answerLeak": True,
+            "reason": "题面直接给出了内部文件、函数和加锁重试方案，开发者可以照答案修改。",
+            "issues": ["删除 state.py、save 和加锁重试方案"],
+        }
+        generated = {"prompt": leaky_prompt, "evidenceUsed": ["steps", "actual", "expected"]}
+        with patch.object(self.service.codex, "run", side_effect=[
+            generated, rejected_review, generated, rejected_review,
+        ]):
+            with self.assertRaisesRegex(ValueError, "答案"):
+                self.service.convert_bug_to_task("bug-leak")
+        self.assertEqual(
+            self.db.one("SELECT status FROM bug_candidates WHERE id='bug-leak'")["status"],
+            "prompt_generation_failed",
+        )
+        self.assertIsNone(self.db.one("SELECT id FROM tasks WHERE source_id='bug-leak'"))
 
     def test_bug_reproduction_uses_isolated_ports_for_every_compose_command(self):
         from pairwise_console.commands import CommandResult

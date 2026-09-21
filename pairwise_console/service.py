@@ -30,6 +30,7 @@ from .prompts import (
     actual_difficulty_review_prompt, bug_discovery_prompt, bugfix_task_prompt, feature_generation_prompt,
     generated_task_prompt_issues, gsb_prompt, gsb_recheck_prompt, task_generation_prompt,
     task_validation_prompt, seeded_bug_prompt, seeded_bug_review_prompt,
+    discovered_bug_review_prompt,
 )
 from .recording import RecordingManager
 from .commands import redact, run_command
@@ -53,7 +54,7 @@ GSB_STEP_REFERENCE = re.compile(
     r"第\s*[一二三四五六七八九十百千万零〇\d]+"
     r"(?:\s*[、，,及和与]\s*[一二三四五六七八九十百千万零〇\d]+)*\s*步"
 )
-ELIGIBLE_TASK_SQL = "(difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"
+ELIGIBLE_TASK_SQL = "difficulty IN ('困难','地狱')"
 MAX_FEATURE_TASKS_PER_PROJECT = 3
 PROJECT_CATEGORY_ORDER = ("全栈", "纯前端", "纯后端")
 PROJECT_CATEGORY_DEFAULT_WEIGHTS = {"纯后端": 15, "纯前端": 40, "全栈": 45}
@@ -71,7 +72,7 @@ RETIRED_BUG_PROMPT_FRAGMENTS = (
 
 
 def task_difficulty_allowed(task_type: str, difficulty: str) -> bool:
-    return difficulty in (("中等", "困难", "地狱") if task_type == "bugfix" else ("困难", "地狱"))
+    return difficulty in ("困难", "地狱")
 
 
 class PairwiseService:
@@ -115,6 +116,7 @@ class PairwiseService:
         self._artifact_retry_after: Dict[str, float] = {}
         self._seed_settings()
         self._retire_outdated_ready_bug_tasks()
+        self._retire_unreviewed_ready_bug_tasks()
         self._retire_overloaded_ready_tasks()
         self._quarantine_invalid_completed_pairs()
         self._queue_invalid_delivery_lineage_pairs()
@@ -1381,6 +1383,38 @@ class PairwiseService:
             retired += int(self._retire_outdated_ready_bug_task(task))
         return retired
 
+    def _retire_unreviewed_ready_bug_tasks(self) -> int:
+        """Keep legacy natural Bug drafts out until they pass the stricter gate."""
+        retired = 0
+        rows = self.db.all(
+            """SELECT t.* FROM tasks t
+                 WHERE t.source='bug_discovery' AND t.task_type='bugfix' AND t.status='ready'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM audit_events e
+                      WHERE e.event_type='bug.task_review_passed'
+                        AND e.entity_type='bug_candidate' AND e.entity_id=t.source_id
+                   )"""
+        )
+        for task in rows:
+            reason = "缺少困难级别、45 至 90 分钟、至少 20 行生产代码及无答案泄露的独立复核"
+            stamp = now_iso()
+            self.db.execute(
+                """UPDATE tasks SET status='rejected',rejection_reason=?,updated_at=?
+                     WHERE id=? AND status='ready'""",
+                (reason, stamp, task["id"]),
+            )
+            if task.get("source_id"):
+                self.db.execute(
+                    """UPDATE bug_candidates SET status='prompt_generation_failed',error=?,updated_at=?
+                         WHERE id=? AND status='converted'""",
+                    (reason, stamp, task["source_id"]),
+                )
+            retired += 1
+            self.db.audit("bug.unreviewed_ready_task_retired", "task", task["id"], {
+                "candidate_id": task.get("source_id") or "", "reason": reason,
+            })
+        return retired
+
     def _retire_overloaded_ready_tasks(self) -> int:
         """Remove unstarted generated prompts that violate the current scope budget."""
         retired = 0
@@ -1415,7 +1449,7 @@ class PairwiseService:
         params: Tuple[Any, ...] = (selected_type,) if selected_type else ()
         tasks = self.db.all(
             """SELECT * FROM tasks WHERE status='ready'
-               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"""
+               AND difficulty IN ('困难','地狱')"""
             + type_clause
             + " ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 150",
             params,
@@ -1499,6 +1533,7 @@ class PairwiseService:
         pending_bug = self.db.one(
             """SELECT id FROM bug_candidates
                WHERE status IN ('reproduced','awaiting_reproduction')
+                 AND difficulty IN ('困难','地狱')
                ORDER BY CASE status WHEN 'reproduced' THEN 0 ELSE 1 END,updated_at,id LIMIT 1"""
         )
         if pending_bug:
@@ -1551,6 +1586,7 @@ class PairwiseService:
         if task_type == "bugfix":
             candidate = self.db.one(
                 """SELECT id FROM bug_candidates WHERE status='reproduced'
+                   AND difficulty IN ('困难','地狱')
                    ORDER BY updated_at,id LIMIT 1"""
             )
             if candidate:
@@ -1559,6 +1595,7 @@ class PairwiseService:
                 )
             candidate = self.db.one(
                 """SELECT id FROM bug_candidates WHERE status='awaiting_reproduction'
+                   AND difficulty IN ('困难','地狱')
                    ORDER BY created_at,id LIMIT 1"""
             )
             if candidate:
@@ -1608,6 +1645,7 @@ class PairwiseService:
         scheduled = 0
         for row in self.db.all(
             """SELECT id FROM bug_candidates WHERE status='reproduced'
+                 AND difficulty IN ('困难','地狱')
                  ORDER BY updated_at,id"""
         ):
             if self._submit_auto(
@@ -1630,6 +1668,7 @@ class PairwiseService:
         )
         for row in self.db.all(
             """SELECT id FROM bug_candidates WHERE status='awaiting_reproduction'
+                 AND difficulty IN ('困难','地狱')
                  ORDER BY created_at,id"""
         ):
             if reproduction_slots <= 0:
@@ -1742,7 +1781,7 @@ class PairwiseService:
         needed = max(0, target - ready)
         candidates = self.db.all(
             """SELECT id FROM tasks WHERE status='candidate'
-               AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"""
+               AND difficulty IN ('困难','地狱')"""
             + type_clause + " ORDER BY created_at LIMIT ?",
             type_params + (min(capacity, needed),),
         )
@@ -2053,7 +2092,15 @@ class PairwiseService:
         previous = ""
         correction = ""
         duplicate = ""
+        last_review: Dict[str, Any] = {}
         workspace = Path(str(arm.get("workspace_path") or ""))
+        project_summary = json.dumps({
+            "sourcePairId": candidate.get("source_pair_id"),
+            "sourceArm": candidate.get("source_arm"),
+            "sourceCommit": candidate.get("source_sha"),
+            "stack": source_task.get("stack", ""),
+            "projectCategory": source_task.get("project_category", ""),
+        }, ensure_ascii=False)
         for attempt in (1, 2):
             result = self.codex.run(
                 "bug_task_generation",
@@ -2077,22 +2124,65 @@ class PairwiseService:
             if duplicate:
                 issues.append(duplicate)
             if not issues:
-                self.db.audit("bug.prompt_generated", "bug_candidate", candidate["id"], {
-                    "attempt": attempt,
-                    "evidenceUsed": result.get("evidenceUsed") or [],
-                    "promptLength": len(prompt),
-                })
-                return prompt
+                last_review = self.codex.run(
+                    "bug_task_review",
+                    discovered_bug_review_prompt(
+                        str(candidate.get("title") or ""), prompt,
+                        json.dumps(evidence, ensure_ascii=False, indent=2),
+                        project_summary,
+                    ),
+                    SEEDED_BUG_REVIEW_SCHEMA,
+                    cwd=workspace if workspace.is_dir() else None,
+                    pair_id=str(candidate.get("source_pair_id") or ""),
+                    task_id=str(source_task.get("id") or ""),
+                    timeout=1800,
+                )
+                review_ok = bool(
+                    last_review.get("accepted")
+                    and last_review.get("difficulty") in ("困难", "地狱")
+                    and 45 <= int(last_review.get("estimatedRepairMinutes") or 0) <= 90
+                    and int(last_review.get("estimatedChangedLines") or 0) >= 20
+                    and int(last_review.get("estimatedChangedFiles") or 0) >= 1
+                    and not last_review.get("answerLeak")
+                )
+                if review_ok:
+                    self.db.audit("bug.task_review_passed", "bug_candidate", candidate["id"], {
+                        "attempt": attempt, "review": last_review,
+                    })
+                    self.db.audit("bug.prompt_generated", "bug_candidate", candidate["id"], {
+                        "attempt": attempt,
+                        "evidenceUsed": result.get("evidenceUsed") or [],
+                        "promptLength": len(prompt),
+                    })
+                    return prompt
+                issues.extend(str(item) for item in (last_review.get("issues") or []) if str(item).strip())
+                issues.append(str(last_review.get("reason") or "独立复核认为难度、答案泄露或预计代码量不合格"))
+                if last_review.get("answerLeak"):
+                    issues.append("删除根因、内部文件或函数位置、代码行号、补丁策略和实现答案，只保留业务复现证据")
+                if last_review.get("difficulty") not in ("困难", "地狱"):
+                    issues.append("该候选实际修复难度未达到困难，不能仅靠扩写题面提升难度")
+                if int(last_review.get("estimatedChangedLines") or 0) < 20:
+                    issues.append("合理修复预计不足 20 行有效生产代码")
             previous = prompt
-            correction = "；".join(issues)
+            correction = "；".join(dict.fromkeys(issues))
         stamp = now_iso()
-        status = "duplicate_rejected" if duplicate else "prompt_generation_failed"
+        scope_rejected = bool(
+            last_review
+            and (
+                last_review.get("difficulty") not in ("困难", "地狱")
+                or not 45 <= int(last_review.get("estimatedRepairMinutes") or 0) <= 90
+                or int(last_review.get("estimatedChangedLines") or 0) < 20
+            )
+        )
+        status = "duplicate_rejected" if duplicate else (
+            "difficulty_rejected" if scope_rejected else "prompt_generation_failed"
+        )
         self.db.execute(
             "UPDATE bug_candidates SET status=?,error=?,updated_at=? WHERE id=?",
             (status, correction[-2000:], stamp, candidate["id"]),
         )
-        self.db.audit("bug.prompt_generation_failed", "bug_candidate", candidate["id"], {
-            "status": status, "reason": correction,
+        self.db.audit("bug.task_review_rejected", "bug_candidate", candidate["id"], {
+            "status": status, "reason": correction, "review": last_review,
         })
         raise ValueError(correction)
 
@@ -2368,7 +2458,7 @@ class PairwiseService:
         if not task:
             raise KeyError("任务不存在")
         if task["status"] != "ready" or not task_difficulty_allowed(task["task_type"], task["difficulty"]):
-            raise ValueError("0–1/Feature 仅允许困难或地狱；Bug 修复允许中等、困难或地狱")
+            raise ValueError("0–1、Feature 和 Bug 修复都只允许困难或地狱")
         active_count = (self.db.one("SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')") or {"count": 0})["count"]
         configured_limit = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         pair_limit = max(1, min(MAX_PAIR_PROJECTS, configured_limit))
@@ -2639,7 +2729,7 @@ class PairwiseService:
         for candidate in result["candidates"]:
             candidate_id = "bug-" + uuid.uuid4().hex[:16]
             difficulty = candidate["difficulty"]
-            status = "awaiting_reproduction" if difficulty in ("中等", "困难", "地狱") else "difficulty_rejected"
+            status = "awaiting_reproduction" if difficulty in ("困难", "地狱") else "difficulty_rejected"
             stamp = now_iso()
             self.db.execute(
                 """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
@@ -2871,8 +2961,8 @@ class PairwiseService:
         candidate = self.db.one("SELECT * FROM bug_candidates WHERE id=?", (candidate_id,))
         if not candidate:
             raise KeyError("Bug 候选不存在")
-        if candidate["status"] == "difficulty_rejected":
-            raise ValueError("简单 Bug 只保留记录，不能进入复现与 Pair")
+        if candidate["status"] == "difficulty_rejected" or candidate["difficulty"] not in ("困难", "地狱"):
+            raise ValueError("只有难度达到困难或地狱的 Bug 才能进入复现与 Pair")
         arm = self.db.one(
             "SELECT * FROM arm_runs WHERE pair_id=? AND arm=? AND commit_sha=?",
             (candidate["source_pair_id"], candidate["source_arm"], candidate["source_sha"]),
@@ -2955,8 +3045,8 @@ class PairwiseService:
         candidate = self.db.one("SELECT * FROM bug_candidates WHERE id=?", (candidate_id,))
         if not candidate:
             raise KeyError("Bug 候选不存在")
-        if candidate["status"] != "reproduced" or candidate["reproduce_count"] < 2 or candidate["difficulty"] not in ("中等", "困难", "地狱"):
-            raise ValueError("只有双次复现且难度至少为中等的 Bug 才能创建任务")
+        if candidate["status"] != "reproduced" or candidate["reproduce_count"] < 2 or candidate["difficulty"] not in ("困难", "地狱"):
+            raise ValueError("只有双次复现且难度达到困难或地狱的 Bug 才能创建任务")
         arm = self.db.one("SELECT * FROM arm_runs WHERE pair_id=? AND arm=?", (candidate["source_pair_id"], candidate["source_arm"])) or {}
         source_task = self.db.one(
             """SELECT t.* FROM tasks t JOIN pairs p ON p.task_id=t.id WHERE p.id=?""",
@@ -3185,9 +3275,7 @@ class PairwiseService:
         raw_assessed = str(result.get("difficulty") or "")
         task_type = str(task.get("task_type") or "")
         accepted = task_difficulty_allowed(task_type, raw_assessed)
-        # Bug 修复仍允许以“中等”进入并完成真实复现，但通过开发后复评的
-        # 交付统一按“困难”落库，避免已通过数据继续显示或导出为中等。
-        assessed = "困难" if accepted and task_type == "bugfix" and raw_assessed == "中等" else raw_assessed
+        assessed = raw_assessed
         status = "passed" if accepted else "rejected"
         reason = str(result.get("reason") or "").strip()[:800]
         evidence = [str(value)[:300] for value in list(result.get("evidence") or [])[:10]]
@@ -3209,7 +3297,7 @@ class PairwiseService:
                     (stamp, pair_id),
                 )
             else:
-                threshold = "中等" if task.get("task_type") == "bugfix" else "困难/地狱"
+                threshold = "困难/地狱"
                 message = "实际难度复评为%s，低于%s准入线，已停止当前 Pair 并等待自动补位：%s" % (
                     assessed or "未知", threshold, reason,
                 )
@@ -3943,7 +4031,7 @@ class PairwiseService:
             issues.append("任务类型无法映射到本期 GSB 表单")
         difficulty = str(task.get("difficulty") or "")
         if not task_difficulty_allowed(str(task.get("task_type") or ""), difficulty):
-            issues.append("0–1/Feature 只允许困难或地狱；Bug 修复允许中等、困难或地狱")
+            issues.append("0–1、Feature 和 Bug 修复都只允许困难或地狱")
         prompt = str(task.get("prompt") or "")
         if not prompt:
             issues.append("缺少完整 User Prompt")
