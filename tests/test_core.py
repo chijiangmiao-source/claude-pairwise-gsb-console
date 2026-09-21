@@ -1964,6 +1964,21 @@ class CoreTests(unittest.TestCase):
         }
         self.assertFalse(RecordingManager._runtime_recording_is_allowed(check, compose))
 
+    def test_verify_blocked_by_unhealthy_web_uses_failure_evidence_recording(self):
+        compose = self.root / "compose.yml"
+        compose.write_text("services:\n  web:\n    image: example\n", encoding="utf-8")
+        check = {
+            "status": "observed_failed",
+            "checks_json": json.dumps([{
+                "name": "verify_service", "passed": False, "exit_code": 1,
+                "detail": (
+                    "Container example-web-1 Error dependency web failed to start\n"
+                    "dependency failed to start: container example-web-1 is unhealthy"
+                ),
+            }]),
+        }
+        self.assertFalse(RecordingManager._runtime_recording_is_allowed(check, compose))
+
     def test_failed_artifact_is_preserved_for_gsb_without_claude_repair(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

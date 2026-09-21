@@ -242,9 +242,16 @@ class RecordingManager:
         # service ``verify``.  Re-launching that API for a browser walkthrough
         # repeats the same contract mistake, so record the real command failure.
         for item in failed:
-            if (str(item.get("name") or "") == "verify_service"
+            name = str(item.get("name") or "")
+            detail = str(item.get("detail") or "")
+            startup_failure = any(marker in detail.casefold() for marker in (
+                "dependency failed to start", "is unhealthy", "container is unhealthy",
+                "error dependency", "healthcheck failed",
+            ))
+            if (name == "verify_service"
                     and (int(item.get("exit_code") or 0) == 124
-                         or "不能启动常驻服务" in str(item.get("detail") or ""))):
+                         or "不能启动常驻服务" in detail
+                         or startup_failure)):
                 return False
         blocking = re.compile(
             r"compose|dockerfile|clean_start|containers?_running|health|startup|published_port",
