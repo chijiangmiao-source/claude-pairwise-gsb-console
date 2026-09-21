@@ -86,6 +86,26 @@ def generated_task_prompt_issues(task_type: str, prompt: str,
         or re.search(r"(?:一次性|自行退出|自动退出|执行后退出|运行后退出)[^。！？]{0,40}verify", cleaned, re.IGNORECASE)
     ):
         issues.append("0–1 新题必须说明 verify 是执行后退出的一次性验收服务")
+    if task_type == "zero_to_one" and candidate is not None:
+        verify_sentences = [
+            sentence for sentence in sentences
+            if re.search(r"\bverify\b", sentence, re.IGNORECASE)
+        ]
+        verify_scope = " ".join(verify_sentences)
+        if not (
+            re.search(r"(?:代码|单元|集成|项目)?测试", verify_scope)
+            and re.search(r"构建(?:检查|校验|验证)?", verify_scope)
+            and re.search(r"(?:API|HTTP|接口)[^。！？]{0,24}冒烟", verify_scope, re.IGNORECASE)
+        ):
+            issues.append("0–1 新题的 verify 只要求代码测试、构建检查和 API/HTTP 冒烟")
+        if re.search(r"(?:verify|验收服务)[^。！？]{0,80}(?:Playwright|浏览器|E2E|端到端)", cleaned, re.IGNORECASE):
+            issues.append("0–1 新题不得要求 verify 安装 Playwright 或运行浏览器验收")
+        if re.search(
+            r"(?:安装|引入|依赖|使用|运行)[^。！？]{0,32}Playwright|Playwright[^。！？]{0,32}(?:安装|引入|依赖|使用|运行)",
+            cleaned,
+            re.IGNORECASE,
+        ):
+            issues.append("0–1 新题不得要求项目仓库安装或运行 Playwright")
 
     scenarios = acceptance if isinstance(acceptance, list) else []
     acceptance_max = FEATURE_MAX_ACCEPTANCE if task_type == "feature" else ZERO_TO_ONE_MAX_ACCEPTANCE
@@ -157,7 +177,7 @@ def task_validation_prompt(task_text: str, known_titles: str,
 {DIFFICULTY_RULES}
 {BANNED_TASKS}
 
-还要检查：必须能用 Docker Compose 清洁启动；应包含可操作的功能验收；不能只是改名换皮；与已有题目不能在核心功能、交互、数据模型、验收或技术实现上高度重复。去重按业务目标、核心机制和验收链路判断，不能只看标题或字面是否完全一致；相同机制换行业名、换角色名或改写措辞仍算重复。
+还要检查：必须能用 Docker Compose 清洁启动；应包含可操作的功能验收；不能只是改名换皮；与已有题目不能在核心功能、交互、数据模型、验收或技术实现上高度重复。新生成的 0–1 题保留 Dockerfile、Docker Compose、健康检查、可配置宿主机端口和一次性 verify 服务，verify 执行后以退出码报告结果，范围只包括代码测试、构建检查和 API/HTTP 冒烟，不要求项目仓库安装 Playwright 或运行浏览器验收。去重按业务目标、核心机制和验收链路判断，不能只看标题或字面是否完全一致；相同机制换行业名、换角色名或改写措辞仍算重复。
 
 先做一次最小实现预演：列出题面不可省略的状态变化、数据边界和验收，再对照基线已有能力，判断最短正确实现的真实难度。Feature 或 Bug 必须检查准确基线中的现有模块；如果主要工作可以复用现有机制并通过直接扩字段、加路由、循环筛选、区间切分、调用既有算法或增加前端状态完成，应判为中等。Feature 的中等候选应拒绝；Bug 修复若来自真实产物、具备准确基线并已双次复现，中等可以接受。困难候选应只有一个贯穿三至四个模块的真实主难点，验收必须能证明它确实被实现；不要用多套无关机制、字段数量或测试数量抬高难度。difficultyEvidence 必须说明判定依据，不能只复述题面。
 
@@ -197,7 +217,7 @@ def task_generation_prompt(existing: str, task_type: str = "zero_to_one",
 
 prompt 目标约 450 字，生成时控制在 300 至 520 字，写成四至六个完整中文句子，单句不超过 120 字，分号不超过两个；本地只为轻微偏差保留 300 至 600 字的硬边界。按业务背景、用户操作、关键约束、失败反馈和可观察验收的因果顺序自然展开，不加标题、列表或“需求如下”，不把数据库、接口、页面、测试数量和交付要求机械拼成一串。acceptance 只列三至六个可独立操作并观察结果的场景，同一次操作产生同一结果的校验要合并。{category_rule}纯后端不得创建前端；纯前端必须交付可真实操作的浏览器页面且不得创建业务后端；全栈必须同时交付浏览器页面和业务后端，并通过真实 API 联调。stack 只写主要编程语言和主要应用框架，用英文逗号加空格分隔，例如 Python 3.13, FastAPI 或 TypeScript, React。
 
-题面从空仓库起步，并在正文中用一句话自然交代 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，以及 Compose 中名为 verify、执行验收后自行退出并以退出码报告结果的一次性服务；不要在结尾堆 README、测试、.gitignore 等通用清单。只固定会改变核心验收结果的业务规则，字段命名、页面布局和内部实现留给开发者。内部范围字段只供系统校验，必须如实填写，不能写进 prompt。
+题面从空仓库起步，并在正文中用一句话自然交代 Dockerfile、Docker Compose、健康检查、可配置宿主机端口，以及 Compose 中名为 verify、执行验收后自行退出并以退出码报告结果的一次性服务。verify 的范围只包括代码测试、构建检查和 API/HTTP 冒烟，不要求项目仓库安装 Playwright 或运行浏览器验收；页面真实操作与录像由交付流程另行完成，不写成项目内 verify 的义务。不要在结尾堆 README、测试、.gitignore 等通用清单。只固定会改变核心验收结果的业务规则，字段命名、页面布局和内部实现留给开发者。内部范围字段只供系统校验，必须如实填写，不能写进 prompt。
 
 已有题目标题与摘要，必须避免核心问题、机制和验收链路雷同；换行业背景或改写措辞不能算新题：
 {existing or '无'}

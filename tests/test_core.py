@@ -215,7 +215,11 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(any("分号最多" in issue for issue in issues))
 
     def test_generated_task_scope_budget_accepts_old_system_shape(self):
-        prompt = "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供名为 verify、执行后自行退出的一次性验收服务。" + "".join(("甲" * 60 + "。") for _ in range(4))
+        prompt = (
+            "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供健康检查与可配置端口。"
+            "名为 verify 的一次性服务只执行代码测试、构建检查和 API/HTTP 冒烟，完成后自行退出并返回退出码。"
+            + "".join(("甲" * 52 + "。") for _ in range(4))
+        )
         issues = generated_task_prompt_issues(
             "zero_to_one", prompt, ["a", "b", "c"], {
                 "engineeringCore": "跨层状态裁决",
@@ -247,6 +251,32 @@ class CoreTests(unittest.TestCase):
         }
         issues = generated_task_prompt_issues("zero_to_one", prompt, ["a", "b", "c"], candidate)
         self.assertTrue(any("一次性" in issue for issue in issues))
+
+    def test_new_generated_zero_to_one_restricts_verify_to_non_browser_checks(self):
+        candidate = {
+            "engineeringCore": "跨层状态裁决",
+            "mainUserFlow": "导入后核验并处理冲突",
+            "implementationModules": ["parser", "service", "api"],
+            "runtimeComponents": ["api"],
+            "auxiliaryMechanisms": [],
+            "newOperations": ["导入", "核验"],
+            "newStateSets": ["处理状态"],
+        }
+        missing_scope = (
+            "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供名为 verify、执行后自行退出的一次性验收服务。"
+            + "".join(("甲" * 60 + "。") for _ in range(4))
+        )
+        issues = generated_task_prompt_issues("zero_to_one", missing_scope, ["a", "b", "c"], candidate)
+        self.assertTrue(any("代码测试、构建检查和 API/HTTP 冒烟" in issue for issue in issues))
+
+        browser_verify = (
+            "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供健康检查与可配置端口。"
+            "名为 verify 的一次性服务执行代码测试、构建检查、API/HTTP 冒烟和 Playwright 浏览器验收，随后退出并返回退出码。"
+            + "".join(("甲" * 52 + "。") for _ in range(3))
+        )
+        issues = generated_task_prompt_issues("zero_to_one", browser_verify, ["a", "b", "c"], candidate)
+        self.assertTrue(any("浏览器验收" in issue for issue in issues))
+        self.assertTrue(any("Playwright" in issue for issue in issues))
 
     def test_generated_feature_does_not_repeat_existing_verify_requirement(self):
         prompt = "".join(("甲" * 62 + "。") for _ in range(5))
