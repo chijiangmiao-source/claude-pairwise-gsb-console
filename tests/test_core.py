@@ -233,9 +233,10 @@ class CoreTests(unittest.TestCase):
 
     def test_generated_task_scope_budget_accepts_old_system_shape(self):
         prompt = (
-            "项目从空仓库起步，用 Dockerfile 和 Docker Compose 启动，并提供健康检查与可配置端口。"
+            "项目从空仓库起步，用 Dockerfile 和 Docker Compose 交付前后端组件。"
+            "Web 与 API 分别提供健康检查，宿主机端口允许按部署环境配置。"
             "名为 verify 的一次性服务只执行代码测试、构建检查和 API/HTTP 冒烟，完成后自行退出并返回退出码。"
-            + "".join(("甲" * 52 + "。") for _ in range(4))
+            + "".join(("甲" * 54 + "。") for _ in range(3))
         )
         issues = generated_task_prompt_issues(
             "zero_to_one", prompt, ["a", "b", "c"], {
@@ -249,6 +250,26 @@ class CoreTests(unittest.TestCase):
             },
         )
         self.assertEqual(issues, [])
+
+    def test_generated_zero_to_one_rejects_infrastructure_template_ending(self):
+        prompt = (
+            "甲" * 58 + "。" + "乙" * 58 + "。" + "丙" * 58 + "。" +
+            "项目由 Dockerfile 和 Docker Compose 启动 Web 与 API，二者提供健康检查和可配置宿主机端口，"
+            "Compose 还含名为 verify、完成接口验收后自行退出并以退出码报告结果的一次性服务。"
+        )
+        candidate = {
+            "engineeringCore": "跨层状态裁决",
+            "mainUserFlow": "导入后核验并处理冲突",
+            "implementationModules": ["parser", "service", "api"],
+            "runtimeComponents": ["api", "web"],
+            "auxiliaryMechanisms": [],
+            "newOperations": ["导入", "核验"],
+            "newStateSets": ["处理状态"],
+        }
+        issues = generated_task_prompt_issues(
+            "zero_to_one", prompt, ["a", "b", "c"], candidate,
+        )
+        self.assertTrue(any("基础设施模板句" in issue for issue in issues))
 
     def test_generated_zero_to_one_requires_named_verify_service(self):
         prompt = "".join(("甲" * 62 + "。") for _ in range(5))
