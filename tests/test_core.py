@@ -357,6 +357,22 @@ class CoreTests(unittest.TestCase):
             "",
         )
 
+    def test_bugfix_prompt_rejects_browser_automation_but_allows_page_symptoms(self):
+        browser_prompt = (
+            "页面提交合法批次后会显示错误结果，Docker Compose 可以正常启动。"
+            "修复后使用 Playwright 浏览器 E2E 重放真实点击，并完成自动化验收。"
+            "同时核对重复提交和异常输入，确认结果稳定且错误提示不丢失。" * 3
+        )
+        issues = self.service._bugfix_prompt_issues(browser_prompt)
+        self.assertTrue(any("浏览器自动化" in issue for issue in issues))
+
+        api_prompt = (
+            "页面提交合法批次后会显示错误结果，现有 Docker Compose 可以正常启动并保留原始输入。"
+            "修复后通过代码测试、构建检查和公开 HTTP API 冒烟完成自动化验收，核对成功响应、异常状态和重复请求。"
+            "页面现象仍作为业务结果说明，录像由交付流程另行完成，接口字段和正常流程不能发生回退。" * 2
+        )
+        self.assertEqual(self.service._bugfix_prompt_issues(api_prompt), [])
+
     def test_submission_claim_and_remote_binding_are_idempotent(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")

@@ -2111,6 +2111,13 @@ class PairwiseService:
             issues.append("没有保留 Docker Compose 启动与验收链路")
         if "自动化" not in text or not ("验收" in text or "测试" in text):
             issues.append("没有给出可执行的自动化验收要求")
+        if re.search(
+            r"playwright|cypress|selenium|puppeteer|"
+            r"浏览器\s*(?:自动化|测试|验收|e2e)|"
+            r"(?:自动化|端到端|e2e)\s*(?:的)?\s*浏览器|真实点击脚本",
+            text, re.IGNORECASE,
+        ):
+            issues.append("Bug 题不得要求浏览器自动化或浏览器 E2E 验收")
         return issues
 
     def _generate_bugfix_task_prompt(self, candidate: Dict[str, Any], arm: Dict[str, Any],
