@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .analytics import dashboard
-from .artifact import ArtifactChecker
+from .artifact import ArtifactChecker, isolated_compose_environment
 from .claude_runner import ClaudeRunner
 from .classification import normalize_project_category, normalize_stack
 from .codex_runner import (
@@ -2892,34 +2892,48 @@ class PairwiseService:
             for attempt in (1, 2):
                 project = "bugrep-%s-%d" % (candidate_id[-8:].lower(), attempt)
                 attempt_result = {"attempt": attempt, "commands": [], "passed": True}
-                run_command(["docker", "compose", "-p", project, "-f", str(compose), "down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180)
-                up = run_command(["docker", "compose", "-p", project, "-f", str(compose), "up", "-d", "--build"], cwd=workspace, check=False, timeout=1200)
-                attempt_result["startExitCode"] = up.returncode
-                if up.returncode != 0:
-                    attempt_result["passed"] = False
-                    attempt_result["startOutput"] = redact(up.stderr or up.stdout)
-                else:
-                    time.sleep(3)
-                    for spec in commands:
-                        args = spec.get("composeArgs") if isinstance(spec, dict) else None
-                        if not isinstance(args, list) or not args or not all(isinstance(x, str) and x for x in args):
-                            raise ValueError("复现命令格式无效")
-                        if args[0] not in ("exec", "run") or any(x in ("down", "rm", "kill", "stop") for x in args):
-                            raise ValueError("复现命令只允许 docker compose exec 或 run")
-                        result = run_command(
-                            ["docker", "compose", "-p", project, "-f", str(compose)] + args,
-                            cwd=workspace, check=False, timeout=600,
-                        )
-                        combined = (result.stdout + "\n" + result.stderr).strip()
-                        expected_code = int(spec.get("expectedExitCode", 0))
-                        marker = str(spec.get("expectedOutputContains") or "")
-                        matched = result.returncode == expected_code and (not marker or marker in combined)
-                        attempt_result["commands"].append({
-                            "composeArgs": args, "exitCode": result.returncode, "expectedExitCode": expected_code,
-                            "expectedOutputContains": marker, "matched": matched, "output": redact(combined),
-                        })
-                        attempt_result["passed"] = attempt_result["passed"] and matched
-                run_command(["docker", "compose", "-p", project, "-f", str(compose), "down", "-v", "--remove-orphans"], cwd=workspace, check=False, timeout=180)
+                compose_env, assigned_ports = isolated_compose_environment(compose)
+                attempt_result["isolatedHostPorts"] = assigned_ports
+                base = ["docker", "compose", "-p", project, "-f", str(compose)]
+                run_command(
+                    base + ["down", "-v", "--remove-orphans"], cwd=workspace,
+                    check=False, timeout=180, env=compose_env,
+                )
+                try:
+                    up = run_command(
+                        base + ["up", "-d", "--build"], cwd=workspace,
+                        check=False, timeout=1200, env=compose_env,
+                    )
+                    attempt_result["startExitCode"] = up.returncode
+                    if up.returncode != 0:
+                        attempt_result["passed"] = False
+                        attempt_result["startOutput"] = redact(up.stderr or up.stdout)
+                    else:
+                        time.sleep(3)
+                        for spec in commands:
+                            args = spec.get("composeArgs") if isinstance(spec, dict) else None
+                            if not isinstance(args, list) or not args or not all(isinstance(x, str) and x for x in args):
+                                raise ValueError("复现命令格式无效")
+                            if args[0] not in ("exec", "run") or any(x in ("down", "rm", "kill", "stop") for x in args):
+                                raise ValueError("复现命令只允许 docker compose exec 或 run")
+                            result = run_command(
+                                base + args, cwd=workspace, check=False, timeout=600,
+                                env=compose_env,
+                            )
+                            combined = (result.stdout + "\n" + result.stderr).strip()
+                            expected_code = int(spec.get("expectedExitCode", 0))
+                            marker = str(spec.get("expectedOutputContains") or "")
+                            matched = result.returncode == expected_code and (not marker or marker in combined)
+                            attempt_result["commands"].append({
+                                "composeArgs": args, "exitCode": result.returncode, "expectedExitCode": expected_code,
+                                "expectedOutputContains": marker, "matched": matched, "output": redact(combined),
+                            })
+                            attempt_result["passed"] = attempt_result["passed"] and matched
+                finally:
+                    run_command(
+                        base + ["down", "-v", "--remove-orphans"], cwd=workspace,
+                        check=False, timeout=180, env=compose_env,
+                    )
                 attempts.append(attempt_result)
             reproduced = len(attempts) == 2 and all(item["passed"] for item in attempts)
             status = "reproduced" if reproduced else "not_reproduced"

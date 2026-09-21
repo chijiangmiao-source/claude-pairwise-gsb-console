@@ -4201,6 +4201,50 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(regenerated["status"], "ready")
         self.assertEqual(regenerated["prompt"], natural_prompt)
 
+    def test_bug_reproduction_uses_isolated_ports_for_every_compose_command(self):
+        from pairwise_console.commands import CommandResult
+        self.insert_ready_task()
+        pair = self.service.create_pair("task-1")
+        workspace = self.root / "bug-reproduction-isolated"
+        workspace.mkdir()
+        (workspace / "compose.yml").write_text(
+            "services:\n  api:\n    image: busybox\n    ports:\n      - '${API_PORT:-8000}:8000'\n",
+            encoding="utf-8",
+        )
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO arm_runs(id,pair_id,arm,branch,workspace_path,container_name,screen_name,
+               model,image,status,commit_sha,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?)""",
+            ("repro-arm-a", pair["id"], "A", "A", str(workspace), "container", "screen",
+             "auto_model/urm", "image", "a" * 40, stamp, stamp),
+        )
+        self.db.execute(
+            """INSERT INTO bug_candidates(id,source_pair_id,source_arm,source_sha,title,preconditions,
+               reproduction_steps_json,reproduction_commands_json,actual_result,expected_result,difficulty,
+               difficulty_evidence_json,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,'[]','awaiting_reproduction',?,?)""",
+            ("bug-isolated", pair["id"], "A", "a" * 40, "isolated ports", "running app",
+             '["call API"]', '[{"composeArgs":["exec","-T","api","check"],"expectedExitCode":0,"expectedOutputContains":"BUG"}]',
+             "bad", "good", "困难", stamp, stamp),
+        )
+        expected_env = {"API_PORT": "54321"}
+        calls = []
+
+        def command(args, **kwargs):
+            calls.append((args, kwargs.get("env")))
+            output = "BUG" if "exec" in args else "ok"
+            return CommandResult(args, str(workspace), 0, output, "")
+
+        with patch("pairwise_console.service.isolated_compose_environment", return_value=(expected_env, {"API_PORT": "54321"})), \
+             patch("pairwise_console.service.run_command", side_effect=command), \
+             patch("pairwise_console.service.time.sleep"):
+            result = self.service.reproduce_bug("bug-isolated")
+        self.assertEqual(result["status"], "reproduced")
+        self.assertEqual(result["reproduce_count"], 2)
+        self.assertTrue(calls)
+        self.assertTrue(all(env is expected_env for _, env in calls))
+
     def test_arm_delivery_is_squashed_to_one_commit_on_baseline(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
