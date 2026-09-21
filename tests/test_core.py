@@ -25,7 +25,10 @@ from pairwise_console.prompts import (
     task_generation_prompt, task_validation_prompt,
 )
 from pairwise_console.recording import RecordingManager
-from pairwise_console.service import PairwiseService, seeded_bug_preflight_allowed
+from pairwise_console.service import (
+    PairwiseService, bug_review_prompt_rewrite_allowed,
+    seeded_bug_preflight_allowed,
+)
 
 
 class CoreTests(unittest.TestCase):
@@ -877,12 +880,35 @@ class CoreTests(unittest.TestCase):
         allowed, mode = seeded_bug_preflight_allowed({
             "status": "failed",
             "checks": [
+                {"name": "clean_start", "passed": True},
+                {"name": "containers_running", "passed": True},
+                {"name": "verify_service_present", "passed": False},
+                {"name": "cleanup", "passed": True},
+            ],
+        })
+        self.assertTrue(allowed)
+        self.assertEqual(mode, "legacy_without_verify")
+
+        allowed, mode = seeded_bug_preflight_allowed({
+            "status": "failed",
+            "checks": [
                 {"name": "clean_start", "passed": False},
                 {"name": "verify_service", "passed": False},
             ],
         })
         self.assertFalse(allowed)
         self.assertIn("clean_start", mode)
+
+    def test_seeded_bug_prompt_rewrite_requires_wording_only_failure(self):
+        review = {
+            "accepted": False, "difficulty": "困难", "estimatedRepairMinutes": 60,
+            "estimatedChangedLines": 40, "estimatedChangedFiles": 2,
+            "answerLeak": True,
+            "issues": ["标题直接泄露根因", "题面提示了补丁策略"],
+        }
+        self.assertTrue(bug_review_prompt_rewrite_allowed(review))
+        review["issues"].append("注入包含显眼的特例硬编码")
+        self.assertFalse(bug_review_prompt_rewrite_allowed(review))
 
     def test_ready_task_selection_prefers_new_zero_to_one_and_rejects_duplicate_title(self):
         rows = [

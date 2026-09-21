@@ -87,6 +87,22 @@ def bug_review_scope_allowed(review: Dict[str, Any]) -> bool:
     )
 
 
+def bug_review_prompt_rewrite_allowed(review: Dict[str, Any]) -> bool:
+    """Return true only when wording is the review's sole remaining defect."""
+    if not (
+        review.get("answerLeak")
+        and bug_review_scope_allowed(review)
+        and int(review.get("estimatedRepairMinutes") or 0) <= 120
+        and int(review.get("estimatedChangedFiles") or 0) >= 1
+    ):
+        return False
+    issues = [str(item) for item in list(review.get("issues") or []) if str(item).strip()]
+    if not issues:
+        return True
+    wording_markers = ("题面", "标题", "泄露", "提示", "答案", "公开文字")
+    return all(any(marker in issue for marker in wording_markers) for issue in issues)
+
+
 def seeded_bug_preflight_allowed(check: Dict[str, Any]) -> Tuple[bool, str]:
     """Allow the injected business defect itself to fail an existing verify.
 
@@ -103,7 +119,9 @@ def seeded_bug_preflight_allowed(check: Dict[str, Any]) -> Tuple[bool, str]:
         for item in list(check.get("checks") or [])
         if not item.get("passed")
     }
-    if failed == {"verify_service"}:
+    if failed and failed.issubset({"verify_service", "verify_service_present"}):
+        if "verify_service_present" in failed:
+            return True, "legacy_without_verify"
         return True, "expected_bug_verify_failure"
     return False, "failed:" + ",".join(sorted(failed))
 
@@ -3182,12 +3200,7 @@ class PairwiseService:
             # every structural gate already passes, rewrite only the public
             # title/prompt once and run the independent review again.  The
             # read-only rewrite cannot touch the seeded code.
-            repairable_leak = bool(
-                review.get("answerLeak")
-                and bug_review_scope_allowed(review)
-                and int(review.get("estimatedRepairMinutes") or 0) <= 120
-                and int(review.get("estimatedChangedFiles") or 0) >= 1
-            )
+            repairable_leak = bug_review_prompt_rewrite_allowed(review)
             if repairable_leak:
                 original_title = str(result.get("title") or "")
                 rewritten = self.codex.run(
