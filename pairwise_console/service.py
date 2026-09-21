@@ -1512,8 +1512,11 @@ class PairwiseService:
         type_clause = " AND task_type=?" if selected_type else ""
         params: Tuple[Any, ...] = (selected_type,) if selected_type else ()
         tasks = self.db.all(
-            """SELECT * FROM tasks WHERE status='ready'
-               AND difficulty IN ('困难','地狱')"""
+            """SELECT tasks.* FROM tasks WHERE status='ready'
+               AND difficulty IN ('困难','地狱')
+               AND NOT EXISTS (
+                 SELECT 1 FROM pairs existing_pair WHERE existing_pair.task_id=tasks.id
+               )"""
             + type_clause
             + " ORDER BY CASE WHEN source='legacy' THEN 1 ELSE 0 END,created_at,id LIMIT 150",
             params,

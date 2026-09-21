@@ -449,6 +449,27 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(status["taskSelectionMode"], "bugfix_only")
         self.assertEqual(status["readyTasks"], 1)
 
+    def test_ready_task_with_existing_pair_is_skipped(self):
+        self.insert_ready_task()
+        self.service.create_pair("task-1")
+        self.db.execute(
+            "UPDATE tasks SET status='ready',locked_by='',used_at=NULL WHERE id='task-1'"
+        )
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+               difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
+            ("task-fresh", "test", "zero_to_one", "fresh hard task",
+             "Build a different hard project with Docker Compose and a verify service",
+             "fresh-fingerprint", stamp, stamp),
+        )
+
+        selected = self.service._next_ready_task("zero_to_one")
+
+        self.assertEqual(selected["id"], "task-fresh")
+        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-1'")["status"], "ready")
+
     def test_failed_pair_replacement_respects_bugfix_only_selection(self):
         self.insert_ready_task()
         retired = self.service.create_pair("task-1")
