@@ -4346,6 +4346,18 @@ class PairwiseService:
         source_sha = str(repo.get(column) or pair.get("baseline_sha") or "")
         return source_sha if re.fullmatch(r"[0-9a-f]{40}", source_sha) else ""
 
+    def _first_prompt_stop_minutes_for_arm(self, arm_id: str, attempt: int) -> int:
+        """Return a one-attempt timeout extension without changing global limits."""
+        default = max(1, int(self.db.setting("first_prompt_stop_minutes", 75)))
+        key = "first_prompt_stop_minutes_override:%s:%d" % (arm_id, max(1, int(attempt)))
+        override = self.db.setting(key, None)
+        if override is None:
+            return default
+        try:
+            return max(default, int(override))
+        except (TypeError, ValueError):
+            return default
+
     def _monitor_arm(self, pair_id: str, arm_id: str, prompt: str) -> Dict[str, Any]:
         # Claude's native TUI removes blank paragraph rows when it records the
         # first user event. Use and persist that representation before any
@@ -4468,9 +4480,9 @@ class PairwiseService:
                 warned = True
                 self.db.execute("UPDATE arm_runs SET warning_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), arm_id))
                 self.db.audit("claude.no_code_warning", "arm_run", arm_id, {"elapsedSeconds": int(elapsed)})
-            stop_minutes = int(self.db.setting("first_prompt_stop_minutes", 75))
-            repeated_trace_minutes = int(self.db.setting("repeated_no_code_trace_minutes", 40))
             attempt = max(1, int(arm.get("attempt_no") or 1))
+            stop_minutes = self._first_prompt_stop_minutes_for_arm(arm_id, attempt)
+            repeated_trace_minutes = int(self.db.setting("repeated_no_code_trace_minutes", 40))
             hard_timeout_due = elapsed >= stop_minutes * 60
             repeated_trace_check_due = (
                 attempt >= 2 and elapsed >= max(0, repeated_trace_minutes) * 60

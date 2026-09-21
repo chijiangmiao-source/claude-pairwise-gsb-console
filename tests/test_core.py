@@ -3274,6 +3274,15 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(detail["matches_previous_attempt"])
         self.assertEqual(detail["rule_trigger"], "repeated_trace_early")
 
+    def test_no_code_timeout_can_be_extended_for_one_arm_attempt(self):
+        arm_id = "pair-special-b"
+        self.assertEqual(self.service._first_prompt_stop_minutes_for_arm(arm_id, 4), 75)
+        self.db.set_setting("first_prompt_stop_minutes_override:%s:4" % arm_id, 105)
+        self.assertEqual(self.service._first_prompt_stop_minutes_for_arm(arm_id, 4), 105)
+        self.assertEqual(self.service._first_prompt_stop_minutes_for_arm(arm_id, 5), 75)
+        self.db.set_setting("first_prompt_stop_minutes_override:%s:4" % arm_id, 30)
+        self.assertEqual(self.service._first_prompt_stop_minutes_for_arm(arm_id, 4), 75)
+
     def test_monitor_restarts_business_code_after_one_hour_without_progress(self):
         self.insert_ready_task()
         pair = self.service.create_pair("task-1")
