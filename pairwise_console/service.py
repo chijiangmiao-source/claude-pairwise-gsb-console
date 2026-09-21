@@ -4283,7 +4283,11 @@ class PairwiseService:
 
     def _start_replacement_pair(self, retired_pair_id: str) -> Dict[str, Any]:
         try:
-            candidate = self._next_ready_task("zero_to_one")
+            # A failed Pair is just another newly available project slot.  Its
+            # replacement must follow the same task-type selection setting as
+            # the regular scheduler; otherwise bugfix-only mode can silently
+            # launch a new zero-to-one task through this side path.
+            candidate = self._next_ready_task()
             if not candidate:
                 self._schedule_refill_once()
                 self.db.execute(
@@ -4292,7 +4296,7 @@ class PairwiseService:
                      now_iso(), retired_pair_id),
                 )
                 self.db.audit("pair.task_replacement_waiting_for_task", "pair", retired_pair_id, {
-                    "selection": "available_first",
+                    "selection": self._selected_task_type() or "available_first",
                 })
                 return {"retiredPairId": retired_pair_id, "replacementPairId": "",
                         "replacementTaskId": "", "outcome": "awaiting_task_refill"}

@@ -432,6 +432,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(status["taskSelectionMode"], "bugfix_only")
         self.assertEqual(status["readyTasks"], 1)
 
+    def test_failed_pair_replacement_respects_bugfix_only_selection(self):
+        self.insert_ready_task()
+        retired = self.service.create_pair("task-1")
+        stamp = now_iso()
+        self.db.execute(
+            """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+               difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
+            ("task-replacement-bug", "test", "bugfix", "replacement bug",
+             "Fix a reproducible concurrency bug in the existing service",
+             "replacement-bug", stamp, stamp),
+        )
+        self.db.execute(
+            "UPDATE pairs SET status='failed',stage='task_replacement' WHERE id=?",
+            (retired["id"],),
+        )
+        self.db.set_setting("task_selection_task_type", "bugfix")
+
+        with patch.object(self.service, "create_pair", return_value={"id": "pair-bug"}) as create, \
+             patch.object(self.service, "prepare_pair_repository") as prepare, \
+             patch.object(self.service, "start_pair") as start:
+            result = self.service._start_replacement_pair(retired["id"])
+
+        create.assert_called_once_with("task-replacement-bug")
+        prepare.assert_called_once_with("pair-bug")
+        start.assert_called_once_with("pair-bug")
+        self.assertEqual(result["replacementTaskId"], "task-replacement-bug")
+
     def test_bugfix_only_refill_does_not_fall_back_to_new_zero_to_one(self):
         self.db.set_setting("task_selection_task_type", "bugfix")
         with patch.object(self.service, "_submit_auto") as submit:
