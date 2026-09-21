@@ -92,6 +92,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.setting("business_progress_idle_minutes"), 60)
         self.assertEqual(self.db.setting("development_max_attempts"), 2)
         self.assertTrue(self.db.setting("task_generation_zero_to_one_only"))
+        self.assertEqual(self.db.setting("task_selection_task_type"), "")
         self.assertEqual(self.db.setting("ab_prompt_stagger_seconds"), 30)
         self.assertEqual(self.db.setting("artifact_verify_timeout_seconds"), 300)
         self.assertIsNone(self.db.setting("task_mix_zero_to_one"))
@@ -410,6 +411,33 @@ class CoreTests(unittest.TestCase):
                  "ready-" + task_type, stamps[task_type], stamps[task_type]),
             )
         self.assertEqual(self.service._next_ready_task()["task_type"], "zero_to_one")
+
+    def test_explicit_task_selection_keeps_queued_zero_to_one_but_selects_bugfix_next(self):
+        stamp = now_iso()
+        for task_id, task_type in (("task-zero", "zero_to_one"), ("task-bug", "bugfix")):
+            self.db.execute(
+                """INSERT INTO tasks(id,source,task_type,title,prompt,difficulty,
+                   difficulty_evidence_json,fingerprint,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'困难','[]',?,'ready',?,?)""",
+                (task_id, "test", task_type, task_id, "hard " + task_type,
+                 task_id, stamp, stamp),
+            )
+        self.db.set_setting("task_selection_task_type", "bugfix")
+
+        selected = self.service._next_ready_task()
+
+        self.assertEqual(selected["id"], "task-bug")
+        self.assertEqual(self.db.one("SELECT status FROM tasks WHERE id='task-zero'")["status"], "ready")
+        status = self.service.automation_status()
+        self.assertEqual(status["taskSelectionMode"], "bugfix_only")
+        self.assertEqual(status["readyTasks"], 1)
+
+    def test_bugfix_only_refill_does_not_fall_back_to_new_zero_to_one(self):
+        self.db.set_setting("task_selection_task_type", "bugfix")
+        with patch.object(self.service, "_submit_auto") as submit:
+            scheduled = self.service._schedule_task_source("bugfix")
+        self.assertFalse(scheduled)
+        submit.assert_not_called()
 
     def test_ready_task_selection_prefers_new_zero_to_one_and_rejects_duplicate_title(self):
         rows = [

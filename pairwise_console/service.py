@@ -153,6 +153,7 @@ class PairwiseService:
             "auto_refill_enabled": True,
             "auto_refill_interval_seconds": 60,
             "task_generation_zero_to_one_only": True,
+            "task_selection_task_type": "",
             "task_category_weight_backend": PROJECT_CATEGORY_DEFAULT_WEIGHTS["纯后端"],
             "task_category_weight_frontend": PROJECT_CATEGORY_DEFAULT_WEIGHTS["纯前端"],
             "task_category_weight_fullstack": PROJECT_CATEGORY_DEFAULT_WEIGHTS["全栈"],
@@ -520,9 +521,7 @@ class PairwiseService:
     def automation_status(self) -> Dict[str, Any]:
         configured = int(self.db.setting("max_pairs_parallel", self.config.max_pairs_parallel))
         target = max(1, min(MAX_PAIR_PROJECTS, configured))
-        zero_to_one_only = bool(
-            self.db.setting("task_generation_zero_to_one_only", True)
-        )
+        selected_type = self._selected_task_type()
         active = int((self.db.one(
             "SELECT COUNT(*) count FROM pairs WHERE status IN ('queued','running','review')"
         ) or {"count": 0})["count"])
@@ -536,7 +535,8 @@ class PairwiseService:
         ) or {"count": 0})["count"])
         ready = int((self.db.one(
             "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND " + ELIGIBLE_TASK_SQL
-            + (" AND task_type='zero_to_one'" if zero_to_one_only else "")
+            + (" AND task_type=?" if selected_type else ""),
+            (selected_type,) if selected_type else (),
         ) or {"count": 0})["count"])
         generating = int((self.db.one(
             "SELECT COUNT(*) count FROM generation_batches WHERE status='running'"
@@ -571,9 +571,17 @@ class PairwiseService:
             "generatingBatches": generating,
             "stages": stages,
             "taskSelectionMode": (
-                "zero_to_one_only" if zero_to_one_only else "available_first"
+                selected_type + "_only" if selected_type else "available_first"
             ),
         }
+
+    def _selected_task_type(self) -> str:
+        selected = str(self.db.setting("task_selection_task_type", "") or "").strip()
+        if selected in ("zero_to_one", "feature", "bugfix"):
+            return selected
+        if bool(self.db.setting("task_generation_zero_to_one_only", True)):
+            return "zero_to_one"
+        return ""
 
     def _terminal_limit(self) -> int:
         configured = int(self.db.setting("max_claude_terminals", 4))
@@ -1393,9 +1401,7 @@ class PairwiseService:
         return retired
 
     def _next_ready_task(self, task_type: str = "") -> Optional[Dict[str, Any]]:
-        selected_type = str(task_type or "")
-        if not selected_type and bool(self.db.setting("task_generation_zero_to_one_only", True)):
-            selected_type = "zero_to_one"
+        selected_type = str(task_type or "").strip() or self._selected_task_type()
         type_clause = " AND task_type=?" if selected_type else ""
         params: Tuple[Any, ...] = (selected_type,) if selected_type else ()
         tasks = self.db.all(
@@ -1478,8 +1484,9 @@ class PairwiseService:
 
     def _schedule_any_task_source(self) -> bool:
         """Prepare an existing real task source before creating a new 0-1 task."""
-        if bool(self.db.setting("task_generation_zero_to_one_only", True)):
-            return self._schedule_task_source("zero_to_one")
+        selected_type = self._selected_task_type()
+        if selected_type:
+            return self._schedule_task_source(selected_type)
         pending_bug = self.db.one(
             """SELECT id FROM bug_candidates
                WHERE status IN ('reproduced','awaiting_reproduction')
@@ -1567,15 +1574,19 @@ class PairwiseService:
                 return self._submit_auto(
                     "bugs-" + source["id"], self.discover_bugs, source["id"],
                 )
+            if self._selected_task_type() == "bugfix":
+                return False
             return self._schedule_task_source("zero_to_one")
         raise ValueError("未知任务类型：" + task_type)
 
     def _schedule_refill_once(self) -> None:
-        zero_to_one_only = bool(self.db.setting("task_generation_zero_to_one_only", True))
-        type_clause = " AND task_type='zero_to_one'" if zero_to_one_only else ""
+        selected_type = self._selected_task_type()
+        type_clause = " AND task_type=?" if selected_type else ""
+        type_params: Tuple[Any, ...] = (selected_type,) if selected_type else ()
         ready = (self.db.one(
             "SELECT COUNT(*) count FROM tasks WHERE status='ready' AND "
-            + ELIGIBLE_TASK_SQL + type_clause
+            + ELIGIBLE_TASK_SQL + type_clause,
+            type_params,
         ) or {"count": 0})["count"]
         minimum = int(self.db.setting("task_pool_min_ready", 6))
         target = int(self.db.setting("task_pool_target_ready", 12))
@@ -1590,13 +1601,13 @@ class PairwiseService:
             """SELECT id FROM tasks WHERE status='candidate'
                AND (difficulty IN ('困难','地狱') OR (task_type='bugfix' AND difficulty='中等'))"""
             + type_clause + " ORDER BY created_at LIMIT ?",
-            (min(capacity, needed),),
+            type_params + (min(capacity, needed),),
         )
         for row in candidates:
             self.validate_task_async(row["id"])
         if needed and capacity and not candidates and not generation_active:
-            if zero_to_one_only:
-                self._schedule_task_source("zero_to_one")
+            if selected_type:
+                self._schedule_task_source(selected_type)
             else:
                 self._schedule_any_task_source()
 
